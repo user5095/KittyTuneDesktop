@@ -124,7 +124,10 @@ class InnerTube {
         videoId: String,
         playlistId: String?,
     ) = httpClient.post("player") {
-        ytClient(client, setLogin = true)
+        // Public playback must stay unauthenticated. A YouTube Music SAPISID cookie can make
+        // otherwise valid ANDROID player requests fail with INVALID_ARGUMENT; account cookies are
+        // still used by browse/playlist endpoints below.
+        ytClient(client)
         setBody(
             PlayerBody(
                 context = client.toContext(locale, visitorData).let {
@@ -237,6 +240,24 @@ class InnerTube {
     }
 
     suspend fun getSwJsData() = httpClient.get("https://music.youtube.com/sw.js_data")
+
+    suspend fun likeVideo(client: YouTubeClient, videoId: String, like: Boolean) =
+        httpClient.post(if (like) "like/like" else "like/removelike") {
+            ytClient(client, setLogin = true)
+            setBody(LikeBody(client.toContext(locale, visitorData), LikeBody.Target(videoId)))
+        }
+
+    suspend fun editPlaylist(client: YouTubeClient, playlistId: String, actions: List<EditPlaylistBody.Action>) =
+        httpClient.post("browse/edit_playlist") {
+            ytClient(client, setLogin = true)
+            setBody(EditPlaylistBody(client.toContext(locale, visitorData), playlistId, actions))
+        }
+
+    suspend fun subscribe(client: YouTubeClient, channelId: String, subscribe: Boolean) =
+        httpClient.post(if (subscribe) "subscription/subscribe" else "subscription/unsubscribe") {
+            ytClient(client, setLogin = true)
+            setBody(SubscribeBody(client.toContext(locale, visitorData), listOf(channelId)))
+        }
 
     suspend fun accountMenu(client: YouTubeClient) = httpClient.post("account/account_menu") {
         ytClient(client, setLogin = true)

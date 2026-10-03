@@ -5,7 +5,7 @@ import com.zionhuang.innertube.models.Thumbnails
 import kotlinx.serialization.Serializable
 
 /**
- * PlayerResponse with [com.zionhuang.innertube.models.YouTubeClient.ANDROID_MUSIC] client
+ * PlayerResponse returned by an InnerTube player client.
  */
 @Serializable
 data class PlayerResponse(

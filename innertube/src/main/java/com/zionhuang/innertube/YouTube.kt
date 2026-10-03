@@ -12,11 +12,12 @@ import com.zionhuang.innertube.models.SearchSuggestions
 import com.zionhuang.innertube.models.SongItem
 import com.zionhuang.innertube.models.WatchEndpoint
 import com.zionhuang.innertube.models.WatchEndpoint.WatchEndpointMusicSupportedConfigs.WatchEndpointMusicConfig.Companion.MUSIC_VIDEO_TYPE_ATV
-import com.zionhuang.innertube.models.YouTubeClient.Companion.ANDROID_MUSIC
-import com.zionhuang.innertube.models.YouTubeClient.Companion.TVHTML5
+import com.zionhuang.innertube.models.YouTubeClient.Companion.ANDROID
 import com.zionhuang.innertube.models.YouTubeClient.Companion.WEB
 import com.zionhuang.innertube.models.YouTubeClient.Companion.WEB_REMIX
 import com.zionhuang.innertube.models.YouTubeLocale
+import com.zionhuang.innertube.models.body.EditPlaylistBody
+import com.zionhuang.innertube.models.continuationFromItems
 import com.zionhuang.innertube.models.getContinuation
 import com.zionhuang.innertube.models.oddElements
 import com.zionhuang.innertube.models.response.AccountMenuResponse
@@ -25,7 +26,6 @@ import com.zionhuang.innertube.models.response.GetQueueResponse
 import com.zionhuang.innertube.models.response.GetSearchSuggestionsResponse
 import com.zionhuang.innertube.models.response.GetTranscriptResponse
 import com.zionhuang.innertube.models.response.NextResponse
-import com.zionhuang.innertube.models.response.PipedResponse
 import com.zionhuang.innertube.models.response.PlayerResponse
 import com.zionhuang.innertube.models.response.SearchResponse
 import com.zionhuang.innertube.pages.AlbumPage
@@ -49,6 +49,7 @@ import com.zionhuang.innertube.pages.SearchSummary
 import com.zionhuang.innertube.pages.SearchSummaryPage
 import io.ktor.client.call.body
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.isSuccess
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
@@ -119,7 +120,7 @@ object YouTube {
                         title = it.musicShelfRenderer?.title?.runs?.firstOrNull()?.text ?: return@mapNotNull null,
                         items = it.musicShelfRenderer.contents
                             ?.mapNotNull {
-                                SearchSummaryPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                                SearchSummaryPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
                             }
                             ?.distinctBy { it.id }
                             ?.ifEmpty { null } ?: return@mapNotNull null
@@ -134,7 +135,7 @@ object YouTube {
             items = response.contents?.tabbedSearchResultsRenderer?.tabs?.firstOrNull()
                 ?.tabRenderer?.content?.sectionListRenderer?.contents?.lastOrNull()
                 ?.musicShelfRenderer?.contents?.mapNotNull {
-                    SearchPage.toYTItem(it.musicResponsiveListItemRenderer)
+                    SearchPage.toYTItem(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
                 }.orEmpty(),
             continuation = response.contents?.tabbedSearchResultsRenderer?.tabs?.firstOrNull()
                 ?.tabRenderer?.content?.sectionListRenderer?.contents?.lastOrNull()
@@ -147,7 +148,7 @@ object YouTube {
         SearchResult(
             items = response.continuationContents?.musicShelfContinuation?.contents
                 ?.mapNotNull {
-                    SearchPage.toYTItem(it.musicResponsiveListItemRenderer)
+                    SearchPage.toYTItem(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
                 }!!,
             continuation = response.continuationContents.musicShelfContinuation.continuations?.getContinuation()
         )
@@ -185,7 +186,7 @@ object YouTube {
             ?.contents?.firstOrNull()
             ?.musicPlaylistShelfRenderer?.contents
             ?.mapNotNull {
-                AlbumPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                AlbumPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
             }!!
             .toMutableList()
         var continuation = response.contents?.twoColumnBrowseResultsRenderer?.secondaryContents?.sectionListRenderer
@@ -197,7 +198,7 @@ object YouTube {
                 setLogin = true
             ).body<BrowseResponse>()
             songs += response.continuationContents?.musicPlaylistShelfContinuation?.contents?.mapNotNull {
-                AlbumPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                AlbumPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
             }.orEmpty()
             continuation = response.continuationContents?.musicPlaylistShelfContinuation?.continuations?.getContinuation()
         }
@@ -244,7 +245,7 @@ object YouTube {
                 items = response.contents?.singleColumnBrowseResultsRenderer?.tabs?.firstOrNull()
                     ?.tabRenderer?.content?.sectionListRenderer?.contents?.firstOrNull()
                     ?.musicPlaylistShelfRenderer?.contents?.mapNotNull {
-                        ArtistItemsPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                        ArtistItemsPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
                     }!!,
                 continuation = response.contents.singleColumnBrowseResultsRenderer.tabs.firstOrNull()
                     ?.tabRenderer?.content?.sectionListRenderer?.contents?.firstOrNull()
@@ -257,7 +258,7 @@ object YouTube {
         val response = innerTube.browse(WEB_REMIX, continuation = continuation).body<BrowseResponse>()
         ArtistItemsContinuationPage(
             items = response.continuationContents?.musicPlaylistShelfContinuation?.contents?.mapNotNull {
-                ArtistItemsContinuationPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                ArtistItemsContinuationPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
             }!!,
             continuation = response.continuationContents.musicPlaylistShelfContinuation.continuations?.getContinuation()
         )
@@ -291,13 +292,34 @@ object YouTube {
             ),
             songs = response.contents?.twoColumnBrowseResultsRenderer?.secondaryContents?.sectionListRenderer?.contents
                 ?.firstOrNull()?.musicPlaylistShelfRenderer?.contents?.mapNotNull {
-                    PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                    PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
                 }!!,
             songsContinuation = response.contents.twoColumnBrowseResultsRenderer.secondaryContents.sectionListRenderer
                 .contents.firstOrNull()
-                ?.musicPlaylistShelfRenderer?.continuations?.getContinuation(),
+                ?.musicPlaylistShelfRenderer?.let { it.continuations?.getContinuation() ?: it.contents.continuationFromItems() },
             continuation = response.contents.twoColumnBrowseResultsRenderer.secondaryContents.sectionListRenderer
                 .continuations?.getContinuation()
+        )
+    }
+
+    /**
+     * First page of a playlist's songs, without parsing its header: system playlists such as "LM"
+     * (liked music) have none of the buttons [playlist] requires. Follow with [playlistContinuation].
+     */
+    suspend fun playlistSongs(playlistId: String): Result<PlaylistContinuationPage> = runCatching {
+        val response = innerTube.browse(
+            client = WEB_REMIX,
+            browseId = "VL$playlistId",
+            setLogin = true
+        ).body<BrowseResponse>()
+        val shelf = response.contents?.twoColumnBrowseResultsRenderer?.secondaryContents?.sectionListRenderer?.contents
+            ?.firstOrNull()?.musicPlaylistShelfRenderer
+            ?: return@runCatching PlaylistContinuationPage(emptyList(), null)
+        PlaylistContinuationPage(
+            songs = shelf.contents.mapNotNull {
+                PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
+            },
+            continuation = shelf.continuations?.getContinuation() ?: shelf.contents.continuationFromItems()
         )
     }
 
@@ -307,11 +329,21 @@ object YouTube {
             continuation = continuation,
             setLogin = true
         ).body<BrowseResponse>()
+        response.onResponseReceivedActions?.firstOrNull()?.appendContinuationItemsAction?.continuationItems?.let { items ->
+            return@runCatching PlaylistContinuationPage(
+                songs = items.mapNotNull {
+                    PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
+                },
+                continuation = items.continuationFromItems()
+            )
+        }
         PlaylistContinuationPage(
             songs = response.continuationContents?.musicPlaylistShelfContinuation?.contents?.mapNotNull {
-                PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer)
+                PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null)
             }!!,
-            continuation = response.continuationContents.musicPlaylistShelfContinuation.continuations?.getContinuation()
+            continuation = response.continuationContents.musicPlaylistShelfContinuation.let {
+                it.continuations?.getContinuation() ?: it.contents.continuationFromItems()
+            }
         )
     }
 
@@ -412,27 +444,42 @@ object YouTube {
             }
     }
 
+    /** Artists the logged-in account follows in its YouTube Music library. Needs [cookie]. */
+    suspend fun libraryArtists(): Result<List<ArtistItem>> = runCatching {
+        val response = innerTube.browse(
+            client = WEB_REMIX,
+            browseId = "FEmusic_library_corpus_artists",
+            setLogin = true
+        ).body<BrowseResponse>()
+        response.contents?.singleColumnBrowseResultsRenderer?.tabs?.firstOrNull()?.tabRenderer?.content?.sectionListRenderer?.contents
+            ?.firstOrNull()?.musicShelfRenderer?.contents.orEmpty()
+            .mapNotNull { it.musicResponsiveListItemRenderer?.let { r ->
+                ArtistItem(
+                    id = r.navigationEndpoint?.browseEndpoint?.browseId ?: return@mapNotNull null,
+                    title = r.flexColumns.firstOrNull()?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.firstOrNull()?.text
+                        ?: return@mapNotNull null,
+                    thumbnail = r.thumbnail?.musicThumbnailRenderer?.getThumbnailUrl().orEmpty(),
+                    shuffleEndpoint = null,
+                    radioEndpoint = null
+                )
+            } }
+    }
+
+    /** Listening history of the logged-in account, newest first. Needs [cookie]. */
+    suspend fun history(): Result<List<SongItem>> = runCatching {
+        val response = innerTube.browse(
+            client = WEB_REMIX,
+            browseId = "FEmusic_history",
+            setLogin = true
+        ).body<BrowseResponse>()
+        response.contents?.singleColumnBrowseResultsRenderer?.tabs?.firstOrNull()?.tabRenderer?.content?.sectionListRenderer?.contents
+            .orEmpty()
+            .flatMap { it.musicShelfRenderer?.contents.orEmpty() }
+            .mapNotNull { PlaylistPage.fromMusicResponsiveListItemRenderer(it.musicResponsiveListItemRenderer ?: return@mapNotNull null) }
+    }
+
     suspend fun player(videoId: String, playlistId: String? = null): Result<PlayerResponse> = runCatching {
-        val playerResponse = innerTube.player(ANDROID_MUSIC, videoId, playlistId).body<PlayerResponse>()
-        if (playerResponse.playabilityStatus.status == "OK") {
-            return@runCatching playerResponse
-        }
-        val safePlayerResponse = innerTube.player(TVHTML5, videoId, playlistId).body<PlayerResponse>()
-        if (safePlayerResponse.playabilityStatus.status != "OK") {
-            return@runCatching playerResponse
-        }
-        val audioStreams = innerTube.pipedStreams(videoId).body<PipedResponse>().audioStreams
-        safePlayerResponse.copy(
-            streamingData = safePlayerResponse.streamingData?.copy(
-                adaptiveFormats = safePlayerResponse.streamingData.adaptiveFormats.mapNotNull { adaptiveFormat ->
-                    audioStreams.find { it.bitrate == adaptiveFormat.bitrate }?.let {
-                        adaptiveFormat.copy(
-                            url = it.url
-                        )
-                    }
-                }
-            )
-        )
+        innerTube.player(ANDROID, videoId, playlistId).body<PlayerResponse>()
     }
 
     suspend fun next(endpoint: WatchEndpoint, continuation: String? = null): Result<NextResult> = runCatching {
@@ -531,6 +578,29 @@ object YouTube {
             .jsonArray[2]
             .jsonArray.first { (it as? JsonPrimitive)?.content?.startsWith(VISITOR_DATA_PREFIX) == true }
             .jsonPrimitive.content
+    }
+
+    /** Likes or un-likes a song on the logged-in account. Needs [cookie]. */
+    suspend fun likeVideo(videoId: String, like: Boolean): Result<Unit> = runCatching {
+        val response = innerTube.likeVideo(WEB_REMIX, videoId, like)
+        check(response.status.isSuccess()) { "like failed: HTTP ${response.status.value}" }
+    }
+
+    /** Adds and removes songs of one of the account's own playlists. Removal needs each song's [SongItem.setVideoId]. Needs [cookie]. */
+    suspend fun editPlaylist(playlistId: String, add: List<String>, remove: List<SongItem>): Result<Unit> = runCatching {
+        val actions = add.map { EditPlaylistBody.Action("ACTION_ADD_VIDEO", addedVideoId = it) } +
+            remove.mapNotNull { song ->
+                song.setVideoId?.let { EditPlaylistBody.Action("ACTION_REMOVE_VIDEO", removedVideoId = song.id, setVideoId = it) }
+            }
+        if (actions.isEmpty()) return@runCatching
+        val response = innerTube.editPlaylist(WEB_REMIX, playlistId, actions)
+        check(response.status.isSuccess()) { "playlist edit failed: HTTP ${response.status.value}" }
+    }
+
+    /** Follows or unfollows an artist channel. Needs [cookie]. */
+    suspend fun subscribe(channelId: String, subscribe: Boolean): Result<Unit> = runCatching {
+        val response = innerTube.subscribe(WEB_REMIX, channelId, subscribe)
+        check(response.status.isSuccess()) { "subscribe failed: HTTP ${response.status.value}" }
     }
 
     suspend fun accountInfo(): Result<AccountInfo> = runCatching {

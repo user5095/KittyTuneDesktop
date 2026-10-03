@@ -16,6 +16,7 @@ import kotlinx.serialization.Serializable
 data class BrowseResponse(
     val contents: Contents?,
     val continuationContents: ContinuationContents?,
+    val onResponseReceivedActions: List<ResponseAction>?,
     val header: Header?,
     val microformat: Microformat?,
     val responseContext: ResponseContext,
@@ -44,6 +45,17 @@ data class BrowseResponse(
         val thumbnail: Thumbnails?,
         val thumbnailCrop: String?,
     )
+
+    /** Newer continuation format: the next page's items arrive in an append action, not in [ContinuationContents]. */
+    @Serializable
+    data class ResponseAction(
+        val appendContinuationItemsAction: AppendContinuationItemsAction?,
+    ) {
+        @Serializable
+        data class AppendContinuationItemsAction(
+            val continuationItems: List<MusicShelfRenderer.Content>?,
+        )
+    }
 
     @Serializable
     data class ContinuationContents(

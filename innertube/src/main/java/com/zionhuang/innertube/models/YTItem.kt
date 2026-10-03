@@ -27,6 +27,8 @@ data class SongItem(
     override val thumbnail: String,
     override val explicit: Boolean = false,
     val endpoint: WatchEndpoint? = null,
+    // Only set for songs read from a playlist: YouTube needs it to remove that entry.
+    val setVideoId: String? = null,
 ) : YTItem() {
     override val shareLink: String
         get() = "https://music.youtube.com/watch?v=$id"
