@@ -41,7 +41,7 @@ import com.alananasss.kittytune.data.UpdateStatus
 import com.alananasss.kittytune.data.network.GithubRelease
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class, ExperimentalLayoutApi::class)
 @Composable
 fun UpdateDialog(
     release: GithubRelease?,
@@ -71,7 +71,7 @@ fun UpdateDialog(
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.background,
-            modifier = Modifier.width(640.dp).padding(16.dp)
+            modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth().padding(16.dp)
         ) {
             Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
                 // Header
@@ -245,18 +245,17 @@ fun UpdateDialog(
                     Spacer(Modifier.height(8.dp))
                 }
 
-                // Action buttons with M3 Expressive shapes parameter
-                Row(
+                // Action buttons with M3 Expressive shapes parameter; wrap onto more lines when the window is narrow
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     when (status) {
                         UpdateStatus.AVAILABLE -> {
                             OutlinedButton(onClick = onDismiss, shapes = ButtonDefaults.shapes()) {
                                 Text(str("btn_cancel"))
                             }
-                            Spacer(Modifier.width(12.dp))
                             FilledTonalButton(
                                 onClick = { scope.launch { UpdateManager.downloadUpdate() } },
                                 shapes = ButtonDefaults.shapes()
@@ -274,11 +273,9 @@ fun UpdateDialog(
                             OutlinedButton(onClick = onDismiss, shapes = ButtonDefaults.shapes()) {
                                 Text(str("update_btn_minimize"))
                             }
-                            Spacer(Modifier.width(8.dp))
                             OutlinedButton(onClick = { UpdateManager.pauseDownload() }, shapes = ButtonDefaults.shapes()) {
                                 Text(str("update_btn_pause"))
                             }
-                            Spacer(Modifier.width(8.dp))
                             FilledTonalButton(
                                 onClick = { UpdateManager.dismiss() },
                                 shapes = ButtonDefaults.shapes()
@@ -296,7 +293,6 @@ fun UpdateDialog(
                             OutlinedButton(onClick = { UpdateManager.dismiss() }, shapes = ButtonDefaults.shapes()) {
                                 Text(str("btn_cancel"))
                             }
-                            Spacer(Modifier.width(12.dp))
                             Button(
                                 onClick = { scope.launch { UpdateManager.downloadUpdate() } },
                                 shapes = ButtonDefaults.shapes()
@@ -312,7 +308,6 @@ fun UpdateDialog(
                             OutlinedButton(onClick = { UpdateManager.cancelDownload() }, shapes = ButtonDefaults.shapes()) {
                                 Text(str("btn_cancel"))
                             }
-                            Spacer(Modifier.width(12.dp))
                             Button(
                                 onClick = { UpdateManager.killInstancesAndContinue() },
                                 shapes = ButtonDefaults.shapes(),
@@ -331,7 +326,6 @@ fun UpdateDialog(
                             OutlinedButton(onClick = { UpdateManager.cancelDownload() }, shapes = ButtonDefaults.shapes()) {
                                 Text(str("btn_cancel"))
                             }
-                            Spacer(Modifier.width(12.dp))
                             Button(
                                 onClick = { UpdateManager.retryInstall() },
                                 shapes = ButtonDefaults.shapes(),
