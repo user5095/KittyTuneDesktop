@@ -22,7 +22,7 @@ data class YouTubeClient(
             clientVersion = clientVersion,
             gl = locale.gl,
             hl = locale.hl,
-            visitorData = visitorData,
+            visitorData = if (this === TV_OAUTH) null else visitorData,
             androidSdkVersion = androidSdkVersion,
             osName = osName,
             osVersion = osVersion,
@@ -98,6 +98,18 @@ data class YouTubeClient(
             api_key = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30",
             userAgent = USER_AGENT_WEB,
             referer = REFERER_YOUTUBE_MUSIC
+        )
+
+        /**
+         * The only client the YouTube TV OAuth token (device-flow sign-in) is accepted by: WEB_REMIX,
+         * ANDROID_MUSIC and older TVHTML5 versions all get 400 INVALID_ARGUMENT with that token.
+         * Answers come back in TV format (tvBrowseRenderer/tileRenderer), not the music one.
+         */
+        val TV_OAUTH = YouTubeClient(
+            clientName = "TVHTML5",
+            clientVersion = "7.20260101.00.00",
+            api_key = "",
+            userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
         )
 
         val TVHTML5 = YouTubeClient(

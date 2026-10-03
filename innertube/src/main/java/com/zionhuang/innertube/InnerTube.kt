@@ -83,6 +83,12 @@ class InnerTube {
         // The web API key belongs to another Google project than the OAuth token: sending both is a 400 INVALID_ARGUMENT.
         var useKey = true
         contentType(ContentType.Application.Json)
+        if (client === YouTubeClient.TV_OAUTH) {
+            accessToken?.let { header("Authorization", "Bearer $it") }
+            userAgent(client.userAgent)
+            parameter("prettyPrint", false)
+            return
+        }
         headers {
             append("X-Goog-Api-Format-Version", "1")
             append("X-YouTube-Client-Name", client.clientName)

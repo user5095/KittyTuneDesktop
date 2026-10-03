@@ -60,7 +60,8 @@ object YtmImporter {
         val artists = YtmSync.syncArtists()
 
         onStep(Step.HISTORY)
-        val history = YouTube.history().getOrThrow()
+        // OAuth sign-in (TV client) can't read the music-format history page: likes only.
+        val history = if (YouTube.cookie == null) emptyList() else YouTube.history().getOrThrow()
         dao.insertHistoryList(history.mapIndexed { i, s ->
             val t = s.toTrack()
             HistoryItem(

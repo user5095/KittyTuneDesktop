@@ -94,6 +94,8 @@ object YtmSync {
 
     /** Followed artists, both ways: following or unfollowing on either side is copied to the other. */
     suspend fun syncArtists(): Int {
+        // OAuth sign-in only gets the TV client, whose library has no channel ids to follow/unfollow with.
+        if (YouTube.cookie == null) return 0
         val dao = AppDatabase.downloadDao
         val remote = YouTube.libraryArtists().getOrThrow()
         val remoteIds = remote.mapTo(HashSet()) { it.id }

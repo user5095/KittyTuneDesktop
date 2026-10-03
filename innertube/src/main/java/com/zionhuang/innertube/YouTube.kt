@@ -14,6 +14,7 @@ import com.zionhuang.innertube.models.WatchEndpoint
 import com.zionhuang.innertube.models.WatchEndpoint.WatchEndpointMusicSupportedConfigs.WatchEndpointMusicConfig.Companion.MUSIC_VIDEO_TYPE_ATV
 import com.zionhuang.innertube.models.YouTubeClient.Companion.ANDROID
 import com.zionhuang.innertube.models.YouTubeClient.Companion.WEB
+import com.zionhuang.innertube.models.YouTubeClient.Companion.TV_OAUTH
 import com.zionhuang.innertube.models.YouTubeClient.Companion.WEB_REMIX
 import com.zionhuang.innertube.models.YouTubeLocale
 import com.zionhuang.innertube.models.body.EditPlaylistBody
@@ -51,6 +52,10 @@ import io.ktor.client.call.body
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.isSuccess
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
@@ -312,7 +317,59 @@ object YouTube {
      * First page of a playlist's songs, without parsing its header: system playlists such as "LM"
      * (liked music) have none of the buttons [playlist] requires. Follow with [playlistContinuation].
      */
+    /** OAuth-only sign-in: that token is accepted just by the TV client, which answers in TV format. */
+    private val authClient get() = if (cookie == null && accessToken != null) TV_OAUTH else WEB_REMIX
+
+    private fun findContinuation(e: JsonElement): String? = when (e) {
+        is JsonObject -> e["nextContinuationData"]?.jsonObject?.get("continuation")?.jsonPrimitive?.content
+            ?: e.values.firstNotNullOfOrNull(::findContinuation)
+        is JsonArray -> e.firstNotNullOfOrNull(::findContinuation)
+        else -> null
+    }
+
+    private fun tvSongsPage(json: JsonElement) = PlaylistContinuationPage(
+        songs = buildList {
+            fun walk(e: JsonElement) {
+                when (e) {
+                    is JsonObject -> {
+                        e["tileRenderer"]?.jsonObject?.let { t ->
+                            val meta = t["metadata"]?.jsonObject?.get("tileMetadataRenderer")?.jsonObject
+                            val run = meta?.get("title")?.jsonObject?.get("runs")?.jsonArray?.firstOrNull()?.jsonObject
+                            val id = run?.get("navigationEndpoint")?.jsonObject?.get("watchEndpoint")?.jsonObject?.get("videoId")?.jsonPrimitive?.content
+                            if (id != null) {
+                                val header = t["header"]?.jsonObject?.get("tileHeaderRenderer")?.jsonObject
+                                val artist = meta["lines"]?.jsonArray?.firstOrNull()?.jsonObject?.get("lineRenderer")?.jsonObject
+                                    ?.get("items")?.jsonArray?.firstOrNull()?.jsonObject?.get("lineItemRenderer")?.jsonObject
+                                    ?.get("text")?.jsonObject?.get("simpleText")?.jsonPrimitive?.content
+                                val duration = header?.get("thumbnailOverlays")?.jsonArray?.firstNotNullOfOrNull {
+                                    it.jsonObject["thumbnailOverlayTimeStatusRenderer"]?.jsonObject?.get("text")?.jsonObject?.get("simpleText")?.jsonPrimitive?.content
+                                }?.split(":")?.mapNotNull { it.toIntOrNull() }?.fold(0) { acc, n -> acc * 60 + n }
+                                add(
+                                    SongItem(
+                                        id = id,
+                                        title = run["text"]?.jsonPrimitive?.content.orEmpty(),
+                                        artists = listOfNotNull(artist?.let { Artist(it, null) }),
+                                        duration = duration,
+                                        thumbnail = header?.get("thumbnail")?.jsonObject?.get("thumbnails")?.jsonArray?.lastOrNull()
+                                            ?.jsonObject?.get("url")?.jsonPrimitive?.content.orEmpty(),
+                                    )
+                                )
+                            }
+                        } ?: e.values.forEach(::walk)
+                    }
+                    is JsonArray -> e.forEach(::walk)
+                    else -> {}
+                }
+            }
+            walk(json)
+        },
+        continuation = findContinuation(json)
+    )
+
     suspend fun playlistSongs(playlistId: String): Result<PlaylistContinuationPage> = runCatching {
+        if (authClient === TV_OAUTH) return@runCatching tvSongsPage(
+            innerTube.browse(TV_OAUTH, "VL$playlistId", setLogin = true).body<JsonElement>()
+        )
         val response = innerTube.browse(
             client = WEB_REMIX,
             browseId = "VL$playlistId",
@@ -330,6 +387,9 @@ object YouTube {
     }
 
     suspend fun playlistContinuation(continuation: String) = runCatching {
+        if (authClient === TV_OAUTH) return@runCatching tvSongsPage(
+            innerTube.browse(TV_OAUTH, continuation = continuation, setLogin = true).body<JsonElement>()
+        )
         val response = innerTube.browse(
             client = WEB_REMIX,
             continuation = continuation,
@@ -588,7 +648,7 @@ object YouTube {
 
     /** Likes or un-likes a song on the logged-in account. Needs [cookie]. */
     suspend fun likeVideo(videoId: String, like: Boolean): Result<Unit> = runCatching {
-        val response = innerTube.likeVideo(WEB_REMIX, videoId, like)
+        val response = innerTube.likeVideo(authClient, videoId, like)
         check(response.status.isSuccess()) { "like failed: HTTP ${response.status.value}" }
     }
 
@@ -599,13 +659,13 @@ object YouTube {
                 song.setVideoId?.let { EditPlaylistBody.Action("ACTION_REMOVE_VIDEO", removedVideoId = song.id, setVideoId = it) }
             }
         if (actions.isEmpty()) return@runCatching
-        val response = innerTube.editPlaylist(WEB_REMIX, playlistId, actions)
+        val response = innerTube.editPlaylist(authClient, playlistId, actions)
         check(response.status.isSuccess()) { "playlist edit failed: HTTP ${response.status.value}" }
     }
 
     /** Follows or unfollows an artist channel. Needs [cookie]. */
     suspend fun subscribe(channelId: String, subscribe: Boolean): Result<Unit> = runCatching {
-        val response = innerTube.subscribe(WEB_REMIX, channelId, subscribe)
+        val response = innerTube.subscribe(authClient, channelId, subscribe)
         check(response.status.isSuccess()) { "subscribe failed: HTTP ${response.status.value}" }
     }
 
