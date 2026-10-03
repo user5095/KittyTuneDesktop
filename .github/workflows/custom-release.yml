@@ -30,6 +30,7 @@ jobs:
           UP_TAG=$(gh api repos/$UPSTREAM/releases/latest --jq .tag_name)
           git remote add upstream https://github.com/$UPSTREAM.git
           git fetch upstream tag "$UP_TAG" --no-tags
+          git push origin "refs/tags/$UP_TAG"  # changelog range needs upstream tags in our repo
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           if git merge-base --is-ancestor "$UP_TAG" HEAD; then
