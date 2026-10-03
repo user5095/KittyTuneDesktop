@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.core.trackTextInput
+import com.alananasss.kittytune.data.ytmusic.YtmBrowserLogin
 import com.alananasss.kittytune.data.ytmusic.YtmImporter
 import com.alananasss.kittytune.data.ytmusic.YtmSession
 import com.alananasss.kittytune.ui.common.SettingsScaffold
@@ -41,6 +42,8 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
     var name by remember { mutableStateOf(YtmSession.accountName()) }
     var showCookieDialog by remember { mutableStateOf(false) }
     var cookieError by remember { mutableStateOf(false) }
+    var signingIn by remember { mutableStateOf(false) }
+    var loginJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var importing by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
 
@@ -68,13 +71,7 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
                     val cookie = temp.trim().removePrefix("cookie:").removePrefix("Cookie:").trim()
                     if (!cookie.contains("SAPISID=")) { cookieError = true; return@TextButton }
                     showCookieDialog = false
-                    scope.launch {
-                        YtmSession.save(cookie, null)
-                        val account = withContext(Dispatchers.IO) { YouTube.accountInfo().getOrNull()?.name }
-                        YtmSession.save(cookie, account)
-                        name = account
-                        loggedIn = true
-                    }
+                    scope.launch { finishLogin(cookie) { n -> name = n; loggedIn = true } }
                 }) { Text(str("btn_ok")) }
             },
             dismissButton = { TextButton(onClick = { showCookieDialog = false }) { Text(str("btn_cancel")) } }
@@ -88,7 +85,34 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
         ) {
             Text(if (loggedIn) str("ytm_subtitle_connected", name ?: "") else str("ytm_subtitle_guest"))
             if (!loggedIn) {
-                Button(onClick = { showCookieDialog = true }, modifier = Modifier.fillMaxWidth()) { Text(str("ytm_login")) }
+                if (signingIn) {
+                    Text(str("ytm_login_waiting"))
+                    OutlinedButton(
+                        onClick = { loginJob?.cancel(); signingIn = false },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(str("btn_cancel")) }
+                } else {
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            status = null
+                            signingIn = true
+                            loginJob = scope.launch {
+                                try {
+                                    val cookie = YtmBrowserLogin.login()
+                                    if (cookie != null) finishLogin(cookie) { n -> name = n; loggedIn = true }
+                                } catch (e: YtmBrowserLogin.NoBrowserException) {
+                                    status = str("ytm_login_no_browser")
+                                } catch (e: Exception) {
+                                    status = str("ytm_import_failed", e.message ?: e.javaClass.simpleName)
+                                } finally {
+                                    signingIn = false
+                                }
+                            }
+                        }
+                    ) { Text(str("ytm_login")) }
+                    TextButton(onClick = { showCookieDialog = true }, modifier = Modifier.fillMaxWidth()) { Text(str("ytm_login_manual")) }
+                }
             } else {
                 Text(str("ytm_import_desc"))
                 Button(
@@ -125,4 +149,11 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
             status?.let { Text(it) }
         }
     }
+}
+
+private suspend fun finishLogin(cookie: String, onDone: (String?) -> Unit) {
+    YtmSession.save(cookie, null)
+    val account = withContext(Dispatchers.IO) { YouTube.accountInfo().getOrNull()?.name }
+    YtmSession.save(cookie, account)
+    onDone(account)
 }
