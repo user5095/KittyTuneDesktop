@@ -91,7 +91,8 @@ enum class AppLanguage(val code: String) {
     GERMAN("de"),
     HUNGARIAN("hu"),
     RUSSIAN("ru"),
-    VIETNAMESE("vi")
+    VIETNAMESE("vi"),
+    ITALIAN("it")
 }
 
 val DEFAULT_PINNED_AUDIO_FX = listOf(

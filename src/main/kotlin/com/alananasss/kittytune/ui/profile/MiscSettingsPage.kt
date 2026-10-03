@@ -34,6 +34,7 @@ fun MiscSettingsPage(navController: NavController, playerViewModel: PlayerViewMo
         AppLanguage.GERMAN to str("lang_german"),
         AppLanguage.HUNGARIAN to str("lang_hungarian"),
         AppLanguage.VIETNAMESE to str("lang_vietnamese"),
+        AppLanguage.ITALIAN to str("lang_italian"),
     )
     val startDestinations = listOf(
         StartDestination.HOME to str("nav_home"),

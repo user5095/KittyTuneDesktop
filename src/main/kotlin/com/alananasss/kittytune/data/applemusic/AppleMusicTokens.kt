@@ -68,6 +68,7 @@ object AppleMusicTokens {
         "fr" -> "fr"
         "hu" -> "hu"
         "ru" -> "ru"
+        "it" -> "it"
         else -> "us"
     }
 }

@@ -577,6 +577,7 @@ object R {
         const val lang_hungarian = "lang_hungarian"
         const val lang_russian = "lang_russian"
         const val lang_vietnamese = "lang_vietnamese"
+        const val lang_italian = "lang_italian"
         const val pref_font_custom_title = "pref_font_custom_title"
         const val pref_font_custom_subtitle = "pref_font_custom_subtitle"
         const val pref_font_variations_title = "pref_font_variations_title"
