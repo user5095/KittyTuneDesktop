@@ -80,6 +80,8 @@ class InnerTube {
     }
 
     private fun HttpRequestBuilder.ytClient(client: YouTubeClient, setLogin: Boolean = false) {
+        // The web API key belongs to another Google project than the OAuth token: sending both is a 400 INVALID_ARGUMENT.
+        var useKey = true
         contentType(ContentType.Application.Json)
         headers {
             append("X-Goog-Api-Format-Version", "1")
@@ -90,7 +92,7 @@ class InnerTube {
                 append("Referer", client.referer)
             }
             if (setLogin) {
-                if (cookie == null) accessToken?.let { append("Authorization", "Bearer $it") }
+                if (cookie == null) accessToken?.let { useKey = false; append("Authorization", "Bearer $it") }
                 cookie?.let { cookie ->
                     append("cookie", cookie)
                     if ("SAPISID" !in cookieMap) return@let
@@ -101,7 +103,7 @@ class InnerTube {
             }
         }
         userAgent(client.userAgent)
-        parameter("key", client.api_key)
+        if (useKey) parameter("key", client.api_key)
         parameter("prettyPrint", false)
     }
 
