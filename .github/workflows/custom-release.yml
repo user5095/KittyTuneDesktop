@@ -1,0 +1,59 @@
+name: Custom Release
+
+# Scheduled: merge the latest upstream release into this branch, tag, build installers.
+# Manual run: rebuild the current branch (use after pushing your own changes).
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM: alan7383/KittyTuneDesktop
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge latest upstream release
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          UP_TAG=$(gh api repos/$UPSTREAM/releases/latest --jq .tag_name)
+          git remote add upstream https://github.com/$UPSTREAM.git
+          git fetch upstream tag "$UP_TAG" --no-tags
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          if git merge-base --is-ancestor "$UP_TAG" HEAD; then
+            echo "new_upstream=false" >> $GITHUB_OUTPUT
+          else
+            # a conflict fails the job here -> GitHub emails you, resolve locally
+            git merge --no-edit "$UP_TAG"
+            # ponytail: push fails if upstream touched .github/workflows (GITHUB_TOKEN can't); merge that locally
+            git push origin HEAD
+            echo "new_upstream=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Tag custom version (upstream.N) and start build
+        if: github.event_name == 'workflow_dispatch' || steps.sync.outputs.new_upstream == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE=$(grep -oP '^version = "\K[0-9]+\.[0-9]+\.[0-9]+' build.gradle.kts | head -1)
+          N=$(( $(git tag -l "v$BASE.*" | wc -l) + 1 ))
+          VERSION="$BASE.$N"
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" build.gradle.kts
+          # tag a bump commit that is never pushed to the branch: no version-file merge noise on the next sync
+          git commit -am "release: v$VERSION"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          # tags pushed with GITHUB_TOKEN don't trigger workflows, so dispatch the build explicitly
+          gh workflow run build-installers.yml --ref "v$VERSION"
