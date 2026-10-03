@@ -760,6 +760,11 @@ fun MainScreen(
                                 onBackClick = { navController.popBackStack() }
                             )
                         }
+                        composable("ytmusic_account") {
+                            com.alananasss.kittytune.ui.profile.integrations.YoutubeMusicScreen(
+                                onBackClick = { navController.popBackStack() }
+                            )
+                        }
                         // Settings sub-pages are now handled within SettingsScreen's Split Pane layout
                         composable("playlist_detail/{playlistId}") { backStackEntry ->
                             val id = backStackEntry.arguments?.let { args ->

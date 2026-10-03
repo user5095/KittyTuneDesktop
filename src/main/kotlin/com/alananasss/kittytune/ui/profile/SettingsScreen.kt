@@ -664,6 +664,7 @@ private fun getSearchableSettings(playerViewModel: PlayerViewModel): List<Settin
         SettingsSearchItem("SoundCloud", str("sources_signed_in"), SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.Cloud, keywords = listOf("soundcloud", "саундклауд")),
         SettingsSearchItem("Qobuz", null, SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.MusicNote, route = "qobuz_settings", keywords = listOf("qobuz", "flac", "hires", "кобуз")),
         SettingsSearchItem("TIDAL", null, SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.Waves, route = "tidal_settings", keywords = listOf("tidal", "hifi", "тайдал")),
+        SettingsSearchItem("YouTube Music", null, SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.GraphicEq, route = "ytmusic_account", keywords = listOf("youtube music", "ytm")),
         SettingsSearchItem("Deezer", null, SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.GraphicEq, route = "deezer_settings", keywords = listOf("deezer", "дизер")),
         SettingsSearchItem(str("sources_yandex"), str("pref_yandex_token"), SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.Key, keywords = listOf("yandex", "token", "яндекс", "токен")),
         SettingsSearchItem(str("provider_order"), null, SettingsCategory.SOURCES, SettingsPlace(SettingsCategory.SOURCES), Icons.Rounded.SwapVert, route = "provider_order", keywords = listOf("provider order", "priority", "ordre", "приоритет", "порядок")),
@@ -1000,6 +1001,17 @@ private fun SourcesSection(navController: NavController) {
                 ServiceRow(shape, "Deezer", deezerSubtitle, com.alananasss.kittytune.R.drawable.ic_logo_deezer, isConnected = !deezerDisabled) {
                     navController.navigate("deezer_settings")
                 }
+            },
+            { shape ->
+                val ytmConnected = com.alananasss.kittytune.data.ytmusic.YtmSession.isLoggedIn()
+                ServiceRow(
+                    shape = shape,
+                    name = str("ytm_title"),
+                    subtitle = if (ytmConnected) str("ytm_subtitle_connected", com.alananasss.kittytune.data.ytmusic.YtmSession.accountName() ?: "") else str("ytm_subtitle_guest"),
+                    iconRes = null,
+                    isConnected = ytmConnected,
+                    onClick = { navController.navigate("ytmusic_account") },
+                )
             },
             { shape ->
                 ServiceRow(

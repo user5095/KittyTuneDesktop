@@ -173,6 +173,11 @@ object LikeRepository {
         com.alananasss.kittytune.data.sync.SyncLikes.record(track.id, liked = true, track = track)
 
         scope.launch {
+            if (com.alananasss.kittytune.data.ytmusic.YtmSync.isYoutube(track)) {
+                // Its id is a hash of the video id: sending it to SoundCloud would like some unrelated track.
+                com.alananasss.kittytune.data.ytmusic.YtmSync.pushLike(track, like = true)
+                return@launch
+            }
             if (track.source == "spotify" || track.user?.urn?.startsWith("spotify") == true || (track.permalinkUrl != null && track.permalinkUrl!!.contains("spotify"))) return@launch
             if (!playerPrefs.getSyncLikesEnabled()) return@launch
             if (tokenManager.isGuestMode()) return@launch
@@ -280,6 +285,11 @@ object LikeRepository {
         // when it came from a row in a list.
         scheduleSave()
         com.alananasss.kittytune.data.sync.SyncLikes.record(trackId, liked = false, track = null)
+
+        if (targetTrack != null && com.alananasss.kittytune.data.ytmusic.YtmSync.isYoutube(targetTrack)) {
+            scope.launch { com.alananasss.kittytune.data.ytmusic.YtmSync.pushLike(targetTrack, like = false) }
+            return
+        }
 
         if (isSpotify) return
 

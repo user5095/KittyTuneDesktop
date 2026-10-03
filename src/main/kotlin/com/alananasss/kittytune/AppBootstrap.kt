@@ -87,6 +87,7 @@ object AppBootstrap {
         Strings.appLanguage = PlayerPreferences().getAppLanguage().code
 
         // 3. Repositories (all global singletons, like the Android objects).
+        com.alananasss.kittytune.data.ytmusic.YtmSession.init()
         LikeRepository.init()
         HistoryRepository.init()
         ListeningStatsRepository.init()
@@ -116,6 +117,15 @@ object AppBootstrap {
         // 4. Player + session keep-alive.
         MusicManager.init()
         SessionManager.start()
+
+        // 4a. YouTube Music two-way sync: shortly after launch, then whenever the last one is old enough.
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            kotlinx.coroutines.delay(15_000)
+            while (true) {
+                com.alananasss.kittytune.data.ytmusic.YtmSync.autoSync()
+                kotlinx.coroutines.delay(10 * 60_000L)
+            }
+        }
 
         // 4b. Anonymous client_id: validate/scrape in background (replaces the ghost
         // WebView interception on Android). Guest mode depends on this.
