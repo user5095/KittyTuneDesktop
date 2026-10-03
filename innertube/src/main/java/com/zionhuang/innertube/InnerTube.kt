@@ -40,6 +40,9 @@ class InnerTube {
         }
     private var cookieMap = emptyMap<String, String>()
 
+    /** OAuth bearer token (device-flow sign-in); used for signed-in requests when there is no cookie. */
+    var accessToken: String? = null
+
     var proxy: Proxy? = null
         set(value) {
             field = value
@@ -87,6 +90,7 @@ class InnerTube {
                 append("Referer", client.referer)
             }
             if (setLogin) {
+                if (cookie == null) accessToken?.let { append("Authorization", "Bearer $it") }
                 cookie?.let { cookie ->
                     append("cookie", cookie)
                     if ("SAPISID" !in cookieMap) return@let

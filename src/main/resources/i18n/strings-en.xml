@@ -2729,8 +2729,8 @@
     <string name="ytm_subtitle_connected">Connected as %1$s</string>
     <string name="ytm_subtitle_guest">Not connected</string>
     <string name="ytm_login">Log in with Google</string>
-    <string name="ytm_login_waiting">Sign in to Google in the browser window that just opened. It closes by itself when you are done.</string>
-    <string name="ytm_login_no_browser">No Chrome, Chromium, Brave, Edge or Vivaldi found. Install one, or use a cookie instead.</string>
+    <string name="ytm_login_waiting">Your browser opened google.com/device. Sign in, check that the code below matches and confirm. This page continues by itself.</string>
+    <string name="ytm_login_failed">Sign-in was not completed.</string>
     <string name="ytm_login_manual">Use a cookie instead</string>
     <string name="ytm_logout">Log out</string>
     <string name="ytm_cookie_helper">Open music.youtube.com while signed in, press F12, Network tab, click any request and copy the full "cookie" request header. It must contain SAPISID.</string>

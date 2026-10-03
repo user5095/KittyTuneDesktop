@@ -38,6 +38,7 @@ object YtmSync {
     /** The user liked or un-liked a YouTube track in the app: mirror it. A failure is repaired by the next [syncLikes]. */
     suspend fun pushLike(track: Track, like: Boolean) {
         if (!YtmSession.isLoggedIn()) return
+        YtmSession.ensureFresh()
         val id = videoId(track) ?: return
         YouTube.likeVideo(id, like)
             .onSuccess {
@@ -49,6 +50,7 @@ object YtmSync {
 
     /** Reconciles the liked songs in both directions. Returns how many songs YouTube Music has liked. */
     suspend fun syncLikes(): Int {
+        YtmSession.ensureFresh()
         val remote = YtmImporter.allSongs("LM") // newest first
         val remoteIds = remote.mapTo(HashSet()) { it.id }
         val local = LikeRepository.likedTracks.value

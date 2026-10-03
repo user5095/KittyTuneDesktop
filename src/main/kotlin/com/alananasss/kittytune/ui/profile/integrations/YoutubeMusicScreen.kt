@@ -25,7 +25,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.core.trackTextInput
-import com.alananasss.kittytune.data.ytmusic.YtmBrowserLogin
+import com.alananasss.kittytune.core.openUrl
+import com.alananasss.kittytune.data.ytmusic.YtmOAuth
 import com.alananasss.kittytune.data.ytmusic.YtmImporter
 import com.alananasss.kittytune.data.ytmusic.YtmSession
 import com.alananasss.kittytune.ui.common.SettingsScaffold
@@ -43,6 +44,7 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
     var showCookieDialog by remember { mutableStateOf(false) }
     var cookieError by remember { mutableStateOf(false) }
     var signingIn by remember { mutableStateOf(false) }
+    var userCode by remember { mutableStateOf<String?>(null) }
     var loginJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var importing by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
@@ -87,8 +89,9 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
             if (!loggedIn) {
                 if (signingIn) {
                     Text(str("ytm_login_waiting"))
+                    userCode?.let { Text(it, style = MaterialTheme.typography.headlineMedium) }
                     OutlinedButton(
-                        onClick = { loginJob?.cancel(); signingIn = false },
+                        onClick = { loginJob?.cancel(); signingIn = false; userCode = null },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text(str("btn_cancel")) }
                 } else {
@@ -99,14 +102,24 @@ fun YoutubeMusicScreen(onBackClick: () -> Unit) {
                             signingIn = true
                             loginJob = scope.launch {
                                 try {
-                                    val cookie = YtmBrowserLogin.login()
-                                    if (cookie != null) finishLogin(cookie) { n -> name = n; loggedIn = true }
-                                } catch (e: YtmBrowserLogin.NoBrowserException) {
-                                    status = str("ytm_login_no_browser")
+                                    val code = YtmOAuth.start()
+                                    userCode = code.userCode
+                                    openUrl(code.verificationUrl + "?user_code=" + code.userCode)
+                                    val tokens = YtmOAuth.await(code)
+                                    if (tokens != null) {
+                                        YtmSession.saveOAuth(tokens, null)
+                                        val account = withContext(Dispatchers.IO) { YouTube.accountInfo().getOrNull()?.name }
+                                        YtmSession.saveOAuth(tokens, account)
+                                        name = account
+                                        loggedIn = true
+                                    } else status = str("ytm_login_failed")
+                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                    throw e
                                 } catch (e: Exception) {
                                     status = str("ytm_import_failed", e.message ?: e.javaClass.simpleName)
                                 } finally {
                                     signingIn = false
+                                    userCode = null
                                 }
                             }
                         }
