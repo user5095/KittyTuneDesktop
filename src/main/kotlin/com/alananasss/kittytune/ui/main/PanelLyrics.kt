@@ -145,7 +145,7 @@ fun PanelLyrics(
                     border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
                 ) {
-                    androidx.compose.material3.Icon(
+                    com.alananasss.kittytune.ui.icons.Icon(
                         imageVector = Icons.Rounded.Search,
                         contentDescription = null,
                         modifier = Modifier.size(18.dp)

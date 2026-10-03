@@ -2886,7 +2886,7 @@ private fun MixOptionsDialog(
                             }
                         }
                         Spacer(Modifier.width(12.dp))
-                        androidx.compose.material3.Switch(
+                        com.alananasss.kittytune.ui.theme.Switch(
                             checked = prioritizeTrusted,
                             onCheckedChange = null,
                         )

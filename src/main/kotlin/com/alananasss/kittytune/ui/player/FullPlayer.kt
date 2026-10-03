@@ -835,7 +835,7 @@ private fun androidx.compose.animation.AnimatedVisibilityScope.ScreensaverOverla
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        androidx.compose.material3.Icon(
+                        com.alananasss.kittytune.ui.icons.Icon(
                             imageVector = Icons.Rounded.Schedule,
                             contentDescription = null,
                             tint = Color.White,
@@ -869,7 +869,7 @@ private fun androidx.compose.animation.AnimatedVisibilityScope.ScreensaverOverla
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        androidx.compose.material3.Icon(
+                        com.alananasss.kittytune.ui.icons.Icon(
                             imageVector = Icons.Rounded.MusicNote,
                             contentDescription = null,
                             tint = Color.White,
@@ -1683,12 +1683,21 @@ private fun QuietButton(
         shapes = IconButtonDefaults.shapes(),
         modifier = Modifier.size(size + 18.dp),
     ) {
-        androidx.compose.material3.Icon(
-            icon,
-            contentDescription = label,
-            tint = tint,
-            modifier = Modifier.size(size),
-        )
+        val skipName = icon.name.substringAfterLast('.')
+        if (com.alananasss.kittytune.ui.theme.LocalPixelTheme.current && (skipName == "SkipNext" || skipName == "SkipPrevious")) {
+            com.alananasss.kittytune.ui.theme.PixelSkipIcon(
+                forward = skipName == "SkipNext",
+                tint = tint,
+                modifier = Modifier.size(size * 0.8f),
+            )
+        } else {
+            com.alananasss.kittytune.ui.icons.Icon(
+                icon,
+                contentDescription = label,
+                tint = tint,
+                modifier = Modifier.size(size),
+            )
+        }
     }
 }
 
