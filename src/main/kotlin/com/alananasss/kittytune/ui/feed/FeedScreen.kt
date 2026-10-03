@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import com.alananasss.kittytune.ui.icons.Icon
 import com.alananasss.kittytune.ui.common.pressScale
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment

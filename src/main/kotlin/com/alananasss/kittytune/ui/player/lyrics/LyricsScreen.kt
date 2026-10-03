@@ -50,6 +50,7 @@ import androidx.compose.material.icons.rounded.OpenInFull
     import androidx.compose.material.icons.rounded.Tune
     import com.alananasss.kittytune.core.EscapableAlertDialog
     import androidx.compose.material3.*
+import com.alananasss.kittytune.ui.theme.Switch
 import androidx.compose.material3.ContainedLoadingIndicator
     import androidx.compose.runtime.*
     import kotlinx.coroutines.isActive

@@ -60,6 +60,7 @@ fun KittyTuneTheme(content: @Composable () -> Unit) {
         keyColor = keyColor,
         colorStyle = themePrefs.colorStyle,
         colorSpec = themePrefs.colorSpec,
+        pixelTheme = themePrefs.pixelTheme,
         typography = typography,
     ) {
         val scrollbarStyle = androidx.compose.foundation.defaultScrollbarStyle().copy(
@@ -85,6 +86,7 @@ private data class ThemePrefs(
     val dynamicColor: Boolean,
     val trackDynamicColor: Boolean,
     val pureBlack: Boolean,
+    val pixelTheme: Boolean,
     val keyColor: Int,
     val colorStyle: String,
     val colorSpec: String,
@@ -108,6 +110,7 @@ private fun PlayerPreferences.readThemePrefs() = ThemePrefs(
     dynamicColor = getDynamicTheme(),
     trackDynamicColor = getTrackDynamicTheme(),
     pureBlack = getPureBlack(),
+    pixelTheme = getPixelTheme(),
     keyColor = getKeyColor(),
     colorStyle = getColorStyle(),
     colorSpec = getColorSpec(),

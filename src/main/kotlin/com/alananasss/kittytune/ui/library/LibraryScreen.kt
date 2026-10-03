@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.ViewList
 import androidx.compose.material.icons.outlined.ExitToApp
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import com.alananasss.kittytune.ui.icons.Icon
 import com.alananasss.kittytune.core.trackTextInput
 import androidx.compose.runtime.*
 import androidx.compose.ui.input.pointer.PointerButton

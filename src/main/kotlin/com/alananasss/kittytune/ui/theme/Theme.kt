@@ -269,6 +269,7 @@ fun SoundTuneTheme(
     keyColor: Int = 0,
     colorStyle: String = "System",
     colorSpec: String = "SPEC_2025",
+    pixelTheme: Boolean = false,
     typography: androidx.compose.material3.Typography = Typography,
     content: @Composable () -> Unit,
 ) {
@@ -290,15 +291,17 @@ fun SoundTuneTheme(
         colorSpec = colorSpec,
     )
 
-    MaterialExpressiveTheme(
-        colorScheme = colorScheme,
-        typography = typography,
-        // Menus, tooltips and snackbars use the extra-small shape; the stock 4 dp made every dropdown look
-        // square next to the app's 16–28 dp cards, so they all get the same softer corner.
-        shapes = androidx.compose.material3.Shapes(
-            extraSmall = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
-        ),
-        content = content,
-        motionScheme = MotionScheme.expressive(),
-    )
+    androidx.compose.runtime.CompositionLocalProvider(LocalPixelTheme provides pixelTheme) {
+        MaterialExpressiveTheme(
+            colorScheme = colorScheme,
+            typography = if (pixelTheme) PixelTypography else typography,
+            // Menus, tooltips and snackbars use the extra-small shape; the stock 4 dp made every dropdown look
+            // square next to the app's 16–28 dp cards, so they all get the same softer corner.
+            shapes = androidx.compose.material3.Shapes(
+                extraSmall = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+            ),
+            content = content,
+            motionScheme = MotionScheme.expressive(),
+        )
+    }
 }

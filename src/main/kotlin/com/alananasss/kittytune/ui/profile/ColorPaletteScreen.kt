@@ -13,6 +13,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import com.alananasss.kittytune.ui.theme.Switch
+import com.alananasss.kittytune.ui.icons.Icon
 import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.runtime.*
 import com.alananasss.kittytune.core.str

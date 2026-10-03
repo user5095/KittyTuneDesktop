@@ -180,6 +180,7 @@ class PlayerPreferences {
         private const val KEY_APP_ICON_VARIANT = "app_icon_variant"
         private const val KEY_THEME_MODE = "app_theme_mode"
         private const val KEY_PURE_BLACK = "pure_black_enabled"
+        private const val KEY_PIXEL_THEME = "pixel_theme_enabled"
         private const val KEY_LOCAL_MEDIA_ENABLED = "local_media_enabled"
         private const val KEY_LOCAL_MEDIA_URIS_SET = "local_media_uris_set_v2"
         private const val KEY_PLAYER_BAR_BUTTONS = "player_bar_buttons"
@@ -703,6 +704,8 @@ class PlayerPreferences {
     fun setThemeMode(mode: AppThemeMode) = Prefs.putString(KEY_THEME_MODE, mode.name)
     fun getPureBlack(): Boolean = Prefs.getBoolean(KEY_PURE_BLACK, false)
     fun setPureBlack(enabled: Boolean) = Prefs.putBoolean(KEY_PURE_BLACK, enabled)
+    fun getPixelTheme(): Boolean = Prefs.getBoolean(KEY_PIXEL_THEME, false)
+    fun setPixelTheme(enabled: Boolean) = Prefs.putBoolean(KEY_PIXEL_THEME, enabled)
     fun getAutoplayEnabled(): Boolean = Prefs.getBoolean(KEY_AUTOPLAY_STATION, true)
     fun setAutoplayEnabled(enabled: Boolean) = Prefs.putBoolean(KEY_AUTOPLAY_STATION, enabled)
     fun getContinuousPlaybackEnabled(): Boolean = Prefs.getBoolean(KEY_CONTINUOUS_PLAYBACK, true)

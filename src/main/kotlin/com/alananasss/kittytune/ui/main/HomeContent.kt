@@ -111,7 +111,7 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.Icon
+import com.alananasss.kittytune.ui.icons.Icon
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.IconButton

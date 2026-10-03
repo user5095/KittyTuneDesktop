@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import com.alananasss.kittytune.ui.icons.Icon
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -61,6 +62,7 @@ fun ThemesSettingsPage(onOpenCustomTheme: () -> Unit) {
     var keyColor by remember { mutableIntStateOf(prefs.getKeyColor()) }
     var themeMode by remember { mutableStateOf(prefs.getThemeMode()) }
     var pureBlack by remember { mutableStateOf(prefs.getPureBlack()) }
+    var pixelTheme by remember { mutableStateOf(prefs.getPixelTheme()) }
     var themedTitleBar by remember { mutableStateOf(prefs.getThemedTitleBar()) }
     var appFont by remember { mutableStateOf(com.alananasss.kittytune.ui.theme.AppFont.parse(prefs.getAppFont())) }
     val appIconVariant by prefs.appIconVariantFlow().collectAsState(initial = prefs.getAppIconVariant())
@@ -180,6 +182,20 @@ fun ThemesSettingsPage(onOpenCustomTheme: () -> Unit) {
                     subtitle = fontLabel(appFont),
                     icon = Icons.Rounded.TextFields,
                     onClick = { showFontDialog = true },
+                )
+            }
+            add { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("pref_pixel_theme_title"),
+                    subtitle = str("pref_pixel_theme_sub"),
+                    hasSwitch = true,
+                    switchState = pixelTheme,
+                    onSwitchChange = {
+                        pixelTheme = it
+                        prefs.setPixelTheme(it)
+                    },
+                    highlightKey = "pref_pixel_theme",
                 )
             }
             add { shape ->
