@@ -30,9 +30,22 @@
 
 ### ~ what is this
 
-KittyTune Desktop is a complete, native desktop music player built from scratch with **Kotlin 2.4.20**, **Compose Multiplatform**, and **Material 3 Expressive**, designed primarily for Linux systems.
+KittyTune Desktop is a native desktop music player by [alan7383](https://github.com/alan7383/KittyTuneDesktop), written in Kotlin with Compose Multiplatform and Material 3 Expressive, aimed mainly at Linux. It runs on the JVM, with no Electron or web wrapper.
 
-No heavy web wrappers or Electron bloat here. Just a fast, lightweight JVM client that streams directly from **SoundCloud** (with full account sync for likes, reposts, and playlists), automatically upgrades to **Qobuz (Hi-Res Lossless)**, **TIDAL (FLAC)**, **Deezer**, or **YouTube Music** when available, renders live Apple-style karaoke lyrics, mixes transitions with DJ Automix, and features an integrated 30+ effects audio DSP rack.
+It streams from **SoundCloud** and syncs your likes, reposts and playlists. When a better source has the track, it can switch to **Qobuz** (Hi-Res Lossless), **TIDAL** (FLAC), **Deezer** or **YouTube Music**. It also shows live karaoke-style lyrics, crossfades tracks with DJ Automix, and includes an audio DSP rack with 30+ effects.
+
+> [!IMPORTANT]
+> **This is a personal fork** of the upstream project, kept in sync with it. Everything above is upstream's work; the section below lists what this fork adds.
+
+### + what this fork adds
+
+- **YouTube Music account**: sign in with Google (OAuth device flow, in your default browser), two-way sync of likes and artists, and import of your listening history.
+- **Faster playback start**: InnerTube fast path for YouTube with current ANDROID/IOS clients, and a parallel race between providers so the first stream that resolves wins.
+- **Pixel theme**: pixel font, pixel icons and pixel-style switches, toggled from the Themes settings.
+- **Tray fix** for Wayland/Hyprland (DBusMenu support) and media controls.
+- **Italian translation** and language option.
+- **In-app updates from this fork's releases**, with an automated workflow that merges upstream releases and publishes builds with the upstream changelog.
+- Tracks played from inside playlists are now recorded in history.
 
 ---
 
