@@ -3560,7 +3560,6 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         isAutoplayRadioLoading = true
         try {
             val videoId = lastTrack.permalinkUrl?.substringAfter("v=")?.substringBefore("&") ?: return
-            val radioUrl = "https://www.youtube.com/watch?v=$videoId&list=RD$videoId"
 
             withContext(Dispatchers.Main) {
                 val encodedUrl = if (lastTrack.permalinkUrl != null) URLEncoder.encode(lastTrack.permalinkUrl, "UTF-8") else ""
@@ -3588,26 +3587,22 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 HistoryRepository.addToHistory(historyPlaylist, isStation = true)
             }
 
-            val youtubeService = ServiceList.YouTube
-            val extractor = youtubeService.getPlaylistExtractor(radioUrl)
-
-            withContext(Dispatchers.IO) {
-                extractor.fetchPage()
-            }
-
-            val streamItems = extractor.initialPage.items.filterIsInstance<StreamInfoItem>()
-            val radioTracks = streamItems.map {
+            val radioTracks = withContext(Dispatchers.IO) {
+                com.zionhuang.innertube.YouTube.next(
+                    com.zionhuang.innertube.models.WatchEndpoint(videoId = videoId, playlistId = "RDAMVM$videoId")
+                ).getOrThrow().items
+            }.map {
                 Track(
-                    id = kotlin.math.abs(it.url.hashCode().toLong()),
-                    title = it.name,
+                    id = abs(it.id.hashCode().toLong()),
+                    title = it.title,
                     user = User(
-                        id = it.uploaderUrl?.hashCode()?.toLong() ?: 0L,
-                        username = it.uploaderName,
-                        avatarUrl = it.uploaderAvatars.firstOrNull()?.url
+                        id = it.artists.firstOrNull()?.id?.hashCode()?.toLong() ?: 0L,
+                        username = it.artists.joinToString(", ") { a -> a.name }.ifEmpty { "YouTube Music" },
+                        avatarUrl = null
                     ),
-                    artworkUrl = it.thumbnails.firstOrNull()?.url,
-                    durationMs = it.duration * 1000,
-                    permalinkUrl = it.url,
+                    artworkUrl = it.thumbnail,
+                    durationMs = (it.duration ?: 0) * 1000L,
+                    permalinkUrl = "https://youtube.com/watch?v=${it.id}",
                     source = "youtube"
                 )
             }
