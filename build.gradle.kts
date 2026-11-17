@@ -372,7 +372,11 @@ compose.desktop {
             // every release, otherwise Windows Installer refuses the upgrade with
             // "Another version of this product is already installed" (issue #73).
             // Never hardcode this again — it drifted (1.3.9) while version moved to 1.4.0.
-            packageVersion = project.version.toString()
+            // The fork's releases are MAJOR.MINOR.PATCH.N, which dmg/msi reject (3 numbers max): fold N into
+            // PATCH (x.y.z.n -> x.y.(z*1000+n)) so every fork release still has a higher package version.
+            packageVersion = project.version.toString().split(".").let { p ->
+                if (p.size < 4) p.joinToString(".") else "${p[0]}.${p[1]}.${p[2].toInt() * 1000 + p[3].toInt()}"
+            }
             description = "KittyTuneDesktop"
             vendor = "KittyTune"
 
