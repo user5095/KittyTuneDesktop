@@ -5,17 +5,25 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Paint
+import androidx.compose.ui.graphics.ClipOp
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
@@ -24,7 +32,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.runtime.withFrameMillis
 import com.alananasss.kittytune.data.local.LyricsDisplayStyle
 import kotlinx.coroutines.isActive
 
@@ -126,19 +133,32 @@ internal object LyricLineStyling {
  * The panel used to have only the third, whatever the setting said. It now shares all three with the full
  * screen, which is the only way "highlight the lyrics word by word" can mean the same thing in both.
  *
- * @param positionMs the playback position the drawing should reflect, already adjusted by the user's offset.
- *   A float because the position is interpolated between progress ticks to keep the fill smooth.
+ * @param positionMs supplies the playback position the drawing should reflect, already adjusted by
+ *   the user's offset. A provider rather than a value so the per-frame interpolation is read where
+ *   it lands — in the draw phase for the fill, in a derived state for the word colouring — instead
+ *   of recomposing this whole composable sixty times a second.
  * @param inactiveColor a line that is not the current one.
  * @param unsungColor the part of the *current* line that has not been reached yet. A separate colour because
  *   it is a separate thing: text waiting its turn inside the line being sung, not a line out of focus.
  * @param textModifier applied to the text itself, for decoration that has to draw over the glyphs — the
  *   full screen's hover rule. Kept separate from [modifier] because that one lays the line out.
  */
+/**
+ * The top-to-bottom fill of a line-by-line lyric line (port of Android PR #83): while the line is current, a soft
+ * gradient band travels down the text at the pace of playback, lit above and dim below, with a glow that grows
+ * as the line goes. Only for lines without word timings.
+ */
+internal data class LyricSweepSpec(
+    val brightColor: Color,
+    val dimColor: Color,
+    val progress: () -> Float,
+)
+
 @Composable
 internal fun LyricLineText(
     line: LyricLine,
     isActive: Boolean,
-    positionMs: Float,
+    positionMs: () -> Float,
     wordSync: Boolean,
     fillEffect: Boolean,
     activeStyle: TextStyle,
@@ -150,16 +170,52 @@ internal fun LyricLineText(
     modifier: Modifier = Modifier,
     textModifier: Modifier = Modifier,
     onTextLayout: (TextLayoutResult) -> Unit = {},
+    /** Fill the width given. Off, the line is as wide as its words are, up to what it was given. */
+    fillWidth: Boolean = true,
+    /** The line-by-line sweep, for the current line; ignored when the line has word timings. */
+    sweep: LyricSweepSpec? = null,
 ) {
     val words = if (wordSync && isActive) line.words else emptyList()
+    val fullWidth = if (fillWidth) Modifier.fillMaxWidth() else Modifier
 
     if (words.isEmpty()) {
+        if (sweep != null && isActive) {
+            // The band's position is read in a derivedStateOf, so only the current line follows the clock.
+            var textHeightPx by remember { mutableFloatStateOf(1f) }
+            val sweepProgress by remember(sweep) { derivedStateOf { sweep.progress().coerceIn(0f, 1f) } }
+            val bandOrigin = sweepProgress * textHeightPx
+            // A finished line is fully lit: the soft band would otherwise leave its last pixels half-dim.
+            val sweepDone = sweepProgress >= 1f
+            val brush = if (sweepDone) null else Brush.verticalGradient(
+                colors = listOf(sweep.brightColor, sweep.dimColor),
+                startY = bandOrigin - 10f,
+                endY = bandOrigin + 10f,
+            )
+            Text(
+                text = line.text,
+                style = activeStyle.copy(
+                    brush = brush,
+                    shadow = androidx.compose.ui.graphics.Shadow(
+                        color = sweep.brightColor.copy(alpha = 0.5f),
+                        blurRadius = sweepProgress * 20f,
+                    ),
+                ),
+                color = if (sweepDone) sweep.brightColor else Color.White, // ignored while a brush is set
+                textAlign = textAlign,
+                modifier = modifier.then(fullWidth).then(textModifier),
+                onTextLayout = {
+                    textHeightPx = it.size.height.toFloat().coerceAtLeast(1f)
+                    onTextLayout(it)
+                },
+            )
+            return
+        }
         Text(
             text = line.text,
             style = if (isActive) activeStyle else inactiveStyle,
             color = if (isActive) activeColor else inactiveColor,
             textAlign = textAlign,
-            modifier = modifier.fillMaxWidth().then(textModifier),
+            modifier = modifier.then(fullWidth).then(textModifier),
             onTextLayout = onTextLayout,
         )
         return
@@ -170,11 +226,18 @@ internal fun LyricLineText(
     val text = remember(words) { words.joinToString("") { it.text } }
 
     if (!fillEffect) {
-        val coloured = buildAnnotatedString {
-            for (word in words) {
-                val reached = positionMs >= word.startTime
-                withStyle(SpanStyle(color = if (reached) activeColor else unsungColor)) {
-                    append(word.text)
+        // Derived rather than built during composition: the string only differs from the previous
+        // one when a word flips from unsung to sung, so this recomposes on word boundaries instead
+        // of every frame.
+        val coloured by remember(words, activeColor, unsungColor, positionMs) {
+            derivedStateOf {
+                buildAnnotatedString {
+                    for (word in words) {
+                        val reached = positionMs() >= word.startTime
+                        withStyle(SpanStyle(color = if (reached) activeColor else unsungColor)) {
+                            append(word.text)
+                        }
+                    }
                 }
             }
         }
@@ -182,13 +245,15 @@ internal fun LyricLineText(
             text = coloured,
             style = activeStyle,
             textAlign = textAlign,
-            modifier = modifier.fillMaxWidth().then(textModifier),
+            modifier = modifier.then(fullWidth).then(textModifier),
             onTextLayout = onTextLayout,
         )
         return
     }
 
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val layerPaint = remember { Paint() }
+    val keepPath = remember { Path() }
     val ranges = remember(words) {
         var start = 0
         words.map { word ->
@@ -198,13 +263,13 @@ internal fun LyricLineText(
         }
     }
 
-    Box(modifier.fillMaxWidth()) {
+    Box(modifier.then(fullWidth)) {
         Text(
             text = text,
             style = activeStyle,
             color = unsungColor,
             textAlign = textAlign,
-            modifier = Modifier.fillMaxWidth().then(textModifier),
+            modifier = fullWidth.then(textModifier),
             onTextLayout = {
                 layout = it
                 onTextLayout(it)
@@ -215,36 +280,63 @@ internal fun LyricLineText(
             style = activeStyle,
             color = activeColor,
             textAlign = textAlign,
-            modifier = Modifier.fillMaxWidth().drawWithContent {
+            modifier = fullWidth.drawWithContent {
                 val result = layout ?: return@drawWithContent
-                // Clamped to this line's own end so the fill can only ever complete, never overrun and
-                // then snap back when the next line takes over.
+                // Read here, in the draw phase: the frame-clock state write invalidates the draw
+                // only, not the composition. Clamped to this line's own end so the fill can only
+                // ever complete, never overrun and then snap back when the next line takes over.
+                val rawPosition = positionMs()
                 val position =
-                    if (line.endTime > line.startTime) positionMs.coerceAtMost(line.endTime.toFloat())
-                    else positionMs
-                clipPath(sungPath(result, words, ranges, text.length, position)) {
+                    if (line.endTime > line.startTime) rawPosition.coerceAtMost(line.endTime.toFloat())
+                    else rawPosition
+                val region = sungRegion(result, words, ranges, text.length, position)
+                // The bright copy is drawn in a layer and the part not sung yet rubbed out of it, with the playhead's
+                // edge fading instead of cut straight: the same soft fill the full screen's karaoke has.
+                drawIntoCanvas { canvas ->
+                    canvas.saveLayer(Rect(Offset.Zero, size), layerPaint)
                     this@drawWithContent.drawContent()
+                    keepPath.rewind()
+                    keepPath.addPath(region.sung)
+                    region.band?.let { keepPath.addRect(it) }
+                    // Everything outside the sung part is rubbed out; clipping to the difference needs no extra paths.
+                    clipPath(keepPath, clipOp = ClipOp.Difference) {
+                        drawRect(Color.White, size = size, blendMode = BlendMode.DstOut)
+                    }
+                    region.band?.let { band ->
+                        drawRect(
+                            brush = Brush.horizontalGradient(0f to Color.Transparent, 1f to Color.White, startX = band.left, endX = band.right),
+                            topLeft = band.topLeft,
+                            size = band.size,
+                            blendMode = BlendMode.DstOut,
+                        )
+                    }
+                    canvas.restore()
                 }
             },
         )
     }
 }
 
+/** What has been sung of a line: [sung] in full, and [band], the soft edge at the playhead, which fades out to the right. */
+private class SungRegion(val sung: Path, val band: Rect?)
+
 /**
  * The region of the line that has been sung by [positionMs].
  *
- * Whole characters for words already finished, and a fraction of one character for the word in progress —
- * which is what separates a smooth fill from a word-by-word jump.
+ * Whole characters for words already finished, and a fraction of one character for the word in progress, which is
+ * what separates a smooth fill from a word-by-word jump. The edge at the playhead is a band that narrows to nothing
+ * at a word's start and end, as the full screen's fill does, so a finished word is never left half faded.
  */
-private fun sungPath(
+private fun sungRegion(
     layout: TextLayoutResult,
     words: List<LyricWord>,
     ranges: List<Pair<Int, Int>>,
     textLength: Int,
     positionMs: Float,
-): Path {
+): SungRegion {
     val path = Path()
     val lastIndex = (textLength - 1).coerceAtLeast(0)
+    var band: Rect? = null
 
     for (i in words.indices) {
         val word = words[i]
@@ -267,11 +359,20 @@ private fun sungPath(
         if (partial < to) {
             val box = layout.getBoundingBox(partial.coerceIn(0, lastIndex))
             val edge = box.left + (box.right - box.left) * (exact - whole)
-            path.addRect(Rect(box.left, box.top, edge, box.bottom))
+            val wordLeft = layout.getBoundingBox(from.coerceIn(0, lastIndex)).left
+            val wordRight = layout.getBoundingBox((to - 1).coerceIn(0, lastIndex)).right
+            // A word broken across two rows has no single width to fade over.
+            val soft = if (wordRight > wordLeft) minOf(box.height * SOFT_EDGE_EMS, (edge - wordLeft) * 2f, (wordRight - edge) * 2f) else 0f
+            val half = soft.coerceAtLeast(0f) / 2f
+            path.addRect(Rect(box.left, box.top, (edge - half).coerceAtLeast(box.left), box.bottom))
+            if (half > 0.5f) band = Rect(edge - half, box.top, edge + half, box.bottom)
         }
     }
-    return path
+    return SungRegion(path, band)
 }
+
+/** The widest the fill's soft edge gets, as a multiple of the line's height. */
+private const val SOFT_EDGE_EMS = 1.6f
 
 /**
  * The playback position, interpolated between the player's reports (issue #33).
@@ -285,25 +386,51 @@ private fun sungPath(
  * when the real position finally arrived — reported as "one line goes straight to the end and jumps around".
  *
  * Shared so the panel's fill is as smooth as the full screen's rather than stepping four times a second.
+ *
+ * Returns the raw State on purpose: read it where it is used — inside a draw lambda (redraw only) or a
+ * [derivedStateOf] (recomposition only when the derived value changes) — never straight into a composition.
+ * The old Float-returning signature forced every caller to read the per-frame value during composition,
+ * which recomposed the visible lyric lines and the mini-player at 60 fps for the whole song.
+ */
+/**
+ * Interpolated playback position, updated per frame so word-fill and progress move smoothly between
+ * the player's 4–5 Hz position reports.
+ *
+ * Takes a `() -> Long` lambda (not a `Long`) so the caller's composable doesn't recompose on every
+ * position tick. The lambda is read inside the frame loop, where a jump > 200 ms (a seek or a
+ * re-sync report) snaps the smooth position to the reported value, and small deltas are
+ * extrapolated from the last known anchor. This matches the old `LaunchedEffect(positionMs, …)`
+ * restart-on-every-tick behaviour without invalidating the caller's composition.
  */
 @Composable
 internal fun rememberSmoothPosition(
-    positionMs: Long,
+    positionMs: () -> Long,
     isPlaying: Boolean,
     speed: Float,
-): Float {
-    var smooth by remember { mutableFloatStateOf(positionMs.toFloat()) }
-    LaunchedEffect(positionMs, isPlaying, speed) {
+): State<Float> {
+    val initial = positionMs()
+    val smooth = remember { mutableFloatStateOf(initial.toFloat()) }
+    // The playback position for the words moves on the shared ambient pulse, not every frame: it is what kept the full
+    // player redrawing at the display's rate — 240 times a second on a 240 Hz monitor — for as long as a song played
+    // (see AmbientClock). Line changes and scrolls the reader starts are animations of their own and keep the full rate.
+    val ambientClock = com.alananasss.kittytune.ui.common.LocalAmbientClock.current
+    LaunchedEffect(isPlaying, speed, ambientClock) {
         if (!isPlaying) {
-            smooth = positionMs.toFloat()
+            smooth.floatValue = positionMs().toFloat()
             return@LaunchedEffect
         }
-        val startedAtMs = System.currentTimeMillis()
-        val startedAt = positionMs.toFloat()
+        var lastReported = positionMs().toFloat()
+        var lastReportedAtMs = System.currentTimeMillis()
         while (isActive) {
-            withFrameMillis {
-                val elapsed = (System.currentTimeMillis() - startedAtMs).coerceAtMost(MAX_EXTRAPOLATION_MS)
-                smooth = startedAt + (elapsed * speed)
+            com.alananasss.kittytune.ui.common.withAmbientFrameNanos(ambientClock) {
+                val now = System.currentTimeMillis()
+                val reported = positionMs().toFloat()
+                if (reported != lastReported) {
+                    lastReported = reported
+                    lastReportedAtMs = now
+                }
+                val elapsed = (now - lastReportedAtMs).coerceIn(0L, MAX_EXTRAPOLATION_MS)
+                smooth.floatValue = lastReported + (elapsed * speed)
             }
         }
     }
@@ -312,3 +439,34 @@ internal fun rememberSmoothPosition(
 
 /** One report interval plus slack. Past this the estimate is guessing, not interpolating. */
 private const val MAX_EXTRAPOLATION_MS = 400L
+
+/**
+ * This line with its words timed evenly across it, when it has none of its own timings (a line timed only as a whole).
+ *
+ * Each word gets a share of the time in proportion to its letters, so the line can fill in smoothly like one timed
+ * word by word, if only by a guess. The line's own end is used when it has one, else [fallbackEndMs] (usually where
+ * the next line starts), else a few seconds.
+ */
+internal fun LyricLine.withEvenWords(fallbackEndMs: Long?): LyricLine {
+    if (words.isNotEmpty() || text.isBlank()) return this
+    val end = when {
+        endTime > startTime -> endTime
+        fallbackEndMs != null && fallbackEndMs > startTime -> fallbackEndMs
+        else -> startTime + DEFAULT_LINE_MS
+    }
+    val pieces = Regex("""\S+\s*""").findAll(text).map { it.value }.toList()
+    if (pieces.isEmpty()) return this
+    val weights = pieces.map { it.trimEnd().length.coerceAtLeast(1) }
+    val total = weights.sum().toDouble()
+    val span = (end - startTime).toDouble()
+    var elapsed = 0
+    val timed = pieces.mapIndexed { i, piece ->
+        val from = startTime + (span * elapsed / total).toLong()
+        elapsed += weights[i]
+        val to = startTime + (span * elapsed / total).toLong()
+        LyricWord(piece, from, to)
+    }
+    return copy(words = timed, endTime = end)
+}
+
+private const val DEFAULT_LINE_MS = 4_000L

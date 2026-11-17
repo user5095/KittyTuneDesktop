@@ -1,3 +1,4 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 package com.alananasss.kittytune.ui.recognition
 
 import androidx.compose.material3.IconButtonDefaults
@@ -6,6 +7,7 @@ import androidx.compose.material3.ButtonDefaults
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.onClick
 import androidx.compose.foundation.layout.*
 import com.alananasss.kittytune.ui.common.ScrollableLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -33,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.alananasss.kittytune.data.RecognitionHistoryRepository
+import com.alananasss.kittytune.data.BlockManager
 import com.alananasss.kittytune.data.local.RecognitionHistoryItem
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.domain.Track
@@ -51,11 +54,17 @@ fun RecognitionHistoryScreen(
     var searchQuery by remember { mutableStateOf("") }
     var showClearHistoryDialog by remember { mutableStateOf(false) }
     
-    val filteredItems = remember(searchQuery, historyItems) {
+    // Recognition items carry no artist id, so only track blocks can apply here.
+    val blockedTrackIds by BlockManager.blockedTrackIdsFlow.collectAsState()
+    val unblockedHistory = remember(historyItems, blockedTrackIds) {
+        historyItems.filter { it.trackId == null || !BlockManager.isTrackBlocked(it.trackId) }
+    }
+
+    val filteredItems = remember(searchQuery, unblockedHistory) {
         if (searchQuery.isBlank()) {
-            historyItems
+            unblockedHistory
         } else {
-            historyItems.filter {
+            unblockedHistory.filter {
                 it.title.contains(searchQuery, ignoreCase = true) ||
                 it.artist.contains(searchQuery, ignoreCase = true)
             }
@@ -179,7 +188,7 @@ fun RecognitionHistoryScreen(
                         items(items, key = { it.id }) { item ->
                             HistoryItemRow(
                                 item = item,
-                                currentlyPlayingTrack = playerViewModel.currentTrack,
+                                currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
                                 onClick = {
                                     if (item.trackId != null) {
                                         val trackList = filteredItems.mapNotNull { historyItem ->
@@ -236,6 +245,7 @@ fun HistoryItemRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .onClick(matcher = androidx.compose.foundation.PointerMatcher.mouse(androidx.compose.ui.input.pointer.PointerButton.Secondary), onClick = onOptionsClick)
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -296,12 +306,5 @@ fun HistoryItemRow(
             )
         }
 
-        IconButton(shapes = IconButtonDefaults.shapes(), onClick = onOptionsClick) {
-            Icon(
-                Icons.Rounded.MoreVert,
-                contentDescription = "Options",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
     }
 }

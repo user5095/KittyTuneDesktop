@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CalendarToday
 import androidx.compose.material.icons.rounded.Comment
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.Info
@@ -23,10 +24,14 @@ import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material3.FilledTonalIconButton
 import com.alananasss.kittytune.ui.icons.Icon
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,6 +43,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.Strings
 import com.alananasss.kittytune.core.str
+import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.domain.Track
 import com.alananasss.kittytune.ui.common.ArtistLinkText
 import com.alananasss.kittytune.ui.common.viewableCover
@@ -62,9 +68,10 @@ internal fun TrackInfoHeader(
     isSpotifyTrack: Boolean,
     isCompact: Boolean,
     isUltraCompact: Boolean,
+    onCommentsClick: () -> Unit = {},
 ) {
-    val isCurrentTrack = track.id == vm.currentTrack?.id ||
-        (track.title == vm.currentTrack?.title && track.user?.username == vm.currentTrack?.user?.username)
+    val isCurrentTrack = track.id == vm.uiCurrentTrack?.id ||
+        (track.title == vm.uiCurrentTrack?.title && track.user?.username == vm.uiCurrentTrack?.user?.username)
     val animatedCoverUrl = if (isCurrentTrack) vm.currentAnimatedCoverUrl else null
 
     Column(verticalArrangement = Arrangement.spacedBy(if (isCompact) 10.dp else 14.dp)) {
@@ -78,7 +85,7 @@ internal fun TrackInfoHeader(
                 AnimatedArtwork(
                     artworkUrl = track.fullResArtwork,
                     animatedCoverUrl = animatedCoverUrl,
-                    isPlaying = vm.isPlaying,
+                    isPlaying = vm.uiIsPlaying,
                     contentDescription = null,
                     modifier = Modifier
                         .size(if (isUltraCompact) 64.dp else 96.dp)
@@ -92,7 +99,7 @@ internal fun TrackInfoHeader(
             AnimatedArtwork(
                 artworkUrl = track.fullResArtwork,
                 animatedCoverUrl = animatedCoverUrl,
-                isPlaying = vm.isPlaying,
+                isPlaying = vm.uiIsPlaying,
                 contentDescription = null,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -104,7 +111,7 @@ internal fun TrackInfoHeader(
             TitleAndArtist(vm, track, isSpotifyTrack, isLarge = true)
         }
 
-        if (isSpotifyTrack) SpotifyStats(track) else SoundCloudStats(vm, track)
+        if (isSpotifyTrack) SpotifyStats(track) else SoundCloudStats(vm, track, onCommentsClick)
     }
 }
 
@@ -117,19 +124,27 @@ private fun TitleAndArtist(
     modifier: Modifier = Modifier,
 ) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text(
-            text = track.title ?: "",
-            style = if (isLarge) MaterialTheme.typography.titleLarge else MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = track.title ?: "",
+                style = if (isLarge) MaterialTheme.typography.titleLarge else MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            if (track.isGoPlus) {
+                Spacer(Modifier.width(6.dp))
+                com.alananasss.kittytune.ui.common.GoPlusBadge()
+            }
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             // navigateToTrackArtist routes both sources, and opens the picker when several artists are credited.
             ArtistLinkText(
                 track = track,
                 onArtistClick = { vm.navigateToTrackArtist(it) },
-                text = track.user?.username ?: "",
+                // The track's own credit, not the account that posted it, which can be shared by two artists.
+                text = track.displayArtist.ifBlank { track.user?.username.orEmpty() },
                 style = if (isLarge) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.primary,
                 hoverColor = MaterialTheme.colorScheme.primary,
@@ -145,35 +160,69 @@ private fun TitleAndArtist(
                 )
             }
         }
+        // The lead artist's monthly listeners, for a sense of who this is.
+        com.alananasss.kittytune.ui.common.MonthlyListenersText(
+            artistName = remember(track.id) { com.alananasss.kittytune.data.lyrics.GeniusVoices.splitNames(track.displayArtist).firstOrNull() },
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
 /**
- * Plays, likes, reposts and comments, and a round button into the track's page. Likes and reposts open
- * the matching list on that page. Local files (negative ids) have none of these, so they get the button only.
+ * Plays, likes, reposts and comments. Likes and reposts open
+ * the matching list on that page; comments switches to the comments
+ * half and scrolls it into view.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SoundCloudStats(vm: PlayerViewModel, track: Track) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        FlowRow(
-            modifier = Modifier.weight(1f),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            if (track.id > 0) {
-                StatPill(Icons.Rounded.PlayArrow, compactCount(track.playbackCount.toLong()))
-                StatPill(Icons.Rounded.Favorite, compactCount(track.likesCount.toLong())) {
-                    vm.navigateToTrackDetails(track.id, 0)
-                }
-                StatPill(Icons.Rounded.Repeat, compactCount(track.repostsCount.toLong())) {
-                    vm.navigateToTrackDetails(track.id, 1)
-                }
-                StatPill(Icons.Rounded.Comment, compactCount(track.commentCount.toLong()))
+private fun SoundCloudStats(vm: PlayerViewModel, track: Track, onCommentsClick: () -> Unit) {
+    if (track.id <= 0) return
+    val hiddenStats = rememberHiddenPanelTrackStats()
+    val showPlays = PlayerPreferences.PANEL_STAT_PLAYS !in hiddenStats
+    val showLikes = PlayerPreferences.PANEL_STAT_LIKES !in hiddenStats
+    val showReposts = PlayerPreferences.PANEL_STAT_REPOSTS !in hiddenStats
+    val showComments = PlayerPreferences.PANEL_STAT_COMMENTS !in hiddenStats
+    val showInfo = PlayerPreferences.PANEL_STAT_INFO !in hiddenStats
+
+    if (!showPlays && !showLikes && !showReposts && !showComments && !showInfo) return
+
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (showPlays) {
+            StatPill(Icons.Rounded.PlayArrow, compactCount(track.playbackCount.toLong()))
+        }
+        if (showLikes) {
+            StatPill(Icons.Rounded.Favorite, compactCount(track.likesCount.toLong())) {
+                vm.navigateToTrackDetails(track.id, 0)
             }
         }
-        FilledTonalIconButton(onClick = { vm.navigateToTrackDetails(track.id, 0) }, modifier = Modifier.size(36.dp)) {
-            Icon(Icons.Rounded.Info, contentDescription = str("detail_track_title"), modifier = Modifier.size(18.dp))
+        if (showReposts) {
+            StatPill(Icons.Rounded.Repeat, compactCount(track.repostsCount.toLong())) {
+                vm.navigateToTrackDetails(track.id, 1)
+            }
+        }
+        if (showComments) {
+            StatPill(Icons.Rounded.Comment, compactCount(track.commentCount.toLong())) {
+                onCommentsClick()
+            }
+        }
+        // The date sits with the numbers, in the same pill, in the room the row has left after them.
+        ReleaseDatePill(track)
+        if (showInfo) {
+            FilledTonalIconButton(
+                onClick = { vm.navigateToTrackDetails(track.id, 0) },
+                shapes = IconButtonDefaults.shapes(),
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    Icons.Rounded.Info,
+                    contentDescription = str("detail_track_title"),
+                    modifier = Modifier.size(15.dp)
+                )
+            }
         }
     }
 }
@@ -181,16 +230,36 @@ private fun SoundCloudStats(vm: PlayerViewModel, track: Track) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SpotifyStats(track: Track) {
+    val hiddenStats = rememberHiddenPanelTrackStats()
+    val showPlays = PlayerPreferences.PANEL_STAT_PLAYS !in hiddenStats
     FlowRow(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         StatPill(label = str("music_provider_spotify"), tint = SpotifyGreen)
         val streams = track.playCount ?: track.playbackCount.takeIf { it > 0 }?.toLong()
-        if (streams != null && streams > 0) {
+        if (showPlays && streams != null && streams > 0) {
             StatPill(Icons.Rounded.PlayArrow, compactCount(streams) + " " + str("spotify_streams_formatted"))
         }
         if (track.publisherMetadata?.explicit == true) StatPill(label = "E")
+        ReleaseDatePill(track)
+    }
+}
+
+/** When the track came out, as one more of the numbers; nothing when it has no date. */
+@Composable
+private fun ReleaseDatePill(track: Track) {
+    val date = remember(track.id, track.releaseDate, track.createdAt) {
+        com.alananasss.kittytune.ui.profile.ReleaseDate.shortText(track.releaseDate ?: track.createdAt)
+    }
+    if (date.isNotEmpty()) StatPill(Icons.Rounded.CalendarToday, date)
+}
+
+@Composable
+private fun rememberHiddenPanelTrackStats(): Set<String> {
+    val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
+    return remember(prefsSnapshot) {
+        PlayerPreferences().getHiddenPanelTrackStats()
     }
 }
 

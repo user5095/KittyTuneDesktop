@@ -47,6 +47,7 @@ object Strings {
             "ru" -> "ru-RU,ru;q=0.9,en;q=0.8"
             "vi" -> "vi-VN,vi;q=0.9,en;q=0.8"
             "it" -> "it-IT,it;q=0.9,en;q=0.8"
+            "tr" -> "tr-TR,tr;q=0.9,en;q=0.8"
             "en" -> "en-US,en;q=0.9"
             else -> {
                 val defaultLocale = Locale.getDefault()
@@ -62,7 +63,7 @@ object Strings {
     }
 
     private fun effectiveLang(): String = when (appLanguage) {
-        "fr", "en", "de", "hu", "ru", "vi", "it" -> appLanguage
+        "fr", "en", "de", "hu", "ru", "vi", "it", "tr" -> appLanguage
         else -> when (Locale.getDefault().language) {
             "fr" -> "fr"
             "de" -> "de"
@@ -70,6 +71,7 @@ object Strings {
             "ru" -> "ru"
             "vi" -> "vi"
             "it" -> "it"
+            "tr" -> "tr"
             else -> "en"
         }
     }

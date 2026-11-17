@@ -26,6 +26,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.data.local.PlayerSliderStyle
+import androidx.compose.material3.ButtonDefaults
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -46,7 +47,7 @@ fun SliderStyleDialog(
             Text(str("pref_slider_style", "Style du curseur"))
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) {
                 Text(str("btn_cancel", "Annuler"))
             }
         },
@@ -166,10 +167,13 @@ fun SliderStyleDialog(
                             }
                             .padding(12.dp)
                     ) {
-                        androidx.compose.material3.Slider(
+                        val previewSliderState = androidx.compose.material3.rememberSliderState(
                             value = 0.65f,
+                            trackRange = 0f..1f
+                        )
+                        androidx.compose.material3.Slider(
+                            state = previewSliderState,
                             onValueChange = {},
-                            valueRange = 0f..1f,
                             thumb = { Spacer(modifier = Modifier.size(0.dp)) },
                             track = { sliderState ->
                                 PlayerSliderTrack(

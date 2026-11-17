@@ -34,7 +34,8 @@ import javax.swing.SwingUtilities
 
 @Composable
 fun LocalMediaSettingsScreen(
-    onBackClick: (() -> Unit)? = null
+    onBackClick: (() -> Unit)? = null,
+    horizontalPadding: androidx.compose.ui.unit.Dp = 16.dp
 ) {
     val prefs = remember { PlayerPreferences() }
     val scope = rememberCoroutineScope()
@@ -49,15 +50,16 @@ fun LocalMediaSettingsScreen(
 
     fun openFolderPicker() {
         SwingUtilities.invokeLater {
-            val chooser = JFileChooser()
-            chooser.fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
-            chooser.dialogTitle = str("pref_local_add")
-            if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
-                val selectedFile = chooser.selectedFile
-                if (selectedFile != null) {
-                    prefs.addLocalMediaUri(selectedFile.absolutePath)
-                    folderUris = prefs.getLocalMediaUris().toList()
+            // The system's folder dialog where there is one; the Swing chooser elsewhere.
+            val picked = com.alananasss.kittytune.core.NativeFileDialog.openFolder(str("pref_local_add"))
+                ?: if (com.alananasss.kittytune.core.NativeFileDialog.isWindowsHost) null else JFileChooser().run {
+                    fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
+                    dialogTitle = str("pref_local_add")
+                    if (showOpenDialog(null) == JFileChooser.APPROVE_OPTION) selectedFile else null
                 }
+            if (picked != null) {
+                prefs.addLocalMediaUri(picked.absolutePath)
+                folderUris = prefs.getLocalMediaUris().toList()
             }
         }
     }
@@ -75,6 +77,7 @@ fun LocalMediaSettingsScreen(
     Column(modifier = Modifier.fillMaxWidth()) {
             Box {
                 SettingsGroup(
+                    horizontalPadding = horizontalPadding,
                     title = str("settings_cat_general"),
                     items = listOf(
                         { shape ->
@@ -185,7 +188,7 @@ fun LocalMediaSettingsScreen(
                                                                 maxLines = 1,
                                                                 color = MaterialTheme.colorScheme.onSurface
                                                             )
-                                                            IconButton(onClick = { deleteFolderWithAnimation(uriString) }
+                                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { deleteFolderWithAnimation(uriString) }
                                                             ) {
                                                                 Icon(
                                                                     Icons.Rounded.Delete,
@@ -217,6 +220,7 @@ fun LocalMediaSettingsScreen(
                         itemsList.add(dynamicContentItem)
 
                         SettingsGroup(
+                            horizontalPadding = horizontalPadding,
                             title = str("pref_local_folders"),
                             items = itemsList
                         )
@@ -249,7 +253,7 @@ fun LocalMediaSettingsScreen(
                                     ),
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(horizontal = 16.dp)
+                                        .padding(horizontal = horizontalPadding)
                                         .height(56.dp)
                                 ) {
                                     if (isScanning) {

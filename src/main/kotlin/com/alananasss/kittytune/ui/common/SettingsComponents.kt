@@ -29,12 +29,18 @@ import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import kotlinx.coroutines.delay
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
@@ -71,12 +77,13 @@ fun SettingsGroupTitle(title: String) {
 @Composable
 fun SettingsGroup(
     title: String? = null,
-    items: List<@Composable (Shape) -> Unit>
+    items: List<@Composable (Shape) -> Unit>,
+    horizontalPadding: androidx.compose.ui.unit.Dp = 16.dp
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .padding(horizontal = horizontalPadding, vertical = 8.dp)
     ) {
         if (title != null) {
             SettingsGroupTitle(title)
@@ -123,30 +130,27 @@ fun SettingsItem(
     sliderRange: ClosedFloatingPointRange<Float> = 0f..1f,
     onSliderChange: ((Float) -> Unit)? = null,
     titleColor: Color = MaterialTheme.colorScheme.onSurface,
-    highlightKey: String? = null
+    highlightKey: String? = null,
+    enabled: Boolean = true,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
 
     val isHighlighted = SettingsHighlightManager.isHighlighted(highlightKey)
     val bringIntoViewRequester = remember { BringIntoViewRequester() }
     val highlightAlpha = remember { Animatable(0f) }
+    var itemCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
 
     val primaryColor = MaterialTheme.colorScheme.primary
     val baseColor = MaterialTheme.colorScheme.surfaceContainerHigh
     val highlightOverlay = remember(primaryColor) { primaryColor.copy(alpha = 0.26f) }
     val highlightedBaseColor = remember(highlightOverlay, baseColor) { highlightOverlay.compositeOver(baseColor) }
 
-    val isScrolling = SettingsHighlightManager.isScrollingToTarget
-
-    LaunchedEffect(isHighlighted, isScrolling) {
+    LaunchedEffect(isHighlighted) {
         if (isHighlighted) {
-            if (isScrolling) {
-                delay(900)
-                SettingsHighlightManager.isScrollingToTarget = false
-            }
-            delay(150)
+            // Short 50ms delay for initial layout pass to settle coordinates
+            delay(50)
             try {
-                bringIntoViewRequester.bringIntoView()
+                bringIntoViewRequester.bringIntoViewCentered(itemCoordinates)
             } catch (_: Exception) {}
 
             highlightAlpha.animateTo(1f, tween(200, easing = LinearEasing))
@@ -167,14 +171,16 @@ fun SettingsItem(
     }
 
     val onToggleOrClick = {
-        if (hasSwitch && onSwitchChange != null) {
-            if (onClick != null) {
-                onClick()
+        if (enabled) {
+            if (hasSwitch && onSwitchChange != null) {
+                if (onClick != null) {
+                    onClick()
+                } else {
+                    onSwitchChange(!switchState)
+                }
             } else {
-                onSwitchChange(!switchState)
+                onClick?.invoke()
             }
-        } else {
-            onClick?.invoke()
         }
     }
 
@@ -182,16 +188,15 @@ fun SettingsItem(
     // branching at the draw site, so both kinds take one path through it instead of two.
     val rowMark = icon?.let { androidx.compose.ui.graphics.vector.rememberVectorPainter(it) } ?: mark
 
-    Card(
-        onClick = { onToggleOrClick() },
-        enabled = onClick != null || hasSwitch,
-        colors = CardDefaults.cardColors(containerColor = animatedContainerColor),
-        shape = shape,
-        modifier = Modifier
-            .fillMaxWidth()
-            .bringIntoViewRequester(bringIntoViewRequester),
-        interactionSource = interactionSource
-    ) {
+    val isClickable = (onClick != null || hasSwitch) && enabled
+    val cardColors = CardDefaults.cardColors(
+        containerColor = animatedContainerColor,
+        disabledContainerColor = animatedContainerColor,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        disabledContentColor = MaterialTheme.colorScheme.onSurface,
+    )
+
+    val content = @Composable {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -259,8 +264,9 @@ fun SettingsItem(
                 // Without a handler the switch still shows the state, it just cannot be changed here.
                 SettingsSwitch(
                     checked = switchState,
-                    onCheckedChange = onSwitchChange,
+                    onCheckedChange = if (enabled) onSwitchChange else null,
                     interactionSource = interactionSource,
+                    enabled = enabled,
                 )
             } else if (trailingContent != null) {
                 trailingContent()
@@ -269,9 +275,38 @@ fun SettingsItem(
                     imageVector = Icons.AutoMirrored.Rounded.ArrowForwardIos,
                     contentDescription = null,
                     modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 0.5f else 0.2f)
                 )
             }
+        }
+    }
+
+    if (isClickable) {
+        Card(
+            onClick = { onToggleOrClick() },
+            enabled = onClick != null || hasSwitch,
+            colors = cardColors,
+            shape = shape,
+            modifier = Modifier
+                .fillMaxWidth()
+                .alpha(if (enabled) 1f else 0.42f)
+                .bringIntoViewRequester(bringIntoViewRequester)
+                .onGloballyPositioned { itemCoordinates = it },
+            interactionSource = interactionSource
+        ) {
+            content()
+        }
+    } else {
+        Card(
+            colors = cardColors,
+            shape = shape,
+            modifier = Modifier
+                .fillMaxWidth()
+                .alpha(if (enabled) 1f else 0.42f)
+                .bringIntoViewRequester(bringIntoViewRequester)
+                .onGloballyPositioned { itemCoordinates = it },
+        ) {
+            content()
         }
     }
 }
@@ -280,6 +315,7 @@ fun SettingsItem(
 fun SettingsScaffold(
     title: String,
     onBackClick: (() -> Unit)? = null,
+    subtitle: String? = null,
     scrollState: androidx.compose.foundation.ScrollState? = null,
     actions: @Composable RowScope.() -> Unit = {},
     content: @Composable (PaddingValues) -> Unit
@@ -298,10 +334,23 @@ fun SettingsScaffold(
 
     val topBarContent = @Composable {
         LargeTopAppBar(
-            title = { Text(title, fontWeight = FontWeight.Bold, maxLines = 1) },
+            title = {
+                Column {
+                    Text(title, fontWeight = FontWeight.Bold, maxLines = 1)
+                    if (!subtitle.isNullOrBlank()) {
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            overflow = TextOverflow.Ellipsis,
+                            maxLines = 1
+                        )
+                    }
+                }
+            },
             navigationIcon = {
                 if (onBackClick != null) {
-                    IconButton(onClick = onBackClick) {
+                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = onBackClick) {
                         Icon(imageVector = Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = null)
                     }
                 }
@@ -350,30 +399,27 @@ fun SplitSettingsItem(
     switchState: Boolean,
     onSwitchChange: (Boolean) -> Unit,
     titleColor: Color = MaterialTheme.colorScheme.onSurface,
-    highlightKey: String? = null
+    highlightKey: String? = null,
+    enabled: Boolean = true,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
 
     val isHighlighted = SettingsHighlightManager.isHighlighted(highlightKey)
     val bringIntoViewRequester = remember { BringIntoViewRequester() }
     val highlightAlpha = remember { Animatable(0f) }
+    var itemCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
 
     val primaryColor = MaterialTheme.colorScheme.primary
     val baseColor = MaterialTheme.colorScheme.surfaceContainerHigh
     val highlightOverlay = remember(primaryColor) { primaryColor.copy(alpha = 0.26f) }
     val highlightedBaseColor = remember(highlightOverlay, baseColor) { highlightOverlay.compositeOver(baseColor) }
 
-    val isScrolling = SettingsHighlightManager.isScrollingToTarget
-
-    LaunchedEffect(isHighlighted, isScrolling) {
+    LaunchedEffect(isHighlighted) {
         if (isHighlighted) {
-            if (isScrolling) {
-                delay(900)
-                SettingsHighlightManager.isScrollingToTarget = false
-            }
-            delay(150)
+            // Short 50ms delay for initial layout pass to settle coordinates
+            delay(50)
             try {
-                bringIntoViewRequester.bringIntoView()
+                bringIntoViewRequester.bringIntoViewCentered(itemCoordinates)
             } catch (_: Exception) {}
 
             highlightAlpha.animateTo(1f, tween(200, easing = LinearEasing))
@@ -394,12 +440,15 @@ fun SplitSettingsItem(
     }
 
     Card(
-        onClick = onClick,
+        onClick = { if (enabled) onClick() },
+        enabled = enabled,
         colors = CardDefaults.cardColors(containerColor = animatedContainerColor),
         shape = shape,
         modifier = Modifier
             .fillMaxWidth()
+            .alpha(if (enabled) 1f else 0.42f)
             .bringIntoViewRequester(bringIntoViewRequester)
+            .onGloballyPositioned { itemCoordinates = it }
     ) {
         Row(
             modifier = Modifier
@@ -472,7 +521,8 @@ fun SplitSettingsItem(
             ) {
                 Switch(
                     checked = switchState,
-                    onCheckedChange = onSwitchChange,
+                    onCheckedChange = if (enabled) onSwitchChange else null,
+                    enabled = enabled,
                     thumbContent = {
                         if (switchState) {
                             Icon(

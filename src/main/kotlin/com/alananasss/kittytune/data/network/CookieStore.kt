@@ -13,10 +13,11 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Persistent OkHttp CookieJar, the desktop replacement for the Android WebView
- * CookieManager the app harvested SoundCloud session/DataDome cookies from.
+ * CookieManager the app harvested SoundCloud session cookies from.
  *
- * Shared app-wide: the login flow (embedded browser) populates it, and the API
- * client sends cookies back — same behavior as the Android cookie jar.
+ * Shared app-wide: OkHttp responses (login flow included) populate it
+ * automatically via [saveFromResponse], and the API client sends the cookies
+ * back — same behavior as the Android cookie jar.
  */
 object CookieStore : CookieJar {
 
@@ -103,22 +104,12 @@ object CookieStore : CookieJar {
         return matches
     }
 
-    /** Manually set a cookie (used by the login flow + DataDome handling). */
-    fun set(url: String, cookie: Cookie) {
-        store[keyOf(cookie)] = cookie
-        persist()
-    }
-
     /** Raw cookie string for a URL, like WebView CookieManager.getCookie(url). */
     fun cookieHeader(url: String): String? {
         val httpUrl = url.toHttpUrlOrNull() ?: return null
         return loadForRequest(httpUrl).joinToString("; ") { "${it.name}=${it.value}" }
             .takeIf { it.isNotBlank() }
     }
-
-    /** Extract a single cookie value by name across all stored cookies for a host. */
-    fun value(host: String, name: String): String? =
-        store.values.firstOrNull { it.name == name && host.endsWith(it.domain) }?.value
 
     fun clear() {
         store.clear()

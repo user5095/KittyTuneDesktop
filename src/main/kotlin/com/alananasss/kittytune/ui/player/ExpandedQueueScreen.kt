@@ -10,6 +10,9 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.PointerMatcher
+import androidx.compose.foundation.onClick
+import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -24,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DragHandle
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.RepeatOne
@@ -63,18 +67,14 @@ fun ExpandedQueueScreen(
     viewModel: PlayerViewModel,
     onClose: () -> Unit
 ) {
-    val queueState = viewModel.queueState
-        val listState = rememberLazyListState()
-
-    LaunchedEffect(viewModel.currentTrack) {
-        val track = viewModel.currentTrack
-        if (track != null && queueState.isNotEmpty()) {
-            val index = queueState.indexOfFirst { it.id == track.id }
-            if (index >= 0) {
-                listState.scrollToItem(kotlin.math.max(0, index - 2))
-            }
-        }
-    }
+    val queueState = viewModel.uiQueueState
+    val listState = rememberLazyListState()
+    AnchorCurrentQueueItem(
+        listState = listState,
+        currentIndex = viewModel.uiCurrentQueueIndex,
+        currentTrackId = viewModel.uiCurrentTrack?.id,
+        targetIndex = (viewModel.uiCurrentQueueIndex - 2).coerceAtLeast(0)
+    )
 
     val reorderableState = rememberReorderableLazyListState(
         lazyListState = listState,
@@ -102,7 +102,14 @@ fun ExpandedQueueScreen(
                     }
                 },
                 actions = {
-                    val shuffleColor = if (viewModel.shuffleEnabled)
+                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = { viewModel.showQueueHistoryDialog = true }) {
+                        Icon(
+                            imageVector = Icons.Rounded.History,
+                            contentDescription = str("queue_history")
+                        )
+                    }
+
+                    val shuffleColor = if (viewModel.uiShuffleEnabled)
                         MaterialTheme.colorScheme.primary
                     else
                         MaterialTheme.colorScheme.onSurface
@@ -115,11 +122,11 @@ fun ExpandedQueueScreen(
                         )
                     }
 
-                    val repeatIcon = when (viewModel.repeatMode) {
+                    val repeatIcon = when (viewModel.uiRepeatMode) {
                         RepeatMode.ONE -> Icons.Rounded.RepeatOne
                         else -> Icons.Rounded.Repeat
                     }
-                    val repeatColor = if (viewModel.repeatMode == RepeatMode.NONE)
+                    val repeatColor = if (viewModel.uiRepeatMode == RepeatMode.NONE)
                         MaterialTheme.colorScheme.onSurface
                     else
                         MaterialTheme.colorScheme.primary
@@ -156,8 +163,8 @@ fun ExpandedQueueScreen(
                     state = reorderableState,
                     key = itemKey
                 ) { isDragging ->
-                    val isCurrent = track.id == viewModel.currentTrack?.id
-                    val shouldDarken = viewModel.repeatMode == RepeatMode.ONE && !isCurrent
+                    val isCurrent = index == viewModel.currentQueueIndex
+                    val shouldDarken = viewModel.uiRepeatMode == RepeatMode.ONE && !isCurrent
                     val itemAlpha by animateFloatAsState(
                         targetValue = if (shouldDarken) 0.3f else 1.0f,
                         label = "dim_alpha"
@@ -188,6 +195,10 @@ fun ExpandedQueueScreen(
                                         baseColor
                                 )
                                 .hoverable(interaction)
+                                .onClick(
+                                    matcher = PointerMatcher.mouse(PointerButton.Secondary),
+                                    onClick = { viewModel.showTrackOptions(track, fromPlayer = true, queueIndex = index) }
+                                )
                                 .clickable { viewModel.skipToQueueItem(index) }
                                 .padding(horizontal = 24.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically

@@ -4,32 +4,92 @@ import androidx.compose.ui.graphics.Color
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.awt.image.BufferedImage
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.util.concurrent.TimeUnit
 import javax.imageio.ImageIO
+import javax.imageio.stream.ImageInputStream
 import kotlin.math.max
 import kotlin.math.min
 
 object ArtworkPalette {
 
+    // Shares ProxyManager's pool and dispatcher; only the timeouts are this module's own.
     private val httpClient by lazy {
-        OkHttpClient.Builder()
+        com.alananasss.kittytune.data.network.ProxyManager.getOkHttpClient().newBuilder()
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(5, TimeUnit.SECONDS)
             .build()
     }
 
+    /** Extracted colours by URL, so scrolling a list does not re-download and re-decode per card. */
+    private val colorCache = PaletteCache()
+
+    /**
+     * Longest edge decoded for colour extraction. The histogram downscales to 64×64 anyway, so
+     * anything above this only spends heap: a 2000×2000 cover decoded in full was ~16 MB of
+     * churn per track change for 16 KB of actually-analysed pixels (the audit's
+     * "full-resolution decode" finding). Four times the histogram's grid, not the grid itself,
+     * so the mesh palette's spread has room to differ from the dominant's.
+     */
+    private const val PALETTE_MAX_DECODE = 256
+
+    /**
+     * The artwork as pixels for colour extraction, decoded at extraction scale via
+     * [javax.imageio.ImageReadParam.setSourceSubsampling] — the decoder produces the subsampled
+     * image directly instead of materialising the full-resolution bitmap and throwing it away.
+     */
     fun load(url: String): BufferedImage? = try {
-        if (url.startsWith("http")) {
+        val input: ImageInputStream? = if (url.startsWith("http")) {
             val req = Request.Builder().url(url).build()
-            httpClient.newCall(req).execute().use { response ->
-                response.body?.byteStream()?.let { ImageIO.read(it) }
+            // Read the bytes while the response is open. Creating the ImageInputStream from the
+            // response's stream and then closing the response (the old code did exactly that)
+            // left every artwork undecodable, so the dynamic theme silently kept its old seed.
+            val bytes = httpClient.newCall(req).execute().use { response ->
+                if (response.isSuccessful) response.body?.bytes() else null
+            }
+            bytes?.takeIf { it.isNotEmpty() }?.let {
+                ImageIO.createImageInputStream(ByteArrayInputStream(it))
             }
         } else {
-            ImageIO.read(File(url))
+            File(url).takeIf { it.isFile }?.let { ImageIO.createImageInputStream(it) }
+        }
+        input?.use { stream ->
+            val readers = ImageIO.getImageReaders(stream)
+            if (!readers.hasNext()) return null
+            val reader = readers.next()
+            try {
+                reader.input = stream
+                var subsample = 1
+                val w = reader.getWidth(0)
+                val h = reader.getHeight(0)
+                if (w > 0 && h > 0) {
+                    val longest = max(w, h)
+                    if (longest > PALETTE_MAX_DECODE) {
+                        subsample = (longest + PALETTE_MAX_DECODE - 1) / PALETTE_MAX_DECODE
+                    }
+                }
+                val param = reader.defaultReadParam
+                if (subsample > 1) param.setSourceSubsampling(subsample, subsample, 0, 0)
+                reader.read(0, param)
+            } finally {
+                reader.dispose()
+            }
         }
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * [dominantColor] memoised by URL. Extraction downloads and decodes the image at
+     * extraction scale, so a second view of the same artwork must not pay for it again.
+     */
+    fun dominantColorCached(url: String, preferLight: Boolean): Color? {
+        val key = "$preferLight|$url"
+        colorCache.get(key)?.let { return it }
+        val extracted = load(url)?.let { dominantColor(it, preferLight = preferLight) } ?: return null
+        colorCache.put(key, extracted)
+        return extracted
     }
 
     /**
@@ -231,4 +291,28 @@ object ArtworkPalette {
 
         return Color(red = r / 255f, green = gg / 255f, blue = b / 255f)
     }
+}
+
+/**
+ * Tiny access-ordered memo for extracted colours: colours are bytes, images are megabytes,
+ * so this is what makes repeat views free while the image itself is never retained.
+ */
+internal class PaletteCache(private val maxSize: Int = 512) {
+    private val map = LinkedHashMap<String, Color>(64, 0.75f, true)
+
+    @Synchronized
+    fun get(key: String): Color? = map[key]
+
+    @Synchronized
+    fun put(key: String, value: Color) {
+        map[key] = value
+        if (map.size > maxSize) {
+            val eldest = map.entries.iterator()
+            eldest.next()
+            eldest.remove()
+        }
+    }
+
+    @Synchronized
+    fun size(): Int = map.size
 }

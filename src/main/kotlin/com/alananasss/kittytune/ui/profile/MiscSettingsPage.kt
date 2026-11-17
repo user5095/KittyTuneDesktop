@@ -1,10 +1,14 @@
 package com.alananasss.kittytune.ui.profile
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.MenuBook
 import androidx.compose.material.icons.rounded.Forum
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Translate
+import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.runtime.*
 import androidx.navigation.NavController
 import com.alananasss.kittytune.core.Strings
@@ -19,10 +23,22 @@ import com.alananasss.kittytune.ui.player.PlayerViewModel
 /** Settings → Other: the language, how the app starts and updates, and Discord. */
 @Composable
 fun MiscSettingsPage(navController: NavController, playerViewModel: PlayerViewModel) {
+    MiscGeneralPage()
+    MainCategoryTitle(str("pref_discord_title"), Icons.Rounded.Forum)
+    MiscDiscordPage(navController, playerViewModel)
+}
+
+/**
+ * Other → General: language selection, start screen, and auto-update toggle.
+ */
+@Composable
+fun MiscGeneralPage() {
     val prefs = remember { PlayerPreferences() }
     var appLanguage by remember { mutableStateOf(prefs.getAppLanguage()) }
     var startDestination by remember { mutableStateOf(prefs.getStartDestination()) }
     var autoUpdate by remember { mutableStateOf(prefs.getAutoUpdateEnabled()) }
+    var verifiedFilterEnabled by remember { mutableStateOf(prefs.getVerifiedFilterEnabled()) }
+    var showCodecOnPlayer by remember { mutableStateOf(prefs.getShowCodecOnPlayer()) }
     var showLanguageDialog by remember { mutableStateOf(false) }
     var showStartDialog by remember { mutableStateOf(false) }
 
@@ -35,6 +51,7 @@ fun MiscSettingsPage(navController: NavController, playerViewModel: PlayerViewMo
         AppLanguage.HUNGARIAN to str("lang_hungarian"),
         AppLanguage.VIETNAMESE to str("lang_vietnamese"),
         AppLanguage.ITALIAN to str("lang_italian"),
+        AppLanguage.TURKISH to str("lang_turkish"),
     )
     val startDestinations = listOf(
         StartDestination.HOME to str("nav_home"),
@@ -73,6 +90,15 @@ fun MiscSettingsPage(navController: NavController, playerViewModel: PlayerViewMo
             { shape ->
                 SettingsItem(
                     shape = shape,
+                    title = str("onboard_replay"),
+                    subtitle = str("onboard_replay_body"),
+                    icon = Icons.AutoMirrored.Rounded.MenuBook,
+                    onClick = { com.alananasss.kittytune.ui.setup.SetupLauncher.requested = true },
+                )
+            },
+            { shape ->
+                SettingsItem(
+                    shape = shape,
                     title = str("pref_language"),
                     subtitle = languages.first { it.first == appLanguage }.second,
                     icon = Icons.Rounded.Translate,
@@ -103,10 +129,45 @@ fun MiscSettingsPage(navController: NavController, playerViewModel: PlayerViewMo
                     highlightKey = "pref_auto_update",
                 )
             },
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("pref_verified_filter"),
+                    subtitle = str("pref_verified_filter_sub"),
+                    icon = Icons.Rounded.Verified,
+                    hasSwitch = true,
+                    switchState = verifiedFilterEnabled,
+                    onSwitchChange = {
+                        verifiedFilterEnabled = it
+                        prefs.setVerifiedFilterEnabled(it)
+                    },
+                    highlightKey = "pref_verified_filter",
+                )
+            },
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("pref_show_codec_on_player"),
+                    subtitle = str("pref_show_codec_on_player_sub"),
+                    icon = Icons.Rounded.GraphicEq,
+                    hasSwitch = true,
+                    switchState = showCodecOnPlayer,
+                    onSwitchChange = {
+                        showCodecOnPlayer = it
+                        prefs.setShowCodecOnPlayer(it)
+                    },
+                    highlightKey = "pref_show_codec_on_player",
+                )
+            },
         ),
     )
+}
 
-    MainCategoryTitle(str("pref_discord_title"), Icons.Rounded.Forum)
+/**
+ * Other → Discord: Discord rich presence settings and login.
+ */
+@Composable
+fun MiscDiscordPage(navController: NavController, playerViewModel: PlayerViewModel) {
     DiscordSettingsScreen(
         onBackClick = null,
         onNavigateToLogin = { navController.navigate("discord_login") },

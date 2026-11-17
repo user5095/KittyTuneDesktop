@@ -34,8 +34,6 @@ import coil3.compose.AsyncImage
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.data.upload.*
 import com.alananasss.kittytune.ui.common.ExpressiveConnectedButtonGroup
-import java.awt.FileDialog
-import java.awt.Frame
 import java.awt.datatransfer.DataFlavor
 import java.awt.dnd.*
 import java.awt.image.BufferedImage
@@ -43,8 +41,6 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import javax.imageio.ImageIO
-import javax.swing.JFileChooser
-import javax.swing.filechooser.FileNameExtensionFilter
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -64,6 +60,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import androidx.compose.material3.IconButtonDefaults
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -534,7 +531,7 @@ private fun HeroFilePickerSection(
                 Spacer(Modifier.height(8.dp))
 
                 Text(
-                    text = if (isDraggingOver) "Glissez-déposez le fichier audio pour commencer" else str("upload_picker_hero_subtitle"),
+                    text = if (isDraggingOver) str("upload_drop_hint") else str("upload_picker_hero_subtitle"),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
@@ -1040,7 +1037,7 @@ private fun BasicInfoTabContent(
                     },
                 trailingIcon = {
                     if (viewModel.tagInput.isNotBlank()) {
-                        IconButton(onClick = { viewModel.addTag(viewModel.tagInput) }) {
+                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = { viewModel.addTag(viewModel.tagInput) }) {
                             Icon(Icons.Rounded.Add, contentDescription = "Add tag")
                         }
                     }
@@ -1060,7 +1057,7 @@ private fun BasicInfoTabContent(
                             onClick = { },
                             label = { Text("#$tag") },
                             trailingIcon = {
-                                IconButton(
+                                IconButton(shapes = IconButtonDefaults.shapes(),
                                     onClick = { viewModel.removeTag(tag) },
                                     modifier = Modifier.size(16.dp)
                                 ) {
@@ -1373,7 +1370,7 @@ private fun ScheduleSection(
                     ) {
                         // Hours
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            IconButton(onClick = { selectedHour = (selectedHour + 1) % 24 }) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { selectedHour = (selectedHour + 1) % 24 }) {
                                 Icon(Icons.Rounded.KeyboardArrowUp, contentDescription = null)
                             }
                             Surface(
@@ -1390,7 +1387,7 @@ private fun ScheduleSection(
                                     )
                                 }
                             }
-                            IconButton(onClick = { selectedHour = if (selectedHour - 1 < 0) 23 else selectedHour - 1 }) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { selectedHour = if (selectedHour - 1 < 0) 23 else selectedHour - 1 }) {
                                 Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = null)
                             }
                         }
@@ -1404,7 +1401,7 @@ private fun ScheduleSection(
 
                         // Minutes
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            IconButton(onClick = { selectedMinute = (selectedMinute + 5) % 60 }) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { selectedMinute = (selectedMinute + 5) % 60 }) {
                                 Icon(Icons.Rounded.KeyboardArrowUp, contentDescription = null)
                             }
                             Surface(
@@ -1421,7 +1418,7 @@ private fun ScheduleSection(
                                     )
                                 }
                             }
-                            IconButton(onClick = { selectedMinute = if (selectedMinute - 5 < 0) 55 else (selectedMinute - 5) }) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { selectedMinute = if (selectedMinute - 5 < 0) 55 else (selectedMinute - 5) }) {
                                 Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = null)
                             }
                         }
@@ -1595,7 +1592,7 @@ private fun MetadataTabContent(
                         },
                         trailingIcon = {
                             if (viewModel.releaseDate.isNotBlank()) {
-                                IconButton(onClick = { viewModel.releaseDate = "" }) {
+                                IconButton(shapes = IconButtonDefaults.shapes(), onClick = { viewModel.releaseDate = "" }) {
                                     Icon(
                                         Icons.Rounded.Close,
                                         contentDescription = "Clear",
@@ -1604,7 +1601,7 @@ private fun MetadataTabContent(
                                     )
                                 }
                             } else {
-                                IconButton(onClick = { showReleaseDatePicker = true }) {
+                                IconButton(shapes = IconButtonDefaults.shapes(), onClick = { showReleaseDatePicker = true }) {
                                     Icon(
                                         Icons.Rounded.Event,
                                         contentDescription = null,
@@ -2380,7 +2377,7 @@ private fun ArtistStorefrontDialog(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
-                    IconButton(onClick = onDismiss) {
+                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = onDismiss) {
                         Icon(
                             imageVector = Icons.Rounded.Close,
                             contentDescription = str("btn_close"),
@@ -2475,7 +2472,7 @@ private fun ArtistStorefrontDialog(
                             }
                         }
 
-                        IconButton(
+                        IconButton(shapes = IconButtonDefaults.shapes(),
                             onClick = {},
                             enabled = viewModel.storefrontLink.isNotBlank()
                         ) {
@@ -2590,9 +2587,11 @@ private fun ArtistStorefrontDialog(
                 }
 
                 Spacer(Modifier.height(16.dp))
-                LazyRow(
+                com.alananasss.kittytune.ui.common.ScrollableLazyRow(
+                    showsArrows = false,
+                    fadeLength = 24.dp,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
                 ) {
                     items(BuyModuleType.entries) { type ->
                         val isSelected = viewModel.storefrontType == type
@@ -3712,7 +3711,7 @@ private fun ScheduleReleaseDialog(
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = "Release Date & Time (UTC/Local)",
+                            text = str("upload_release_datetime"),
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -3855,13 +3854,13 @@ private fun DiscardChangesDialog(
         ) {
             Column(modifier = Modifier.padding(24.dp)) {
                 Text(
-                    text = "Discard unsaved changes?",
+                    text = str("upload_discard_title"),
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    text = "You have modified track details. If you leave now, your changes will be discarded.",
+                    text = str("upload_discard_message"),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -4239,52 +4238,19 @@ private fun SwitchRow(
 }
 
 // ---------------- FILE CHOOSER HELPERS ----------------
+// The dialog Explorer itself uses (AWT's FileDialog froze the app while it was open and surfaced behind it).
 private fun openNativeAudioFileChooser(onFileSelected: (File) -> Unit) {
-    try {
-        val fileDialog = FileDialog(null as Frame?, str("upload_choose_audio"), FileDialog.LOAD)
-        fileDialog.setFilenameFilter { _, name ->
-            val ext = name.substringAfterLast(".", "").lowercase()
-            ext in listOf("mp3", "wav", "flac", "aac", "ogg", "m4a", "aiff")
-        }
-        fileDialog.isVisible = true
-        val file = fileDialog.file
-        val dir = fileDialog.directory
-        if (file != null && dir != null) {
-            onFileSelected(File(dir, file))
-        }
-    } catch (e: Exception) {
-        val chooser = JFileChooser()
-        chooser.dialogTitle = str("upload_choose_audio")
-        chooser.fileFilter = FileNameExtensionFilter("Audio Files (*.mp3, *.wav, *.flac, *.aac, *.ogg, *.m4a, *.aiff)", "mp3", "wav", "flac", "aac", "ogg", "m4a", "aiff")
-        val result = chooser.showOpenDialog(null)
-        if (result == JFileChooser.APPROVE_OPTION && chooser.selectedFile != null) {
-            onFileSelected(chooser.selectedFile)
-        }
-    }
+    com.alananasss.kittytune.core.NativeFileDialog.openFile(
+        str("upload_choose_audio"),
+        com.alananasss.kittytune.core.NativeFileDialog.FileType("Audio", listOf("mp3", "wav", "flac", "aac", "ogg", "m4a", "aiff")),
+    )?.let(onFileSelected)
 }
 
 private fun openNativeImageFileChooser(onFileSelected: (File) -> Unit) {
-    try {
-        val fileDialog = FileDialog(null as Frame?, str("upload_choose_artwork"), FileDialog.LOAD)
-        fileDialog.setFilenameFilter { _, name ->
-            val ext = name.substringAfterLast(".", "").lowercase()
-            ext in listOf("jpg", "jpeg", "png", "webp")
-        }
-        fileDialog.isVisible = true
-        val file = fileDialog.file
-        val dir = fileDialog.directory
-        if (file != null && dir != null) {
-            onFileSelected(File(dir, file))
-        }
-    } catch (e: Exception) {
-        val chooser = JFileChooser()
-        chooser.dialogTitle = str("upload_choose_artwork")
-        chooser.fileFilter = FileNameExtensionFilter("Image Files (*.jpg, *.jpeg, *.png, *.webp)", "jpg", "jpeg", "png", "webp")
-        val result = chooser.showOpenDialog(null)
-        if (result == JFileChooser.APPROVE_OPTION && chooser.selectedFile != null) {
-            onFileSelected(chooser.selectedFile)
-        }
-    }
+    com.alananasss.kittytune.core.NativeFileDialog.openFile(
+        str("upload_choose_artwork"),
+        com.alananasss.kittytune.core.NativeFileDialog.FileType("Images", listOf("jpg", "jpeg", "png", "webp")),
+    )?.let(onFileSelected)
 }
 
 private fun formatFileSize(bytes: Long): String {

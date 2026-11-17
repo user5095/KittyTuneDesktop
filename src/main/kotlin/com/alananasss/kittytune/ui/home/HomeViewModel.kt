@@ -1,6 +1,7 @@
     package com.alananasss.kittytune.ui.home
 
 import com.alananasss.kittytune.core.str
+import com.alananasss.kittytune.data.local.SearchSourceOrder
 import com.alananasss.kittytune.core.Application
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -9,10 +10,15 @@ import androidx.compose.runtime.setValue
 import com.alananasss.kittytune.core.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.alananasss.kittytune.data.HistoryRepository
+import com.alananasss.kittytune.data.search.isYoutubeShort
 import com.alananasss.kittytune.data.LikeRepository
 import com.alananasss.kittytune.data.RecentSearchRepository
 import com.alananasss.kittytune.data.SearchCategory
 import com.alananasss.kittytune.data.TokenManager
+import com.alananasss.kittytune.data.search.ProviderLinks
+import com.alananasss.kittytune.data.search.TrackVerification
+import com.alananasss.kittytune.data.search.TrackVerifier
+import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.data.local.HistoryItem
 import com.alananasss.kittytune.data.network.RetrofitClient
 import com.alananasss.kittytune.domain.Playlist
@@ -102,6 +108,7 @@ import com.alananasss.kittytune.utils.Logger
     class HomeViewModel(application: Application) : AndroidViewModel(application) {
         private val api = RetrofitClient.create()
         private val prefs = com.alananasss.kittytune.core.NamedPrefs("home_cache")
+        private val playerPrefs = PlayerPreferences()
         private val gson = Gson()
         private val tokenManager = TokenManager
     
@@ -124,6 +131,40 @@ import com.alananasss.kittytune.utils.Logger
         var activeFilter by mutableStateOf(SearchFilter.ALL)
         var isSearchLoading by mutableStateOf(false)
         var activeSearchSource by mutableStateOf(SearchSource.SOUNDCLOUD)
+
+        /**
+         * Master switch for the Verified filter, set in Settings. Off by default: comparing against
+         * four catalogues is extra network work, so it stays out of search unless enabled.
+         */
+        var verifiedFilterEnabled by mutableStateOf(playerPrefs.getVerifiedFilterEnabled())
+            private set
+
+        /** Whether the current search is applying the Verified filter. */
+        var verifiedOnly by mutableStateOf(verifiedFilterEnabled)
+            private set
+
+        /** Source-scoped identity of the rows the verifier could fully confirm. */
+        var verifiedTrackKeys by mutableStateOf<Set<String>>(emptySet())
+            private set
+
+        var trackVerificationStatus by mutableStateOf(TrackVerification.Status.IDLE)
+            private set
+
+        /**
+         * "All": every source the reader has switched on is asked at once, and the results come back grouped by source
+         * (round 3 of the tester's list, 26). Apple Music and Yandex are left out: their results are names to find
+         * elsewhere, not songs that play from here.
+         */
+        var searchAllPlatforms by mutableStateOf(false)
+
+        fun onSearchAllPlatforms() {
+            if (searchAllPlatforms) return
+            searchAllPlatforms = true
+            if (searchQuery.isNotBlank()) {
+                searchJob?.cancel()
+                searchJob = viewModelScope.launch { performSearch(searchQuery) }
+            }
+        }
     
     
         var isLoading by mutableStateOf(true)
@@ -167,6 +208,10 @@ import com.alananasss.kittytune.utils.Logger
         var yandexNotice by mutableStateOf<YandexNotice?>(null)
             private set
 
+        /** The spelling a SoundCloud search was retried with when what was typed found nothing; see [SearchQueryRepair]. */
+        var searchCorrectedQuery by mutableStateOf<String?>(null)
+            private set
+
         /** The Apple result currently being looked for on a source that streams, if any. */
         var resolvingAppleSongId by mutableStateOf<String?>(null)
             private set
@@ -195,7 +240,7 @@ import com.alananasss.kittytune.utils.Logger
 
         /** Enough of the chart to preview on the landing; the whole thing lives on the Charts screen. */
         val chartPreview = mutableStateListOf<ChartEntry>()
-        var chartPreviewKind by mutableStateOf(ChartKind.TOP)
+        var chartPreviewKind by mutableStateOf(ChartKind.COUNTRY)
             private set
         var isChartPreviewLoading by mutableStateOf(false)
             private set
@@ -215,6 +260,8 @@ import com.alananasss.kittytune.utils.Logger
 
         /** Called when a search is actually run, so a half-typed word never becomes history. */
         private fun recordSearch(query: String) {
+            // Pause search history: nothing is written while the setting is on.
+            if (playerPrefs.getPauseSearchHistory()) return
             viewModelScope.launch { RecentSearchRepository.record(query) }
         }
 
@@ -224,6 +271,75 @@ import com.alananasss.kittytune.utils.Logger
 
         fun clearRecentSearches() {
             viewModelScope.launch { RecentSearchRepository.clear() }
+            com.alananasss.kittytune.data.search.RecentVisits.clear()
+        }
+
+        /** Artists, tracks and playlists opened from search, newest first; see [RecentVisits]. */
+        val recentVisits = com.alananasss.kittytune.data.search.RecentVisits.visits
+
+        fun forgetVisit(visit: com.alananasss.kittytune.data.search.RecentVisits.Visit) =
+            com.alananasss.kittytune.data.search.RecentVisits.forget(visit)
+
+        /**
+         * Something was opened from the results: it takes the place of the words typed to find it in the recent
+         * list, and an artist picked for this query counts towards making them its best result next time.
+         */
+        private fun noteOpened(visit: com.alananasss.kittytune.data.search.RecentVisits.Visit) {
+            // Queries, artists, tracks and playlists alike stay out of the recent searches.
+            if (playerPrefs.getPauseSearchHistory()) return
+            com.alananasss.kittytune.data.search.RecentVisits.record(visit)
+            searchQuery.trim().takeIf { it.isNotEmpty() }?.let(::forgetSearch)
+        }
+
+        fun noteOpenedArtist(user: User) {
+            if (playerPrefs.getPauseSearchHistory()) return
+            com.alananasss.kittytune.data.search.SearchPicks.record(searchQuery, user.id)
+            noteOpened(
+                com.alananasss.kittytune.data.search.RecentVisits.Visit(
+                    kind = com.alananasss.kittytune.data.search.RecentVisits.Kind.ARTIST,
+                    key = user.profileNavId,
+                    title = user.username.orEmpty(),
+                    subtitle = null,
+                    imageUrl = user.avatarUrl,
+                    destination = user.profileNavId,
+                    track = null,
+                    isVerified = user.verified,
+                    at = System.currentTimeMillis(),
+                )
+            )
+        }
+
+        fun noteOpenedTrack(track: Track) {
+            noteOpened(
+                com.alananasss.kittytune.data.search.RecentVisits.Visit(
+                    kind = com.alananasss.kittytune.data.search.RecentVisits.Kind.TRACK,
+                    key = track.id.toString(),
+                    title = track.title.orEmpty(),
+                    subtitle = track.displayArtist.ifBlank { track.user?.username.orEmpty() },
+                    imageUrl = track.fullResArtwork,
+                    destination = null,
+                    // Without what goes stale or weighs a lot; the player fetches the rest again.
+                    track = track.copy(description = null, tagList = null, caption = null, waveformUrl = null, media = null),
+                    isVerified = track.user?.verified == true,
+                    at = System.currentTimeMillis(),
+                )
+            )
+        }
+
+        fun noteOpenedPlaylist(playlist: Playlist, destination: String) {
+            noteOpened(
+                com.alananasss.kittytune.data.search.RecentVisits.Visit(
+                    kind = com.alananasss.kittytune.data.search.RecentVisits.Kind.PLAYLIST,
+                    key = destination,
+                    title = playlist.title.orEmpty(),
+                    subtitle = playlist.user?.username,
+                    imageUrl = playlist.artworkUrl ?: playlist.calculatedArtworkUrl,
+                    destination = destination,
+                    track = null,
+                    isVerified = false,
+                    at = System.currentTimeMillis(),
+                )
+            )
         }
 
         /**
@@ -247,6 +363,7 @@ import com.alananasss.kittytune.utils.Logger
                     limit = CHART_PREVIEW_LENGTH,
                     // The landing previews one market; picking another belongs to the chart screen.
                     countryCode = "US",
+                    country = ChartCountry.forDevice(com.alananasss.kittytune.core.Strings.resolvedLanguage),
                 )
                 if (kind == chartPreviewKind) {
                     chartPreview.clear()
@@ -305,15 +422,38 @@ import com.alananasss.kittytune.utils.Logger
             /** How many songs the landing's chart preview shows. */
             const val CHART_PREVIEW_LENGTH = 5
 
-            /** How many liked artists are asked for new songs. One request each. */
-            const val ARTIST_UPDATE_SOURCES = 6
+            /** How many of the first search results have their stream looked up ahead of a press. */
+            private const val WARMED_RESULTS = 2
 
-            private const val TRACKS_PER_ARTIST = 5
-            private const val MAX_PER_ARTIST = 2
-            private const val ARTIST_UPDATE_TOTAL = 18
+            /** How long a query has to stand still before its results' streams are looked up. */
+            private const val WARM_AFTER_IDLE_MS = 700L
+
+            /** How many liked artists are asked for new songs. One request each, all at once. */
+            const val ARTIST_UPDATE_SOURCES = 10
+
+            private const val TRACKS_PER_ARTIST = 6
+            private const val MAX_PER_ARTIST = 3
+            private const val ARTIST_UPDATE_TOTAL = 30
         }
 
         init {
+            viewModelScope.launch {
+                playerPrefs.verifiedFilterEnabledFlow().collect { enabled ->
+                    val changed = verifiedFilterEnabled != enabled
+                    verifiedFilterEnabled = enabled
+                    if (!enabled) {
+                        verifiedOnly = false
+                        verifiedTrackKeys = emptySet()
+                        trackVerificationStatus = TrackVerification.Status.IDLE
+                    } else if (changed) {
+                        verifiedOnly = true
+                    }
+                    if (changed && searchQuery.isNotBlank()) {
+                        searchJob?.cancel()
+                        searchJob = viewModelScope.launch { performSearch(searchQuery) }
+                    }
+                }
+            }
             loadFromCache()
             if (isOfflineMode) {
                 isLoading = false
@@ -349,6 +489,7 @@ import com.alananasss.kittytune.utils.Logger
             val isSpotifyUrl = trimmed.contains("open.spotify.com") || trimmed.contains("spotify.link") ||
                     trimmed.startsWith("spotify:") || trimmed.startsWith("spotify_") || trimmed.startsWith("station_spotify:")
             val isYoutubeUrl = trimmed.contains("youtube.com") || trimmed.contains("youtu.be") || trimmed.startsWith("yt_radio:")
+            val isProviderUrl = ProviderLinks.looksLikeProviderUrl(trimmed)
 
             if (isSoundCloudUrl) {
                 handleSoundCloudUrl(trimmed)
@@ -356,6 +497,8 @@ import com.alananasss.kittytune.utils.Logger
                 handleSpotifyUrl(trimmed)
             } else if (isYoutubeUrl) {
                 handleYoutubeUrl(trimmed)
+            } else if (isProviderUrl) {
+                handleProviderUrl(trimmed)
             } else {
                 if (trimmed.isBlank()) {
                     clearSearchResults()
@@ -473,6 +616,58 @@ import com.alananasss.kittytune.utils.Logger
             }
         }
 
+        /**
+         * Pasted Qobuz/Tidal/Deezer links point at an exact object. Resolve the id
+         * instead of sending the URL through text search, which is what made a
+         * pasted link return an arbitrary page of songs.
+         *
+         * When the link cannot be resolved the search stays empty on purpose: a
+         * provider link is not a title, so searching for its text would only
+         * produce something unrelated.
+         */
+        private fun handleProviderUrl(url: String) {
+            isSearchLoading = true
+            clearSearchResults()
+            viewModelScope.launch {
+                try {
+                    var processedUrl = url
+                    var link = ProviderLinks.parse(processedUrl)
+                    if (link == null && ProviderLinks.isShortLink(processedUrl)) {
+                        processedUrl = unshortenUrl(processedUrl)
+                        link = ProviderLinks.parse(processedUrl)
+                    }
+                    if (link == null) return@launch
+
+                    when (link.kind) {
+                        ProviderLinks.Kind.TRACK -> {
+                            val track = withContext(Dispatchers.IO) {
+                                when (link.provider) {
+                                    ProviderLinks.Provider.DEEZER ->
+                                        com.alananasss.kittytune.data.deezer.DeezerSearchRepository.getTrack(link.id)
+                                    ProviderLinks.Provider.TIDAL ->
+                                        com.alananasss.kittytune.data.tidal.TidalSearchRepository.getTrack(link.id)
+                                    ProviderLinks.Provider.QOBUZ ->
+                                        com.alananasss.kittytune.data.qobuz.QobuzSearchRepository.getTrack(link.id)
+                                }
+                            }
+                            if (track != null) {
+                                _playTrack.emit(track)
+                                clearSearch()
+                            }
+                        }
+                        else -> {
+                            _navigateTo.emit(link.urn)
+                            clearSearch()
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    isSearchLoading = false
+                }
+            }
+        }
+
         private fun handleSpotifyUrl(url: String) {
             isSearchLoading = true
             clearSearchResults()
@@ -550,13 +745,41 @@ import com.alananasss.kittytune.utils.Logger
         }
     
         var searchTrigger by mutableStateOf(0)
-        fun activateSearch() { isSearching = true; searchTrigger++ }
-        fun clearSearch() { searchQuery = ""; isSearching = false; clearSearchResults() }
+        fun activateSearch() {
+            isSearching = true
+            verifiedOnly = verifiedFilterEnabled
+            searchTrigger++
+        }
+        fun clearSearch() {
+            searchQuery = ""
+            isSearching = false
+            verifiedOnly = verifiedFilterEnabled
+            clearSearchResults()
+        }
         fun onFilterChanged(filter: SearchFilter) { activeFilter = filter; if (searchQuery.isNotBlank()) { searchJob?.cancel(); searchJob = viewModelScope.launch { performSearch(searchQuery) } } }
+
+        /** Whether [track] may show the verified badge in the current result list. */
+        fun isVerifiedMatch(track: Track): Boolean =
+            verifiedFilterEnabled && verifiedOnly && TrackVerification.keyOf(track) in verifiedTrackKeys
+
+        /** Toggles the Verified filter for the current search; the feature must be enabled in Settings. */
+        fun onVerifiedFilterChanged(enabled: Boolean) {
+            if (!verifiedFilterEnabled || verifiedOnly == enabled) return
+            verifiedOnly = enabled
+            if (!enabled) {
+                verifiedTrackKeys = emptySet()
+                trackVerificationStatus = TrackVerification.Status.IDLE
+            }
+            if (searchQuery.isNotBlank()) {
+                searchJob?.cancel()
+                searchJob = viewModelScope.launch { performSearch(searchQuery) }
+            }
+        }
     
         fun onSearchSourceChanged(source: SearchSource) {
-            if (activeSearchSource == source) return
+            if (activeSearchSource == source && !searchAllPlatforms) return
             activeSearchSource = source
+            searchAllPlatforms = false
             if (searchQuery.isNotBlank()) {
                 searchJob?.cancel()
                 searchJob = viewModelScope.launch { performSearch(searchQuery) }
@@ -571,7 +794,10 @@ import com.alananasss.kittytune.utils.Logger
             searchResultsTidalTracks.clear(); searchResultsTidalAlbums.clear(); searchResultsTidalPlaylists.clear(); searchResultsTidalArtists.clear()
             searchResultsQobuzTracks.clear(); searchResultsQobuzAlbums.clear(); searchResultsQobuzPlaylists.clear(); searchResultsQobuzArtists.clear()
             searchResultsApple.clear()
+            verifiedTrackKeys = emptySet()
+            trackVerificationStatus = TrackVerification.Status.IDLE
             yandexNotice = null
+            searchCorrectedQuery = null
             tracksNextUrl = null; artistsNextUrl = null; playlistsNextUrl = null
         }
     
@@ -580,23 +806,188 @@ import com.alananasss.kittytune.utils.Logger
             // The field searches as you type, so this is the first moment a query becomes a search
             // rather than a prefix. Recording it here is what keeps "lo" out of the history.
             recordSearch(query)
+            verifiedFilterEnabled = playerPrefs.getVerifiedFilterEnabled()
+            if (!verifiedFilterEnabled) verifiedOnly = false
             try {
-                when (activeSearchSource) {
-                    SearchSource.SOUNDCLOUD -> performSoundCloudSearch(query)
-                    SearchSource.YOUTUBE -> performYoutubeSearch(query)
-                    SearchSource.YOUTUBE_MUSIC -> performYoutubeMusicSearch(query)
-                    SearchSource.SPOTIFY -> performSpotifySearch(query)
-                    SearchSource.APPLE_MUSIC -> performAppleMusicSearch(query)
-                    SearchSource.YANDEX_MUSIC -> performYandexSearch(query)
-                    SearchSource.DEEZER -> performDeezerSearch(query)
-                    SearchSource.TIDAL -> performTidalSearch(query)
-                    SearchSource.QOBUZ -> performQobuzSearch(query)
+                if (searchAllPlatforms) {
+                    coroutineScope {
+                        SearchSourceOrder.visible()
+                            .filter { it != SearchSource.APPLE_MUSIC && it != SearchSource.YANDEX_MUSIC && it != SearchSource.YOUTUBE }
+                            .map { source -> async { runCatching { performOneSource(source, query) } } }
+                            .awaitAll()
+                    }
+                } else {
+                    performOneSource(activeSearchSource, query)
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
-            } finally {
-                isSearchLoading = false
             }
+            try {
+                applyTrackVerification(query)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                e.printStackTrace()
+                if (verifiedOnly) trackVerificationStatus = TrackVerification.Status.UNAVAILABLE
+            }
+            isSearchLoading = false
+            warmTopResults(query)
+        }
+
+        private fun currentTrackResults(source: SearchSource): MutableList<Track>? = when (source) {
+            SearchSource.SOUNDCLOUD -> searchResultsTracks
+            SearchSource.YOUTUBE -> searchResultsYoutube
+            SearchSource.YOUTUBE_MUSIC -> searchResultsYoutubeMusic
+            SearchSource.SPOTIFY -> searchResultsSpotify
+            SearchSource.DEEZER -> searchResultsDeezerTracks
+            SearchSource.TIDAL -> searchResultsTidalTracks
+            SearchSource.QOBUZ -> searchResultsQobuzTracks
+            SearchSource.APPLE_MUSIC, SearchSource.YANDEX_MUSIC -> null
+        }
+
+        private fun excludedPlatform(source: SearchSource): String? = when (source) {
+            SearchSource.SPOTIFY -> "spotify"
+            SearchSource.DEEZER -> "deezer"
+            SearchSource.TIDAL -> "tidal"
+            SearchSource.QOBUZ -> "qobuz"
+            else -> null
+        }
+
+        private fun trackSectionVisible(): Boolean =
+            activeFilter == SearchFilter.ALL ||
+                activeFilter == SearchFilter.TRACKS ||
+                activeSearchSource == SearchSource.YOUTUBE ||
+                activeSearchSource == SearchSource.YOUTUBE_MUSIC
+
+        /**
+         * Replaces the current track list(s) with the verified ranking. When nothing can be
+         * compared, the lists are left alone and the UI explains that verification was unavailable.
+         */
+        private suspend fun applyTrackVerification(query: String) {
+            if (!verifiedFilterEnabled || !verifiedOnly) {
+                verifiedTrackKeys = emptySet()
+                trackVerificationStatus = TrackVerification.Status.IDLE
+                return
+            }
+
+            if (searchAllPlatforms) {
+                val lists = listOf(
+                    searchResultsTracks,
+                    searchResultsYoutube,
+                    searchResultsYoutubeMusic,
+                    searchResultsSpotify,
+                    searchResultsDeezerTracks,
+                    searchResultsTidalTracks,
+                    searchResultsQobuzTracks,
+                )
+                val keys = linkedSetOf<String>()
+                var anyReference = false
+                var anyVisible = false
+                var anyVerified = false
+                for (list in lists) {
+                    if (list.isEmpty()) continue
+                    val outcome = TrackVerifier.verify(query, list.toList(), excludedPlatform = null)
+                    list.clear()
+                    list.addAll(outcome.tracks)
+                    keys += outcome.verifiedKeys
+                    anyReference = anyReference || outcome.referencesAvailable
+                    anyVisible = anyVisible || outcome.tracks.isNotEmpty()
+                    anyVerified = anyVerified || outcome.verifiedKeys.isNotEmpty()
+                }
+                verifiedTrackKeys = keys
+                trackVerificationStatus = when {
+                    !anyReference -> TrackVerification.Status.UNAVAILABLE
+                    anyVerified -> TrackVerification.Status.VERIFIED
+                    !anyVisible -> TrackVerification.Status.NO_MATCHES
+                    else -> TrackVerification.Status.INCONCLUSIVE
+                }
+                return
+            }
+
+            if (!trackSectionVisible()) {
+                verifiedTrackKeys = emptySet()
+                trackVerificationStatus = TrackVerification.Status.IDLE
+                return
+            }
+            val list = currentTrackResults(activeSearchSource)
+            if (list == null || list.isEmpty()) {
+                verifiedTrackKeys = emptySet()
+                trackVerificationStatus = TrackVerification.Status.IDLE
+                return
+            }
+
+            val outcome = TrackVerifier.verify(
+                query = query,
+                tracks = list.toList(),
+                excludedPlatform = excludedPlatform(activeSearchSource),
+            )
+            list.clear()
+            list.addAll(outcome.tracks)
+            verifiedTrackKeys = outcome.verifiedKeys
+            trackVerificationStatus = outcome.status
+        }
+
+        private suspend fun performOneSource(source: SearchSource, query: String) {
+            when (source) {
+                SearchSource.SOUNDCLOUD -> performSoundCloudSearch(query)
+                SearchSource.YOUTUBE -> performYoutubeSearch(query)
+                SearchSource.YOUTUBE_MUSIC -> performYoutubeMusicSearch(query)
+                SearchSource.SPOTIFY -> performSpotifySearch(query)
+                SearchSource.APPLE_MUSIC -> performAppleMusicSearch(query)
+                SearchSource.YANDEX_MUSIC -> performYandexSearch(query)
+                SearchSource.DEEZER -> performDeezerSearch(query)
+                SearchSource.TIDAL -> performTidalSearch(query)
+                SearchSource.QOBUZ -> performQobuzSearch(query)
+            }
+        }
+
+        private var warmStreamsJob: kotlinx.coroutines.Job? = null
+
+        /**
+         * Looks up where the first results stream from while the reader is still reading the list, so pressing
+         * one starts at once instead of after the sources have been asked (issue #66). Only once the query has
+         * stood still for a moment, so typing does not set it off at every letter.
+         */
+        private fun warmTopResults(query: String) {
+            warmStreamsJob?.cancel()
+            val top = when (activeSearchSource) {
+                SearchSource.SOUNDCLOUD -> searchResultsTracks
+                SearchSource.SPOTIFY -> searchResultsSpotify
+                SearchSource.DEEZER -> searchResultsDeezerTracks
+                SearchSource.TIDAL -> searchResultsTidalTracks
+                SearchSource.QOBUZ -> searchResultsQobuzTracks
+                SearchSource.YOUTUBE -> searchResultsYoutube
+                SearchSource.YOUTUBE_MUSIC -> searchResultsYoutubeMusic
+                SearchSource.APPLE_MUSIC, SearchSource.YANDEX_MUSIC -> emptyList()
+            }.take(WARMED_RESULTS).toList()
+            if (top.isEmpty()) return
+            warmStreamsJob = viewModelScope.launch {
+                delay(WARM_AFTER_IDLE_MS)
+                if (searchQuery.trim() != query.trim()) return@launch
+                withContext(Dispatchers.IO) {
+                    top.forEach { track ->
+                        runCatching { com.alananasss.kittytune.data.StreamResolver.resolveStreamWithDrm(track) }
+                    }
+                }
+            }
+        }
+
+        /**
+         * When none of the tracks found looks like what was typed, asks Deezer, whose search forgives a missing
+         * space or dash, how the song is spelt, and searches SoundCloud again with that; see [SearchQueryRepair].
+         */
+        private suspend fun retryWithRepairedQuery(query: String) {
+            val found = searchResultsTracks.map { (it.title.orEmpty()) to it.displayArtist.ifBlank { it.user?.username.orEmpty() } }
+            if (!SearchQueryRepair.needsRepair(query, found)) return
+            val candidates = runCatching {
+                com.alananasss.kittytune.data.deezer.DeezerSearchRepository.searchTracks(query, limit = 10)
+            }.getOrDefault(emptyList()).map { it.title.orEmpty() to it.displayArtist.ifBlank { it.user?.username.orEmpty() } }
+            val repaired = SearchQueryRepair.repairedQuery(query, candidates) ?: return
+            if (searchQuery.trim() != query.trim()) return
+            searchResultsTracks.clear(); searchResultsArtists.clear(); searchResultsPlaylists.clear()
+            tracksNextUrl = null; artistsNextUrl = null; playlistsNextUrl = null
+            searchCorrectedQuery = repaired
+            performSoundCloudSearch(repaired, isRetry = true)
         }
 
         private suspend fun performDeezerSearch(query: String) {
@@ -813,6 +1204,30 @@ import com.alananasss.kittytune.utils.Logger
         private suspend fun performYoutubeSearch(query: String) {
             withContext(Dispatchers.IO) {
                 try {
+                    // "Hide video songs": the YouTube tab lists YouTube Music songs instead of videos.
+                    if (playerPrefs.getHideVideoSongs()) {
+                        val songs = com.zionhuang.innertube.YouTube.search(
+                            query,
+                            com.zionhuang.innertube.YouTube.SearchFilter.FILTER_SONG
+                        ).getOrNull()?.items?.filterIsInstance<com.zionhuang.innertube.models.SongItem>().orEmpty()
+                        val mappedSongs = songs.map { song ->
+                            val videoUrl = "https://www.youtube.com/watch?v=${song.id}"
+                            Track(
+                                id = videoUrl.hashCode().toLong(),
+                                title = song.title,
+                                user = User(0L, song.artists.joinToString(", ") { it.name }, null),
+                                artworkUrl = song.thumbnail,
+                                durationMs = (song.duration ?: 0) * 1000L,
+                                permalinkUrl = videoUrl,
+                                source = "youtube"
+                            )
+                        }
+                        withContext(Dispatchers.Main) {
+                            searchResultsYoutube.clear()
+                            searchResultsYoutube.addAll(mappedSongs)
+                        }
+                        return@withContext
+                    }
                     com.alananasss.kittytune.data.StreamResolver.init()
                     val youtubeService = org.schabi.newpipe.extractor.ServiceList.YouTube
                     val searchInfo = org.schabi.newpipe.extractor.search.SearchInfo.getInfo(
@@ -820,7 +1235,10 @@ import com.alananasss.kittytune.utils.Logger
                         youtubeService.searchQHFactory.fromQuery(query, listOf("videos"), "")
                     )
     
-                    val mappedTracks = searchInfo.relatedItems.filterIsInstance<org.schabi.newpipe.extractor.stream.StreamInfoItem>().mapNotNull { item ->
+                    val hideShorts = playerPrefs.getHideYoutubeShorts()
+                    val mappedTracks = searchInfo.relatedItems.filterIsInstance<org.schabi.newpipe.extractor.stream.StreamInfoItem>()
+                        .filterNot { hideShorts && isYoutubeShort(it.isShortFormContent, it.url) }
+                        .mapNotNull { item ->
                         Track(
                             id = item.url.hashCode().toLong(),
                             title = item.name,
@@ -873,7 +1291,7 @@ import com.alananasss.kittytune.utils.Logger
                 }
             }
         }
-        private suspend fun performSoundCloudSearch(query: String) {
+        private suspend fun performSoundCloudSearch(query: String, isRetry: Boolean = false) {
             coroutineScope {
                 when (activeFilter) {
                     SearchFilter.ALL -> {
@@ -895,6 +1313,9 @@ import com.alananasss.kittytune.utils.Logger
                         val response = api.searchPlaylists(query, limit = 30); searchResultsPlaylists.addAll(response.collection); playlistsNextUrl = response.next_href
                     }
                 }
+            }
+            if (!isRetry && activeFilter != SearchFilter.ARTISTS && activeFilter != SearchFilter.PLAYLISTS) {
+                retryWithRepairedQuery(query)
             }
         }
     
@@ -944,6 +1365,7 @@ import com.alananasss.kittytune.utils.Logger
                             }
                         }
                     }
+                    if (verifiedFilterEnabled && verifiedOnly) applyTrackVerification(searchQuery)
                 } catch (e: Exception) { e.printStackTrace() } finally { isSearchLoadingMore = false }
             }
         }

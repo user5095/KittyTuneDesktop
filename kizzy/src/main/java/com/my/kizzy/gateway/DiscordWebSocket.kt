@@ -29,11 +29,13 @@
     import kotlinx.coroutines.Job
     import kotlinx.coroutines.SupervisorJob
     import kotlinx.coroutines.cancel
+    import kotlinx.coroutines.cancelChildren
     import kotlinx.coroutines.delay
     import kotlinx.coroutines.flow.receiveAsFlow
     import kotlinx.coroutines.isActive
     import kotlinx.coroutines.launch
     import kotlinx.coroutines.runBlocking
+    import kotlinx.coroutines.withTimeoutOrNull
     import kotlinx.serialization.encodeToString
     import kotlinx.serialization.json.Json
     import kotlinx.serialization.json.decodeFromJsonElement
@@ -57,24 +59,43 @@
         private var heartbeatInterval = 0L
         private var resumeGatewayUrl: String? = null
         private var heartbeatJob: Job? = null
+        private var connectJob: Job? = null
         private var connected = false
-        private var client: HttpClient = HttpClient {
-            install(WebSockets)
+        private var client: HttpClient? = null
+
+        private fun getClient(): HttpClient {
+            var c = client
+            if (c == null) {
+                c = HttpClient {
+                    install(WebSockets)
+                }
+                client = c
+            }
+            return c
         }
+
         private val json = Json {
             ignoreUnknownKeys = true
             encodeDefaults = true
         }
-    
+
+        // A single stable SupervisorJob: every launch()/heartbeat launched from this scope is a child
+        // of THIS job. The previous `get() = SupervisorJob() + Dispatchers.Default` constructed a new
+        // job on every access, so `close()`'s `this.cancel()` cancelled a throwaway job — none of the
+        // actually-launched coroutines (heartbeat, receive loop) were ever cancelled, leaking the
+        // WebSocket and the ktor HttpClient on every closeRPC().
+        private val supervisorJob = SupervisorJob()
         override val coroutineContext: CoroutineContext
-            get() = SupervisorJob() + Dispatchers.Default
+            get() = supervisorJob + Dispatchers.Default
     
         suspend fun connect() {
-            launch {
+            if (isSocketConnectedToAccount()) return
+            if (connectJob?.isActive == true) return
+            connectJob = launch {
                 try {
                     Logger.getLogger("Kizzy").log(INFO, "Gateway: Connect called")
                     val url = resumeGatewayUrl ?: gatewayUrl
-                    websocket = client.webSocketSession(url)
+                    websocket = getClient().webSocketSession(url)
     
                     // start receiving messages
                     websocket!!.incoming.receiveAsFlow()
@@ -100,12 +121,16 @@
             heartbeatJob?.cancel()
             connected = false
             val close = websocket?.closeReason?.await()
-            Logger.getLogger("Kizzy").log(INFO, "Gateway: Closed with code: ${close?.code}, reason: ${close?.message},  can_reconnect: ${close?.code?.toInt() == 4000}")
-            if (close?.code?.toInt() == 4000) {
-                delay(200.milliseconds)
+            val code = close?.code?.toInt()
+            Logger.getLogger("Kizzy").log(INFO, "Gateway: Closed with code: $code, reason: ${close?.message}")
+            // Codes that cannot reconnect (authentication failure, invalid shards, etc.)
+            val isFatal = code in listOf(4004, 4010, 4011, 4012, 4013, 4014)
+            if (!isFatal) {
+                delay(1000.milliseconds)
                 connect()
-            } else
+            } else {
                 close()
+            }
         }
     
         private suspend fun onMessage(payload: Payload) {
@@ -209,7 +234,7 @@
             }
         }
     
-        private fun isSocketConnectedToAccount(): Boolean {
+        fun isSocketConnectedToAccount(): Boolean {
             return connected && websocket?.isActive == true
         }
     
@@ -233,20 +258,42 @@
         fun close() {
             heartbeatJob?.cancel()
             heartbeatJob = null
-            this.cancel()
+            connectJob?.cancel()
+            connectJob = null
+            // Cancel only the launched children (connect receive loop, heartbeat), not the scope
+            // itself. Cancelling the scope via this.cancel() would make the scope unusable for a
+            // future reconnect, and with the previous buggy getter it didn't even do that.
+            supervisorJob.cancelChildren()
             resumeGatewayUrl = null
             sessionId = null
             connected = false
-            runBlocking {
-                websocket?.close()
-                Logger.getLogger("Kizzy").log(Level.SEVERE, "Gateway: Connection to gateway closed")
+            runCatching {
+                runBlocking {
+                    websocket?.close()
+                    Logger.getLogger("Kizzy").log(Level.SEVERE, "Gateway: Connection to gateway closed")
+                }
             }
+            // Release the ktor HttpClient (connection pool + threads). Previously leaked forever —
+            // every closeRPC() left one HttpClient open.
+            runCatching { client?.close() }
+            client = null
+            websocket = null
         }
-    
+
         suspend fun sendActivity(presence: Presence) {
-            // TODO : Figure out a better way to wait for socket to be connected to account
-            while (!isSocketConnectedToAccount()) {
-                delay(10.milliseconds)
+            if (!isSocketConnectedToAccount()) {
+                connect()
+            }
+            // Wait for the gateway to reach READY, but with a timeout: the previous unbounded
+            // `while (!isSocketConnectedToAccount()) delay(10ms)` could spin forever if connect()
+            // silently failed to dispatch READY, suspending the caller indefinitely.
+            val ready = withTimeoutOrNull(ACTIVITY_READY_TIMEOUT_MS) {
+                while (!isSocketConnectedToAccount()) delay(50.milliseconds)
+                true
+            }
+            if (ready == null) {
+                Logger.getLogger("Kizzy").log(Level.WARNING, "Gateway: sendActivity timed out waiting for READY, dropping presence update")
+                return
             }
             Logger.getLogger("Kizzy").log(INFO, "Gateway: Sending $PRESENCE_UPDATE")
             send(
@@ -254,7 +301,12 @@
                 d = presence
             )
         }
-    
+
+        companion object {
+            /** Maximum time sendActivity waits for the gateway to reach READY before giving up. */
+            private const val ACTIVITY_READY_TIMEOUT_MS = 10_000L
+        }
+
     }
 
 

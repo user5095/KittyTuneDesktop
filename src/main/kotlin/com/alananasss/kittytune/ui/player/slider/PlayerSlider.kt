@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.SliderColors
 import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.SliderState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -19,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.data.local.PlayerSliderStyle
 import com.alananasss.kittytune.ui.common.Slider
+import androidx.compose.ui.graphics.Color
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -33,12 +33,21 @@ fun PlayerSlider(
     colors: SliderColors = SliderDefaults.colors(),
     enabled: Boolean = true,
     bufferedValue: Float? = null,
+    /** A mix to show on the bar, with the colour of its glow; the wavy bar draws it from its own thumb, the others behind themselves. */
+    mix: MixTransition? = null,
+    mixColor: Color = colors.activeTrackColor,
+    onValueChangeCancelled: (() -> Unit)? = null,
 ) {
     val clampedValue = if (valueRange.endInclusive > valueRange.start) {
         value.coerceIn(valueRange.start, valueRange.endInclusive)
     } else {
         0f
     }
+
+    val span = valueRange.endInclusive - valueRange.start
+    val behindGlow = if (mix != null && sliderStyle != PlayerSliderStyle.WAVY) {
+        modifier.mixGlow(mix, mixColor) { if (span > 0f) (clampedValue - valueRange.start) / span else 0f }
+    } else modifier
 
     when (sliderStyle) {
         PlayerSliderStyle.BAR -> {
@@ -49,7 +58,7 @@ fun PlayerSlider(
                 valueRange = valueRange,
                 colors = colors,
                 enabled = enabled,
-                modifier = modifier
+                modifier = behindGlow
             )
         }
         PlayerSliderStyle.WAVY -> {
@@ -58,10 +67,12 @@ fun PlayerSlider(
                 valueRange = valueRange,
                 onValueChange = onValueChange,
                 onValueChangeFinished = onValueChangeFinished,
+                onValueChangeCancelled = onValueChangeCancelled,
                 colors = colors,
                 isPlaying = isPlaying,
                 enabled = enabled,
-                bufferedValue = bufferedValue,
+                mix = mix,
+                mixColor = mixColor,
                 modifier = modifier
             )
         }
@@ -80,16 +91,16 @@ fun PlayerSlider(
                 label = "trackHeight"
             )
 
-            androidx.compose.material3.Slider(
+            Slider(
                 value = clampedValue,
+                valueRange = valueRange,
                 onValueChange = onValueChange,
                 onValueChangeFinished = onValueChangeFinished,
-                valueRange = valueRange,
                 interactionSource = trackInteractionSource,
                 thumb = { Spacer(modifier = Modifier.size(0.dp)) },
-                track = { sliderState ->
+                track = { state ->
                     PlayerSliderTrack(
-                        sliderState = sliderState,
+                        sliderState = state,
                         trackHeight = trackHeight,
                         colors = colors,
                         bufferedValue = bufferedValue
@@ -97,7 +108,7 @@ fun PlayerSlider(
                 },
                 colors = colors,
                 enabled = enabled,
-                modifier = modifier
+                modifier = behindGlow
             )
         }
         PlayerSliderStyle.SQUIGGLY -> {
@@ -106,11 +117,11 @@ fun PlayerSlider(
                 valueRange = valueRange,
                 onValueChange = onValueChange,
                 onValueChangeFinished = onValueChangeFinished,
+                onValueChangeCancelled = onValueChangeCancelled,
                 colors = colors,
                 isPlaying = isPlaying,
                 enabled = enabled,
-                bufferedValue = bufferedValue,
-                modifier = modifier
+                modifier = behindGlow
             )
         }
     }

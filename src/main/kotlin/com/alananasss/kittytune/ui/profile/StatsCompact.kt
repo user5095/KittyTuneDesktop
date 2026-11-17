@@ -19,6 +19,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.str
+import com.alananasss.kittytune.ui.common.MorphingGrid
 import com.alananasss.kittytune.data.stats.ListeningReport
 import com.alananasss.kittytune.data.stats.ReportArtist
 import com.alananasss.kittytune.data.stats.ReportPeriod
@@ -38,6 +39,7 @@ internal fun CompactStats(
     onOpen: (StatsList) -> Unit,
     onTrackClick: (Long) -> Unit,
     onArtistClick: (ReportArtist) -> Unit,
+    header: (@Composable () -> Unit)? = null,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val isWide = maxWidth >= 760.dp
@@ -46,6 +48,7 @@ internal fun CompactStats(
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 120.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            if (header != null) item(key = "recaps") { header() }
             item { NumbersStrip(report, period, onOpen) }
             item { ActivityStrip(report) }
             item {
@@ -76,16 +79,9 @@ internal fun CompactStats(
                         }
                     }
                 }
-                if (isWide) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.height(IntrinsicSize.Max)) {
-                        tracks(Modifier.weight(1f).fillMaxHeight())
-                        artists(Modifier.weight(1f).fillMaxHeight())
-                    }
-                } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        tracks(Modifier.fillMaxWidth())
-                        artists(Modifier.fillMaxWidth())
-                    }
+                MorphingGrid(columns = if (isWide) 2 else 1, spacing = 12.dp) {
+                    tracks(Modifier)
+                    artists(Modifier)
                 }
             }
             item { HabitsLine(report) }

@@ -56,8 +56,15 @@ class RainPlayer {
         if (clip != null) return
         try {
             val wav = ensureDecodedWav(currentType)
+            // Closed right after the Clip has read it in: leaving it open leaked a file handle per
+            // ambient change or device reload, and the open handle also kept the cached WAV
+            // undeletable on Windows.
             val stream = AudioSystem.getAudioInputStream(wav)
-            val c = openClipForStream(stream)
+            val c = try {
+                openClipForStream(stream)
+            } finally {
+                runCatching { stream.close() }
+            }
             c.loop(Clip.LOOP_CONTINUOUSLY)
             clip = c
             applyVolume()
@@ -105,7 +112,10 @@ class RainPlayer {
                 initPlayer()
                 clip?.start()
             } else {
-                clip?.stop()
+                // Closed, not just stopped: a Clip holds the whole decoded loop in memory (18 MB for
+                // the rain), and a stopped one kept it until exit. Turning it back on reopens it from
+                // the cached WAV, which is a few milliseconds.
+                releaseClip()
             }
         }
     }

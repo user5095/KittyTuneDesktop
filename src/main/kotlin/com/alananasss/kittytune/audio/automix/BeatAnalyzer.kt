@@ -1,6 +1,7 @@
 package com.alananasss.kittytune.audio.automix
 
 import com.alananasss.kittytune.utils.Logger
+import com.alananasss.kittytune.audio.ANALYSIS_RW_TIMEOUT_US
 import com.alananasss.kittytune.audio.releaseQuietly
 import org.bytedeco.javacv.FFmpegFrameGrabber
 import org.bytedeco.javacv.Frame
@@ -35,6 +36,8 @@ object BeatAnalyzer {
         /** 0=C, 1=C#, ... 11=B. Null when the chroma signal was too weak to call a key. */
         val keyPitchClass: Int? = null,
         val keyIsMinor: Boolean? = null,
+        /** 0..1, how loud and driving the body of the track is. */
+        val energy: Float? = null,
     )
 
     private const val TAG = "BeatAnalyzer"
@@ -83,6 +86,17 @@ object BeatAnalyzer {
         knownDurationMs: Long = 0L,
         shouldCancel: () -> Boolean = { false },
     ): Result? {
+        // A protected stream is ciphertext to FFmpeg. This runs on the automix thread and must not
+        // block on a download, so it uses a clear copy only when one is already on disk (a download,
+        // the audio cache, or the karaoke split leaves one). Without it, there is simply no beat
+        // grid for that track, which automix already handles.
+        if (source.contains(".m3u8")) {
+            val clear = com.alananasss.kittytune.audio.ClearStreamCache.cached(source)
+            if (clear != null) {
+                Logger.d(TAG, "beat analysis reads a clear copy of the protected stream")
+                return analyzeFile(clear.absolutePath, shouldCancel)
+            }
+        }
         if (source.contains(".m3u8")) {
             val adapter = try {
                 com.alananasss.kittytune.audio.HlsStreamAdapter(source, headers)
@@ -90,77 +104,81 @@ object BeatAnalyzer {
                 Logger.w(TAG, "Failed creating HlsStreamAdapter for beat analysis: ${e.message}")
                 return null
             }
-            val totalDurationMs = if (knownDurationMs > 0) knownDurationMs else adapter.totalDurationMs
+            try {
+                val totalDurationMs = if (knownDurationMs > 0) knownDurationMs else adapter.totalDurationMs
 
-            val windowStartMs = if (totalDurationMs > 36_000L) max(0L, totalDurationMs / 2 - 9_000L) else 0L
-            if (shouldCancel()) return null
-            val midPcm = try {
-                decodeHlsWindow(adapter, windowStartMs, WINDOW_US, shouldCancel)
-            } catch (e: Exception) {
-                Logger.w(TAG, "Failed decoding HLS middle window: ${e.message}")
-                null
+                val windowStartMs = if (totalDurationMs > 36_000L) max(0L, totalDurationMs / 2 - 9_000L) else 0L
+                if (shouldCancel()) return null
+                val midPcm = try {
+                    decodeHlsWindow(adapter, windowStartMs, WINDOW_US, shouldCancel)
+                } catch (e: Exception) {
+                    Logger.w(TAG, "Failed decoding HLS middle window: ${e.message}")
+                    null
+                }
+
+                if (midPcm == null || midPcm.samples.size < FFT_SIZE * 8) {
+                    Logger.d(TAG, "Insufficient PCM frames from HLS for beat analysis (${midPcm?.samples?.size ?: 0})")
+                    return null
+                }
+
+                if (shouldCancel()) return null
+                val key = estimateKey(midPcm.samples, midPcm.sampleRate)
+
+                if (shouldCancel()) return null
+                val flux = spectralFlux(midPcm.samples)
+                val frameRate = midPcm.sampleRate.toFloat() / HOP_SIZE
+
+                val (periodFrames, confidence) = estimateTempoPeriod(flux, frameRate) ?: return null
+                val phaseFrames = estimateBeatPhase(flux, periodFrames)
+
+                var periodMs = periodFrames / frameRate * 1000f
+                var bpm = 60_000f / periodMs
+                while (bpm < MIN_CANONICAL_BPM) {
+                    bpm *= 2f
+                    periodMs /= 2f
+                }
+                while (bpm >= MAX_CANONICAL_BPM) {
+                    bpm /= 2f
+                    periodMs *= 2f
+                }
+
+                val windowStartAnchorMs = midPcm.actualStartUs / 1000L
+                val anchorMs = windowStartAnchorMs + (phaseFrames / frameRate * 1000f).roundToLong()
+                val firstBeatOffsetMs = (anchorMs % periodMs.roundToLong() + periodMs.roundToLong()) % periodMs.roundToLong()
+
+                var mixInPointMs: Long? = null
+                if (totalDurationMs > 16_000L && !shouldCancel()) {
+                    try {
+                        val headPcm = decodeHlsWindow(adapter, 0L, HEAD_WINDOW_US, shouldCancel)
+                        if (headPcm != null) {
+                            mixInPointMs = detectMixIn(
+                                energyEnvelope(headPcm.samples, headPcm.sampleRate),
+                                firstBeatOffsetMs,
+                                periodMs
+                            )
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                var mixOutPointMs: Long? = null
+                if (totalDurationMs > 45_000L && !shouldCancel()) {
+                    val tailStartMs = max(0L, totalDurationMs - 24_000L)
+                    try {
+                        val tailPcm = decodeHlsWindow(adapter, tailStartMs, TAIL_WINDOW_US, shouldCancel)
+                        if (tailPcm != null) {
+                            mixOutPointMs = detectMixOut(
+                                energyEnvelope(tailPcm.samples, tailPcm.sampleRate),
+                                tailStartMs,
+                                totalDurationMs
+                            )
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                return Result(bpm, firstBeatOffsetMs, confidence, mixInPointMs, mixOutPointMs, key?.first, key?.second, bodyEnergy(midPcm.samples, bpm))
+            } finally {
+                adapter.releaseDrm()
             }
-
-            if (midPcm == null || midPcm.samples.size < FFT_SIZE * 8) {
-                Logger.d(TAG, "Insufficient PCM frames from HLS for beat analysis (${midPcm?.samples?.size ?: 0})")
-                return null
-            }
-
-            if (shouldCancel()) return null
-            val key = estimateKey(midPcm.samples, midPcm.sampleRate)
-
-            if (shouldCancel()) return null
-            val flux = spectralFlux(midPcm.samples)
-            val frameRate = midPcm.sampleRate.toFloat() / HOP_SIZE
-
-            val (periodFrames, confidence) = estimateTempoPeriod(flux, frameRate) ?: return null
-            val phaseFrames = estimateBeatPhase(flux, periodFrames)
-
-            var periodMs = periodFrames / frameRate * 1000f
-            var bpm = 60_000f / periodMs
-            while (bpm < MIN_CANONICAL_BPM) {
-                bpm *= 2f
-                periodMs /= 2f
-            }
-            while (bpm >= MAX_CANONICAL_BPM) {
-                bpm /= 2f
-                periodMs *= 2f
-            }
-
-            val windowStartAnchorMs = midPcm.actualStartUs / 1000L
-            val anchorMs = windowStartAnchorMs + (phaseFrames / frameRate * 1000f).roundToLong()
-            val firstBeatOffsetMs = (anchorMs % periodMs.roundToLong() + periodMs.roundToLong()) % periodMs.roundToLong()
-
-            var mixInPointMs: Long? = null
-            if (totalDurationMs > 16_000L && !shouldCancel()) {
-                try {
-                    val headPcm = decodeHlsWindow(adapter, 0L, HEAD_WINDOW_US, shouldCancel)
-                    if (headPcm != null) {
-                        mixInPointMs = detectMixIn(
-                            energyEnvelope(headPcm.samples, headPcm.sampleRate),
-                            firstBeatOffsetMs,
-                            periodMs
-                        )
-                    }
-                } catch (_: Exception) {}
-            }
-
-            var mixOutPointMs: Long? = null
-            if (totalDurationMs > 45_000L && !shouldCancel()) {
-                val tailStartMs = max(0L, totalDurationMs - 24_000L)
-                try {
-                    val tailPcm = decodeHlsWindow(adapter, tailStartMs, TAIL_WINDOW_US, shouldCancel)
-                    if (tailPcm != null) {
-                        mixOutPointMs = detectMixOut(
-                            energyEnvelope(tailPcm.samples, tailPcm.sampleRate),
-                            tailStartMs,
-                            totalDurationMs
-                        )
-                    }
-                } catch (_: Exception) {}
-            }
-
-            return Result(bpm, firstBeatOffsetMs, confidence, mixInPointMs, mixOutPointMs, key?.first, key?.second)
         }
 
         var grabber: FFmpegFrameGrabber? = null
@@ -180,6 +198,7 @@ object BeatAnalyzer {
                     setOption("reconnect_on_network_error", "1")
                 }
                 setOption("timeout", "8000000") // 8s network timeout
+                setOption("rw_timeout", ANALYSIS_RW_TIMEOUT_US)
                 sampleRate = 44100
                 audioChannels = 1
                 sampleMode = FrameGrabber.SampleMode.FLOAT
@@ -269,7 +288,7 @@ object BeatAnalyzer {
                 } catch (_: Exception) {}
             }
 
-            return Result(bpm, firstBeatOffsetMs, confidence, mixInPointMs, mixOutPointMs, key?.first, key?.second)
+            return Result(bpm, firstBeatOffsetMs, confidence, mixInPointMs, mixOutPointMs, key?.first, key?.second, bodyEnergy(pcm.samples, bpm))
         } catch (e: Exception) {
             Logger.w(TAG, "Beat analysis failed: ${e.message}")
             return null
@@ -387,6 +406,23 @@ object BeatAnalyzer {
             writePos += c.size
         }
         return MonoPcm(out, sampleRate, startUs)
+    }
+
+    /**
+     * How energetic the body of a track is, 0 to 1: how loud it is, and how fast.
+     *
+     * The loudness is the RMS of the analysed middle of the track against a loud master (0.25 is about as hot as
+     * mastered music gets), the pace the tempo against the usual 70 to 140; loudness counts for two thirds. Both are
+     * crude, and meant only to tell a ballad from a club track so the blend can be chosen for the pair.
+     */
+    fun bodyEnergy(samples: FloatArray, bpm: Float): Float {
+        if (samples.isEmpty()) return 0f
+        var sum = 0.0
+        for (s in samples) sum += s * s
+        val rms = sqrt(sum / samples.size).toFloat()
+        val loud = (rms / 0.25f).coerceIn(0f, 1f)
+        val pace = ((bpm - MIN_CANONICAL_BPM) / (MAX_CANONICAL_BPM - MIN_CANONICAL_BPM)).coerceIn(0f, 1f)
+        return (0.65f * loud + 0.35f * pace).coerceIn(0f, 1f)
     }
 
     /** RMS energy per ENERGY_BLOCK_MS block. */
@@ -556,43 +592,73 @@ object BeatAnalyzer {
     private val MAJOR_PROFILE = floatArrayOf(6.35f, 2.23f, 3.48f, 2.33f, 4.38f, 4.09f, 2.52f, 5.19f, 2.39f, 3.66f, 2.29f, 2.88f)
     private val MINOR_PROFILE = floatArrayOf(6.33f, 2.68f, 3.52f, 5.38f, 2.60f, 3.53f, 2.54f, 4.75f, 3.98f, 2.69f, 3.34f, 3.17f)
 
+    // Target frequency resolution of the key chroma FFT (Hz per bin).
+    private const val KEY_TARGET_BIN_HZ = 5f
+    private const val KEY_MIN_FFT = 2048
+    private const val KEY_MAX_FFT = 8192
+
+    // Below this the bins are wider than a semitone and a half: pure smear, no pitch info.
+    private const val KEY_MIN_HZ = 100f
+    private const val KEY_MAX_HZ = 2000f
+
     /**
-     * Chroma vector (12-bin pitch-class energy) correlated against the Krumhansl-Schmuckler
-     * profiles across all 12 rotations.
+     * FFT size for the chroma. The beat/flux FFT_SIZE (1024) gives ~43 Hz bins at 44.1 kHz, wider than a
+     * semitone below ~700 Hz, so every track collapsed onto the same few keys. Picks the largest power of two
+     * with bins of at least [KEY_TARGET_BIN_HZ], then shrinks until the buffer holds enough frames.
+     * Returns 0 when the buffer is too short.
+     */
+    internal fun keyFftSize(sampleRate: Int, numSamples: Int): Int {
+        var n = KEY_MIN_FFT
+        while (n * 2 <= KEY_MAX_FFT && n * 2 <= sampleRate / KEY_TARGET_BIN_HZ) n *= 2
+        while (n > KEY_MIN_FFT && numSamples < n * 4) n /= 2
+        return if (numSamples < n * 4) 0 else n
+    }
+
+    /**
+     * Chroma vector (12-bin pitch-class power) correlated against the Krumhansl-Schmuckler major/minor
+     * profiles across all 12 rotations (Pearson, so a flat chroma scores ~0 instead of being decided by
+     * whichever profile has the larger sum). Returns (pitch class 0=C..11=B, isMinor), or null when there
+     * is not enough tonal energy to call a key (e.g. mostly percussive).
      */
     fun estimateKey(samples: FloatArray, sampleRate: Int): Pair<Int, Boolean>? {
-        if (samples.size < FFT_SIZE * 4) return null
-        val window = FloatArray(FFT_SIZE) { 0.5f - 0.5f * cos(2.0 * Math.PI * it / FFT_SIZE).toFloat() }
-        val hop = FFT_SIZE / 2
-        val numFrames = (samples.size - FFT_SIZE) / hop
+        if (sampleRate <= 0) return null
+        val n = keyFftSize(sampleRate, samples.size)
+        if (n == 0) return null
+        val window = FloatArray(n) { 0.5f - 0.5f * cos(2.0 * Math.PI * it / n).toFloat() }
+        val hop = n / 2
+        val numFrames = (samples.size - n) / hop
         if (numFrames < 4) return null
 
         val chroma = FloatArray(12)
-        val re = FloatArray(FFT_SIZE)
-        val im = FloatArray(FFT_SIZE)
-        val binHz = sampleRate.toFloat() / FFT_SIZE
-        val minBin = (65f / binHz).toInt().coerceAtLeast(1)
-        val maxBin = (2000f / binHz).toInt().coerceAtMost(FFT_SIZE / 2 - 1)
+        val re = FloatArray(n)
+        val im = FloatArray(n)
+        val binHz = sampleRate.toFloat() / n
+        val minBin = (KEY_MIN_HZ / binHz).toInt().coerceAtLeast(1)
+        val maxBin = (KEY_MAX_HZ / binHz).toInt().coerceAtMost(n / 2 - 1)
+        if (maxBin <= minBin) return null
+
+        // bin -> pitch class, computed once (it does not depend on the frame).
+        val pitchClassOfBin = IntArray(maxBin + 1)
+        for (b in minBin..maxBin) {
+            val midi = 69.0 + 12.0 * (ln(b * binHz / 440.0) / ln(2.0))
+            pitchClassOfBin[b] = ((midi.roundToInt() % 12) + 12) % 12
+        }
 
         for (frame in 0 until numFrames) {
             val offset = frame * hop
-            for (i in 0 until FFT_SIZE) {
+            for (i in 0 until n) {
                 re[i] = samples[offset + i] * window[i]
                 im[i] = 0f
             }
             fft(re, im)
             for (b in minBin..maxBin) {
-                val mag = sqrt(re[b] * re[b] + im[b] * im[b])
-                if (mag <= 0f) continue
-                val freq = b * binHz
-                val midi = 69.0 + 12.0 * (ln(freq / 440.0) / ln(2.0))
-                val pitchClass = ((midi.roundToInt() % 12) + 12) % 12
-                chroma[pitchClass] += mag
+                // Power, not magnitude: emphasises spectral peaks over broadband noise.
+                chroma[pitchClassOfBin[b]] += re[b] * re[b] + im[b] * im[b]
             }
         }
 
         val sum = chroma.sum()
-        if (sum <= 0f) return null
+        if (!(sum > 0f) || sum.isInfinite()) return null // also rejects NaN
         for (i in chroma.indices) chroma[i] /= sum
 
         var bestScore = Float.NEGATIVE_INFINITY
@@ -608,13 +674,29 @@ object BeatAnalyzer {
                 bestScore = minorScore; bestPitchClass = tonic; bestIsMinor = true
             }
         }
+        // No positive correlation = no tonal centre: say "unknown" rather than a random key.
+        if (!(bestScore > 0f)) return null
         return bestPitchClass to bestIsMinor
     }
 
+    /** Pearson correlation of the chroma, rotated so index 0 = [tonic], with [profile]. */
     private fun correlateChroma(chroma: FloatArray, profile: FloatArray, tonic: Int): Float {
-        var sum = 0f
-        for (degree in 0 until 12) sum += chroma[(degree + tonic) % 12] * profile[degree]
-        return sum
+        var meanX = 0f
+        var meanP = 0f
+        for (i in 0 until 12) { meanX += chroma[i]; meanP += profile[i] }
+        meanX /= 12f
+        meanP /= 12f
+        var num = 0f
+        var dx = 0f
+        var dp = 0f
+        for (degree in 0 until 12) {
+            val x = chroma[(degree + tonic) % 12] - meanX
+            val p = profile[degree] - meanP
+            num += x * p
+            dx += x * x
+            dp += p * p
+        }
+        return if (dx <= 0f || dp <= 0f) 0f else num / sqrt(dx * dp)
     }
 
     /** Comb filter: phase (in frames) maximizing summed flux at phase + k*period. */

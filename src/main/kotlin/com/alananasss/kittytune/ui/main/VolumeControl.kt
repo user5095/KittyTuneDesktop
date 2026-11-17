@@ -1,8 +1,14 @@
 package com.alananasss.kittytune.ui.main
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.material3.ProgressIndicatorDefaults
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -34,6 +40,9 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import com.alananasss.kittytune.ui.icons.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.IconButtonShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -79,8 +88,11 @@ import java.awt.Cursor
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 
+/** Room for the level beside the track: "100%" included, which used to wrap its sign onto a hidden second line. */
+private val PERCENT_LABEL_WIDTH = 44.dp
+
 /** Mute button, the two gaps and the percentage: everything in the inline row that is not the track. */
-private val INLINE_OVERHEAD = 36.dp + 6.dp + 8.dp + 40.dp
+private val INLINE_OVERHEAD = 40.dp + 6.dp + 8.dp + PERCENT_LABEL_WIDTH
 
 /** Shortest track worth aiming at; with less room the bar uses the hover popup instead. */
 private val MIN_TRACK_WIDTH = 96.dp
@@ -99,6 +111,7 @@ private val TRACK_INSET = 7.dp
  * The inline one replaces a stock Material slider whose tall bar thumb and thick track were built
  * for touch: hard to hit precisely in a 64 dp bar, and it never said what level it was at.
  */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 internal fun VolumeControl(
     volume: Float,
@@ -108,23 +121,42 @@ internal fun VolumeControl(
     onVolumeChangeFinished: () -> Unit,
     onVolumeScrolled: (Float) -> Unit,
     onToggleMute: () -> Unit,
+    shapes: IconButtonShapes = IconButtonDefaults.shapes(),
+    /** A right click on the speaker lists the output devices; see [OutputDevicePicker]. */
+    onSelectDevice: (String) -> Unit = {},
 ) {
     val style = rememberVolumeStyle()
     androidx.compose.runtime.CompositionLocalProvider(LocalWaveMoving provides isPlaying) {
     BoxWithConstraints(contentAlignment = Alignment.Center) {
         val roomForTrack = maxWidth - INLINE_OVERHEAD
-        if (preferVertical || roomForTrack < MIN_TRACK_WIDTH) {
-            VolumeHoverControl(volume, style, onVolumeChange, onVolumeChangeFinished, onVolumeScrolled, onToggleMute)
-        } else {
-            InlineVolumeControl(
-                volume = volume,
-                style = style,
-                trackWidth = roomForTrack.coerceAtMost(MAX_TRACK_WIDTH),
-                onVolumeChange = onVolumeChange,
-                onVolumeChangeFinished = onVolumeChangeFinished,
-                onVolumeScrolled = onVolumeScrolled,
-                onToggleMute = onToggleMute,
-            )
+        // The inline track folds into the speaker button when the window gets too narrow for it, and unfolds
+        // again, instead of swapping in a single frame (issue #66).
+        androidx.compose.animation.AnimatedContent(
+            targetState = preferVertical || roomForTrack < MIN_TRACK_WIDTH,
+            transitionSpec = {
+                (androidx.compose.animation.fadeIn(tween(220, delayMillis = 80)) +
+                    androidx.compose.animation.scaleIn(tween(260, easing = FastOutSlowInEasing), initialScale = 0.85f)) togetherWith
+                    androidx.compose.animation.fadeOut(tween(120)) using
+                    androidx.compose.animation.SizeTransform(clip = false) { _, _ -> tween(300, easing = FastOutSlowInEasing) }
+            },
+            contentAlignment = Alignment.CenterEnd,
+            label = "volumeLayout",
+        ) { usesPopup ->
+            if (usesPopup) {
+                VolumeHoverControl(volume, style, onVolumeChange, onVolumeChangeFinished, onVolumeScrolled, onToggleMute, shapes = shapes, onSelectDevice = onSelectDevice)
+            } else {
+                InlineVolumeControl(
+                    volume = volume,
+                    style = style,
+                    trackWidth = roomForTrack.coerceAtMost(MAX_TRACK_WIDTH),
+                    onVolumeChange = onVolumeChange,
+                    onVolumeChangeFinished = onVolumeChangeFinished,
+                    onVolumeScrolled = onVolumeScrolled,
+                    onToggleMute = onToggleMute,
+                    shapes = shapes,
+                    onSelectDevice = onSelectDevice,
+                )
+            }
         }
     }
     }
@@ -143,6 +175,7 @@ internal fun StyledVolumeTrack(
     onVolumeChange: (Float) -> Unit,
     onVolumeChangeFinished: () -> Unit,
     modifier: Modifier = Modifier,
+    thumbColor: Color = activeColor,
 ) {
     androidx.compose.runtime.CompositionLocalProvider(LocalWaveMoving provides isPlaying) {
         VolumeTrack(
@@ -153,6 +186,7 @@ internal fun StyledVolumeTrack(
             modifier = modifier,
             activeColor = activeColor,
             inactiveColor = inactiveColor,
+            thumbColor = thumbColor,
         )
     }
 }
@@ -160,6 +194,7 @@ internal fun StyledVolumeTrack(
 /** Whether the wavy volume track should be moving: only while music plays, like the seek bar. */
 private val LocalWaveMoving = androidx.compose.runtime.compositionLocalOf { false }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun InlineVolumeControl(
     volume: Float,
@@ -169,23 +204,27 @@ private fun InlineVolumeControl(
     onVolumeChangeFinished: () -> Unit,
     onVolumeScrolled: (Float) -> Unit,
     onToggleMute: () -> Unit,
+    shapes: IconButtonShapes = IconButtonDefaults.shapes(),
+    onSelectDevice: (String) -> Unit = {},
 ) {
+    val isMuted = volume <= 0.001f
+    val iconColor = speakerTint(isMuted)
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier
-                .size(36.dp)
-                .clip(CircleShape)
-                .pointerHoverIcon(PointerIcon(Cursor(Cursor.HAND_CURSOR)))
-                .volumeWheel({ volume }, onVolumeScrolled)
-                .clickable(onClick = onToggleMute),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = volumeIcon(volume),
-                contentDescription = "Mute",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(20.dp),
-            )
+        OutputDevicePicker(onSelect = onSelectDevice) { pickerModifier ->
+            IconButton(
+                onClick = onToggleMute,
+                shapes = shapes,
+                modifier = pickerModifier
+                    .pointerHoverIcon(PointerIcon(Cursor(Cursor.HAND_CURSOR)))
+                    .volumeWheel({ volume }, onVolumeScrolled),
+            ) {
+                Icon(
+                    imageVector = volumeIcon(volume),
+                    contentDescription = if (isMuted) "Unmute" else "Mute",
+                    tint = iconColor,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
         }
         Spacer(Modifier.width(6.dp))
         VolumeTrack(
@@ -201,10 +240,11 @@ private fun InlineVolumeControl(
         Text(
             text = volumePercentLabel(volume),
             style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (isMuted) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.End,
             maxLines = 1,
-            modifier = Modifier.width(40.dp),
+            softWrap = false,
+            modifier = Modifier.width(PERCENT_LABEL_WIDTH),
         )
     }
 }
@@ -228,6 +268,7 @@ private fun VolumeTrack(
     activeColor: Color = MaterialTheme.colorScheme.primary,
     // Material's own inactive-track colour: visible on the bar's container, unlike a surface tone.
     inactiveColor: Color = MaterialTheme.colorScheme.secondaryContainer,
+    thumbColor: Color = activeColor,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val isHovered by interaction.collectIsHoveredAsState()
@@ -248,17 +289,40 @@ private fun VolumeTrack(
         spring(dampingRatio = 0.45f, stiffness = 500f),
         label = "volumeThumb",
     )
-    // The wave moves while music plays and flattens to a line when it stops, in step with the seek bar.
-    val isMoving = LocalWaveMoving.current && com.alananasss.kittytune.core.LocalWindowSeen.current && spec.amplitude > 0.dp
-    val waveScale by animateFloatAsState(if (LocalWaveMoving.current) 1f else 0f, androidx.compose.animation.core.tween(400), label = "volumeWave")
+    // Morph the thumb between circle (idle) and capsule/pill (pressing/dragging) for WAVY style.
+    val thumbInteractionFraction by animateFloatAsState(
+        targetValue = if (isDragging) 1f else 0f,
+        animationSpec = tween(250, easing = FastOutSlowInEasing),
+        label = "volumeThumbInteraction",
+    )
+    // What is drawn follows the level on a spring, so wheel steps slide instead of jumping, and a fast spin
+    // just retargets the slide already under way. A drag is drawn exactly where the pointer is.
+    val shownLevel = remember { Animatable(volume) }
+    LaunchedEffect(volume, isDragging) {
+        if (isDragging) shownLevel.snapTo(volume)
+        else shownLevel.animateTo(volume, spring(stiffness = Spring.StiffnessMediumLow))
+    }
+    val isMuted = volume <= 0.001f
+    val effectiveThumbColor = mutedThumbColor(isMuted, thumbColor, inactiveColor)
+    // The wave moves while music plays and compresses to a flat line when pressed, in step with the seek bar.
+    val isMoving = LocalWaveMoving.current && com.alananasss.kittytune.core.LocalWindowSeen.current && spec.amplitude > 0.dp && !isMuted
+    val animatedAmplitude by animateFloatAsState(
+        targetValue = if (LocalWaveMoving.current && !isDragging && !isMuted) 1f else 0f,
+        animationSpec = ProgressIndicatorDefaults.ProgressAnimationSpec,
+        label = "volumeWaveAmplitude",
+    )
     val phase = remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
     val density = androidx.compose.ui.platform.LocalDensity.current
     val waveLengthPx = with(density) { spec.wavelength.toPx() }
     val waveSpeedPx = with(density) { (spec.wavelength / 2f).toPx() }
-    androidx.compose.runtime.LaunchedEffect(isMoving, waveLengthPx) {
+    // On the shared ambient pulse rather than its own 30 fps `delay`: paced apart, it put thirty extra redraws a second
+    // between everybody else's for as long as music played (see AmbientClock).
+    val ambientClock = com.alananasss.kittytune.ui.common.LocalAmbientClock.current
+    androidx.compose.runtime.LaunchedEffect(isMoving, waveLengthPx, ambientClock) {
         while (isMoving) {
-            phase.floatValue = com.alananasss.kittytune.ui.player.slider.wavePhasePx(waveSpeedPx, waveLengthPx)
-            kotlinx.coroutines.delay(33)
+            com.alananasss.kittytune.ui.common.withAmbientFrameNanos(ambientClock) {
+                phase.floatValue = com.alananasss.kittytune.ui.player.slider.wavePhasePx(waveSpeedPx, waveLengthPx)
+            }
         }
     }
 
@@ -315,11 +379,12 @@ private fun VolumeTrack(
                 }
             },
     ) {
+        val level = shownLevel.value
         val inset = TRACK_INSET.toPx()
         val length = ((if (vertical) size.height else size.width) - 2 * inset).coerceAtLeast(0f)
         val cross = (if (vertical) size.width else size.height) / 2f
         val stroke = thickness.toPx()
-        val filled = length * volume.coerceIn(0f, 1f)
+        val filled = length * level.coerceIn(0f, 1f)
 
         val barWidth = 4.dp.toPx()
         val gapMargin = 3.dp.toPx()
@@ -345,7 +410,7 @@ private fun VolumeTrack(
                 val thumbY = bottomY - filled
 
                 // Active track (from bottom up towards thumb)
-                if (volume > 0.001f) {
+                if (level > 0.001f) {
                     val activeTop = (thumbY + actualThumbHalf + actualGap).coerceAtMost(bottomY)
                     val activeHeight = (bottomY - activeTop).coerceAtLeast(0f)
                     if (activeHeight > 0f) {
@@ -360,7 +425,7 @@ private fun VolumeTrack(
                 }
 
                 // Inactive track (from thumb up towards top)
-                if (volume < 0.999f) {
+                if (level < 0.999f) {
                     val inactiveBottom = (thumbY - actualInactiveThumbHalf - actualInactiveGap).coerceAtLeast(topY)
                     val inactiveHeight = (inactiveBottom - topY).coerceAtLeast(0f)
                     if (inactiveHeight > 0f) {
@@ -379,7 +444,7 @@ private fun VolumeTrack(
                 val thumbX = startX + filled
 
                 // Active track (from left up towards thumb)
-                if (volume > 0.001f) {
+                if (level > 0.001f) {
                     val activeRight = (thumbX - actualThumbHalf - actualGap).coerceAtLeast(startX)
                     val activeWidth = (activeRight - startX).coerceAtLeast(0f)
                     if (activeWidth > 0f) {
@@ -394,7 +459,7 @@ private fun VolumeTrack(
                 }
 
                 // Inactive track (from thumb up towards right)
-                if (volume < 0.999f) {
+                if (level < 0.999f) {
                     val inactiveLeft = (thumbX + actualInactiveThumbHalf + actualInactiveGap).coerceAtMost(endX)
                     val inactiveWidth = (endX - inactiveLeft).coerceAtLeast(0f)
                     if (inactiveWidth > 0f) {
@@ -408,20 +473,82 @@ private fun VolumeTrack(
                     }
                 }
             }
-        } else {
-            // Wavy / squiggly tracks
+        } else if (style == PlayerSliderStyle.WAVY) {
+            // Wavy track with permanent circle thumb, morphing to pill on press, and wave compression
             fun at(along: Float, across: Float = 0f): Offset =
                 if (vertical) Offset(cross + across, size.height - inset - along)
                 else Offset(inset + along, cross + across)
 
-            val activeEnd = if (volume <= 0.001f) 0f else filled
-            val inactiveStart = if (volume >= 0.999f) length else filled
+            val thumbRadiusPx = with(density) { spec.thumbRadius.toPx() }
+            val thumbLineHeightPx = with(density) { spec.thumbLength.toPx() }
+
+            val currentHalfAlongTrack = lerp(thumbRadiusPx, stroke * 0.6f, thumbInteractionFraction)
+            val dynamicGap = with(density) {
+                val idleGap = 5.dp.toPx()
+                val draggingGap = currentHalfAlongTrack + 1.2.dp.toPx()
+                idleGap + (draggingGap - idleGap) * thumbInteractionFraction
+            } * (1.0f + 0.1573f * animatedAmplitude * animatedAmplitude)
+
+            val activeEnd = (filled - dynamicGap).coerceAtLeast(0f)
+            val inactiveStart = (filled + dynamicGap).coerceAtMost(length)
+
+            // Inactive track line with stop dot
+            if (inactiveStart < length) {
+                drawLine(inactiveColor, at(inactiveStart), at(length), stroke, StrokeCap.Round)
+                drawCircle(activeColor, with(density) { 1.5.dp.toPx() }, at(length))
+            }
+
+            // Active wavy track (compresses to straight line when pressed)
+            if (activeEnd > 0f) {
+                val amplitude = spec.amplitude.toPx() * animatedAmplitude
+                val k = (2.0 * Math.PI / spec.wavelength.toPx()).toFloat()
+                val shift = phase.floatValue
+                val wave = Path()
+                var t = 0f
+                val start = at(0f)
+                wave.moveTo(start.x, start.y)
+                while (t < activeEnd) {
+                    t = (t + 2f).coerceAtMost(activeEnd)
+                    val p = at(t, amplitude * kotlin.math.sin(k * (t - shift)))
+                    wave.lineTo(p.x, p.y)
+                }
+                drawPath(wave, activeColor, style = Stroke(width = stroke, cap = StrokeCap.Round))
+            }
+
+            // Circle thumb at the end of the wave, morphing into a capsule pill when pressed
+            val currentAlong = lerp(thumbRadiusPx * 2f, stroke * 1.2f, thumbInteractionFraction)
+            val currentAcross = lerp(thumbRadiusPx * 2f, thumbLineHeightPx, thumbInteractionFraction)
+            val thumbCenter = at(filled)
+
+            if (vertical) {
+                drawRoundRect(
+                    color = effectiveThumbColor,
+                    topLeft = Offset(thumbCenter.x - currentAcross / 2f, thumbCenter.y - currentAlong / 2f),
+                    size = Size(currentAcross, currentAlong),
+                    cornerRadius = CornerRadius(currentAlong / 2f),
+                )
+            } else {
+                drawRoundRect(
+                    color = effectiveThumbColor,
+                    topLeft = Offset(thumbCenter.x - currentAlong / 2f, thumbCenter.y - currentAcross / 2f),
+                    size = Size(currentAlong, currentAcross),
+                    cornerRadius = CornerRadius(currentAlong / 2f),
+                )
+            }
+        } else {
+            // Squiggly tracks
+            fun at(along: Float, across: Float = 0f): Offset =
+                if (vertical) Offset(cross + across, size.height - inset - along)
+                else Offset(inset + along, cross + across)
+
+            val activeEnd = if (level <= 0.001f) 0f else filled
+            val inactiveStart = if (level >= 0.999f) length else filled
 
             if (inactiveStart < length) {
                 drawLine(inactiveColor, at(inactiveStart), at(length), stroke, StrokeCap.Round)
             }
             if (activeEnd > 0f) {
-                val amplitude = spec.amplitude.toPx() * waveScale
+                val amplitude = spec.amplitude.toPx() * animatedAmplitude
                 val k = (2.0 * Math.PI / spec.wavelength.toPx()).toFloat()
                 val shift = phase.floatValue
                 val wave = Path()
@@ -437,47 +564,70 @@ private fun VolumeTrack(
             }
         }
 
-        // Thumb: a bar for the bar style, a dot for the others
-        if (spec.gapAroundThumb) {
-            val barLength = spec.thumbLength.toPx() * (1f + 0.2f * thumbGrow)
-            val thumbPos = if (vertical) {
-                Offset(cross, size.height - inset - filled)
-            } else {
-                Offset(inset + filled, cross)
+        // Thumb: a bar for the bar style, a dot for slim/squiggly (WAVY draws its own thumb above)
+        if (style != PlayerSliderStyle.WAVY) {
+            if (spec.gapAroundThumb) {
+                val barLength = spec.thumbLength.toPx() * (1f + 0.2f * thumbGrow)
+                val thumbPos = if (vertical) {
+                    Offset(cross, size.height - inset - filled)
+                } else {
+                    Offset(inset + filled, cross)
+                }
+                val topLeft = if (vertical) {
+                    Offset(thumbPos.x - barLength / 2f, thumbPos.y - barWidth / 2f)
+                } else {
+                    Offset(thumbPos.x - barWidth / 2f, thumbPos.y - barLength / 2f)
+                }
+                val barSize = if (vertical) Size(barLength, barWidth) else Size(barWidth, barLength)
+                drawRoundRect(effectiveThumbColor, topLeft, barSize, CornerRadius(barWidth / 2f))
+            } else if (thumbGrow > 0f) {
+                val dotPos = if (vertical) {
+                    Offset(cross, size.height - inset - filled)
+                } else {
+                    Offset(inset + filled, cross)
+                }
+                drawCircle(effectiveThumbColor, 7.dp.toPx() * thumbGrow.coerceAtLeast(0f), dotPos)
             }
-            val topLeft = if (vertical) {
-                Offset(thumbPos.x - barLength / 2f, thumbPos.y - barWidth / 2f)
-            } else {
-                Offset(thumbPos.x - barWidth / 2f, thumbPos.y - barLength / 2f)
-            }
-            val barSize = if (vertical) Size(barLength, barWidth) else Size(barWidth, barLength)
-            drawRoundRect(activeColor, topLeft, barSize, CornerRadius(barWidth / 2f))
-        } else if (thumbGrow > 0f) {
-            val dotPos = if (vertical) {
-                Offset(cross, size.height - inset - filled)
-            } else {
-                Offset(inset + filled, cross)
-            }
-            drawCircle(activeColor, 7.dp.toPx() * thumbGrow.coerceAtLeast(0f), dotPos)
         }
     }
 }
 
+private fun lerp(start: Float, stop: Float, fraction: Float): Float = start + (stop - start) * fraction
+
+/**
+ * The thumb greys out at zero, but stays solid: a see-through inactive colour (the full player's) let the
+ * track show through the dot, which read as a hole in it.
+ */
+private fun mutedThumbColor(isMuted: Boolean, thumbColor: Color, inactiveColor: Color): Color = when {
+    !isMuted -> thumbColor
+    inactiveColor.alpha >= 0.99f -> inactiveColor
+    else -> androidx.compose.ui.graphics.lerp(thumbColor, Color.Black, 0.45f)
+}
+
 /** How each seek-bar style translates to the volume track. */
-private data class VolumeTrackSpec(
+internal data class VolumeTrackSpec(
     val thickness: Dp,
     val activeThickness: Dp,
     val amplitude: Dp,
     val wavelength: Dp,
     val gapAroundThumb: Boolean,
     val thumbLength: Dp,
+    val thumbRadius: Dp = 0.dp,
 ) {
     companion object {
         fun of(style: PlayerSliderStyle) = when (style) {
-            PlayerSliderStyle.BAR -> VolumeTrackSpec(8.dp, 10.dp, 0.dp, 1.dp, gapAroundThumb = true, thumbLength = 20.dp)
-            PlayerSliderStyle.SLIM -> VolumeTrackSpec(4.dp, 6.dp, 0.dp, 1.dp, gapAroundThumb = false, thumbLength = 0.dp)
-            PlayerSliderStyle.WAVY -> VolumeTrackSpec(4.dp, 5.dp, 2.5.dp, androidx.compose.material3.WavyProgressIndicatorDefaults.LinearDeterminateWavelength, gapAroundThumb = false, thumbLength = 0.dp)
-            PlayerSliderStyle.SQUIGGLY -> VolumeTrackSpec(3.dp, 4.dp, 3.dp, 12.dp, gapAroundThumb = false, thumbLength = 0.dp)
+            PlayerSliderStyle.BAR -> VolumeTrackSpec(8.dp, 10.dp, 0.dp, 1.dp, gapAroundThumb = true, thumbLength = 20.dp, thumbRadius = 0.dp)
+            PlayerSliderStyle.SLIM -> VolumeTrackSpec(4.dp, 6.dp, 0.dp, 1.dp, gapAroundThumb = false, thumbLength = 0.dp, thumbRadius = 0.dp)
+            PlayerSliderStyle.WAVY -> VolumeTrackSpec(
+                thickness = 4.dp,
+                activeThickness = 5.dp,
+                amplitude = 2.5.dp,
+                wavelength = androidx.compose.material3.WavyProgressIndicatorDefaults.LinearDeterminateWavelength,
+                gapAroundThumb = false,
+                thumbLength = 20.dp,
+                thumbRadius = 7.dp,
+            )
+            PlayerSliderStyle.SQUIGGLY -> VolumeTrackSpec(3.dp, 4.dp, 3.dp, 12.dp, gapAroundThumb = false, thumbLength = 0.dp, thumbRadius = 0.dp)
         }
     }
 }
@@ -492,8 +642,11 @@ private fun rememberVolumeStyle(): PlayerSliderStyle {
     }
 }
 
-internal fun volumeIcon(volume: Float): ImageVector =
-    if (volume <= 0.001f) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp
+internal fun volumeIcon(volume: Float): ImageVector = when {
+    volume <= 0.001f -> Icons.AutoMirrored.Filled.VolumeOff
+    volume < 0.5f -> Icons.AutoMirrored.Filled.VolumeDown
+    else -> Icons.AutoMirrored.Filled.VolumeUp
+}
 
 internal fun volumePercentLabel(volume: Float): String {
     if (volume <= 0.001f) return "0%"
@@ -511,7 +664,7 @@ internal fun volumePercentLabel(volume: Float): String {
  * moved one step either side of that stale value.
  */
 @Composable
-private fun Modifier.volumeWheel(
+internal fun Modifier.volumeWheel(
     currentVolume: () -> Float,
     onVolumeChange: (Float) -> Unit,
 ): Modifier {
@@ -552,6 +705,8 @@ private fun VolumeHoverControl(
     onVolumeChangeFinished: () -> Unit,
     onVolumeScrolled: (Float) -> Unit,
     onToggleMute: () -> Unit,
+    shapes: IconButtonShapes = IconButtonDefaults.shapes(),
+    onSelectDevice: (String) -> Unit = {},
 ) {
     var overButton by remember { mutableStateOf(false) }
     var overPanel by remember { mutableStateOf(false) }
@@ -566,37 +721,32 @@ private fun VolumeHoverControl(
         }
     }
 
+    val isMuted = volume <= 0.001f
     val levelIcon = volumeIcon(volume)
+    val iconColor = speakerTint(isMuted)
 
     Box {
-        val buttonShape by animateDpAsState(
-            targetValue = if (expanded) 14.dp else 20.dp,
-            animationSpec = spring(dampingRatio = 0.55f, stiffness = 500f),
-            label = "volumeButtonShape",
-        )
-        Box(
-            modifier = Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(buttonShape))
-                .background(
-                    if (expanded) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
-                    else Color.Transparent
+        OutputDevicePicker(onSelect = onSelectDevice) { pickerModifier ->
+            IconButton(
+                onClick = onToggleMute,
+                shapes = shapes,
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = if (expanded) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f) else Color.Transparent,
+                    contentColor = iconColor,
+                ),
+                modifier = pickerModifier
+                    .onPointerEvent(PointerEventType.Enter) { overButton = true }
+                    .onPointerEvent(PointerEventType.Exit) { overButton = false }
+                    .pointerHoverIcon(PointerIcon(Cursor(Cursor.HAND_CURSOR)))
+                    .volumeWheel({ volume }, onVolumeScrolled),
+            ) {
+                Icon(
+                    levelIcon,
+                    contentDescription = if (isMuted) "Unmute" else "Volume",
+                    tint = iconColor,
+                    modifier = Modifier.size(20.dp),
                 )
-                .onPointerEvent(PointerEventType.Enter) { overButton = true }
-                .onPointerEvent(PointerEventType.Exit) { overButton = false }
-                .pointerHoverIcon(PointerIcon(Cursor(Cursor.HAND_CURSOR)))
-                .volumeWheel({ volume }, onVolumeScrolled)
-                .clickable(indication = ripple(), interactionSource = remember { MutableInteractionSource() }) {
-                    onToggleMute()
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                levelIcon,
-                contentDescription = "Volume",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(20.dp),
-            )
+            }
         }
 
         if (expanded) {
@@ -621,7 +771,7 @@ private fun VolumeHoverControl(
                         Text(
                             text = volumePercentLabel(volume),
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (isMuted) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.height(10.dp))
                         VolumeTrack(
@@ -633,21 +783,35 @@ private fun VolumeHoverControl(
                             modifier = Modifier.height(150.dp),
                         )
                         Spacer(Modifier.height(8.dp))
-                        Icon(
-                            levelIcon,
-                            contentDescription = "Mute",
-                            tint = MaterialTheme.colorScheme.primary,
+                        IconButton(
+                            onClick = onToggleMute,
+                            shapes = shapes,
                             modifier = Modifier
-                                .size(18.dp)
-                                .pointerHoverIcon(PointerIcon(Cursor(Cursor.HAND_CURSOR)))
-                                .clickable { onToggleMute() },
-                        )
+                                .size(32.dp)
+                                .pointerHoverIcon(PointerIcon(Cursor(Cursor.HAND_CURSOR))),
+                        ) {
+                            Icon(
+                                levelIcon,
+                                contentDescription = if (isMuted) "Unmute" else "Mute",
+                                tint = iconColor,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
                     }
                 }
             }
         }
     }
 }
+
+/**
+ * The speaker is a toggle, so it is drawn like the bar's other toggles: lit in the accent while sound is on,
+ * greyed out once muted. Both states used to be shades of grey, close enough that muting barely showed on
+ * the button that did it (issue #66).
+ */
+@Composable
+private fun speakerTint(isMuted: Boolean): Color =
+    if (isMuted) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary
 
 /** Places a popup directly above its anchor, horizontally centred and clamped to the window. */
 private object AboveAnchorCentered : PopupPositionProvider {

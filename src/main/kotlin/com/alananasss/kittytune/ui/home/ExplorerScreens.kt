@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import com.alananasss.kittytune.ui.common.ScrollableLazyColumn as LazyColumn
 import com.alananasss.kittytune.ui.common.horizontalMouseSwipe
+import com.alananasss.kittytune.ui.utils.fadedHorizontalEdges
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -69,6 +70,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +100,7 @@ import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.ui.common.ArtistLinkText
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.getValue
+import com.alananasss.kittytune.data.BlockManager
 import com.alananasss.kittytune.data.GenreData
 import com.alananasss.kittytune.data.sections.SduiItem
 import com.alananasss.kittytune.data.sections.SduiSection
@@ -111,6 +114,7 @@ import com.alananasss.kittytune.domain.Track
 import com.alananasss.kittytune.domain.User
 import com.alananasss.kittytune.ui.common.SquareCardShimmer
 import com.alananasss.kittytune.ui.common.TrackListItemShimmer
+import com.alananasss.kittytune.ui.common.rememberFilteredTracks
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.google.gson.Gson
 import kotlinx.coroutines.async
@@ -402,6 +406,10 @@ fun GenreDetailScreen(
         viewModel.loadData(genreName, genreQuery)
     }
 
+    // Hide blocked tracks/artists (issue #41); playback uses the same visible
+    // list so the paged index stays aligned. Playlists and albums are never filtered.
+    val popularTracks = rememberFilteredTracks(viewModel.popularTracks)
+
     if (showCountrySelector) {
         BackHandler(onBack = { showCountrySelector = false })
         Dialog(onDismissRequest = { showCountrySelector = false }) {
@@ -454,14 +462,16 @@ fun GenreDetailScreen(
                 contentPadding = PaddingValues(bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp)
             ) {
-                if (viewModel.popularTracks.isNotEmpty()) {
+                if (popularTracks.isNotEmpty()) {
                     item { SectionTitle(str("profile_tab_popular")) }
                     item {
-                        val pages = viewModel.popularTracks.chunked(5)
+                        val pages = popularTracks.chunked(5)
                         val popularRowState = rememberLazyListState()
                         LazyRow(
                             state = popularRowState,
-                            modifier = Modifier.horizontalMouseSwipe(popularRowState),
+                            modifier = Modifier
+                                .horizontalMouseSwipe(popularRowState)
+                                .fadedHorizontalEdges(popularRowState),
                             contentPadding = PaddingValues(horizontal = 16.dp),
                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
@@ -474,8 +484,8 @@ fun GenreDetailScreen(
                                         val absoluteIndex = pageIndex * 5 + itemIndexInColumn
                                         PopularTrackListItem(
                                             track = track,
-                                            currentlyPlayingTrack = playerViewModel.currentTrack,
-                                            onClick = { playerViewModel.playPlaylist(viewModel.popularTracks, absoluteIndex) },
+                                            currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
+                                            onClick = { playerViewModel.playPlaylist(popularTracks, absoluteIndex) },
                                             onOptionClick = { playerViewModel.showTrackOptions(track) },
                                             onArtistClick = { playerViewModel.navigateToTrackArtist(it) }
                                         )
@@ -500,8 +510,6 @@ fun GenreDetailScreen(
                                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(OfficialPlaylistsData.sources[viewModel.selectedSourceIndex].flagEmoji)
-                                    Spacer(Modifier.width(8.dp))
                                     Text(OfficialPlaylistsData.sources[viewModel.selectedSourceIndex].countryName, style = MaterialTheme.typography.labelLarge)
                                     Icon(Icons.Rounded.KeyboardArrowDown, null)
                                 }
@@ -512,7 +520,9 @@ fun GenreDetailScreen(
                         val officialRowState = rememberLazyListState()
                         LazyRow(
                             state = officialRowState,
-                            modifier = Modifier.horizontalMouseSwipe(officialRowState),
+                            modifier = Modifier
+                                .horizontalMouseSwipe(officialRowState)
+                                .fadedHorizontalEdges(officialRowState),
                             contentPadding = PaddingValues(horizontal = 16.dp),
                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
@@ -537,7 +547,9 @@ fun GenreDetailScreen(
                         val communityRowState = rememberLazyListState()
                         LazyRow(
                             state = communityRowState,
-                            modifier = Modifier.horizontalMouseSwipe(communityRowState),
+                            modifier = Modifier
+                                .horizontalMouseSwipe(communityRowState)
+                                .fadedHorizontalEdges(communityRowState),
                             contentPadding = PaddingValues(horizontal = 16.dp),
                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
@@ -554,7 +566,9 @@ fun GenreDetailScreen(
                         val albumsRowState = rememberLazyListState()
                         LazyRow(
                             state = albumsRowState,
-                            modifier = Modifier.horizontalMouseSwipe(albumsRowState),
+                            modifier = Modifier
+                                .horizontalMouseSwipe(albumsRowState)
+                                .fadedHorizontalEdges(albumsRowState),
                             contentPadding = PaddingValues(horizontal = 16.dp),
                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
@@ -582,7 +596,7 @@ fun SectionTitle(title: String, showMore: Boolean = false, onMoreClick: (() -> U
             fontWeight = FontWeight.Bold
         )
         if (showMore && onMoreClick != null) {
-            TextButton(onClick = onMoreClick) { Text(str("btn_see_all")) }
+            TextButton(shapes = ButtonDefaults.shapes(), onClick = onMoreClick) { Text(str("btn_see_all")) }
         }
     }
 }
@@ -690,9 +704,6 @@ private fun PopularTrackListItem(
                     com.alananasss.kittytune.ui.common.TrackRowSocialMarkers(track)
                 }
             }
-            IconButton(onClick = onOptionClick) {
-                Icon(Icons.Default.MoreVert, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
         }
     }
 }
@@ -732,8 +743,6 @@ private fun CountrySelectionCard(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(text = flagEmoji, style = MaterialTheme.typography.headlineSmall)
-                Spacer(Modifier.width(16.dp))
                 Text(
                     text = countryName,
                     style = MaterialTheme.typography.bodyLarge,
@@ -915,11 +924,10 @@ private fun CinematicPlaylistCard(playlist: Playlist, onClick: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (playlist.user?.avatarUrl != null) {
-                        AsyncImage(
-                            model = playlist.user?.avatarUrl,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp).clip(CircleShape)
+                    if (playlist.user != null) {
+                        com.alananasss.kittytune.ui.common.UserAvatar(
+                            url = playlist.user?.avatarUrl,
+                            modifier = Modifier.size(16.dp),
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                     }
@@ -1026,6 +1034,13 @@ private fun SduiScreen(
     header: (@Composable () -> Unit)? = null,
 ) {
 
+    // Hide blocked track/artist tiles (issue #41); playlists and categories stay.
+    val blockedTrackIds by BlockManager.blockedTrackIdsFlow.collectAsState()
+    val blockedArtistIds by BlockManager.blockedArtistIdsFlow.collectAsState()
+    val visibleScreen = remember(screen, blockedTrackIds, blockedArtistIds) {
+        screen.withBlockedTilesHidden()
+    }
+
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 200.dp),
         modifier = Modifier.fillMaxSize(),
@@ -1045,7 +1060,7 @@ private fun SduiScreen(
 
         // Flattened here rather than in the parser: a group's title is worth showing, and its shelves are worth
         // showing under it, but a desktop grid has no third level to nest them into.
-        screen.sections.forEach { section ->
+        visibleScreen.sections.forEach { section ->
             when (section) {
                 is SduiSection.Group -> {
                     section.title?.let { groupTitle ->
@@ -1103,6 +1118,24 @@ private fun androidx.compose.foundation.lazy.grid.LazyGridScope.sduiShelf(
 
 /** `soundcloud:users:12345` → `12345`, which is what every route in this app takes. */
 private fun String.numericId(): Long? = substringAfterLast(':').toLongOrNull()
+
+/** A server-driven tile pointing at blocked content, hidden like any blocked track/artist (issue #41). */
+private fun SduiItem.isBlockedTile(): Boolean = when (kind) {
+    SduiItem.Kind.TRACK -> urn?.numericId()?.let { BlockManager.isTrackBlocked(it) } == true
+    SduiItem.Kind.USER -> urn?.numericId()?.let { BlockManager.isArtistBlocked(it) } == true
+    SduiItem.Kind.PLAYLIST, SduiItem.Kind.CATEGORY -> false
+}
+
+/** A shelf or group with blocked tiles removed; null when nothing visible remains. */
+private fun SduiSection.withBlockedTilesHidden(): SduiSection? = when (this) {
+    is SduiSection.Group -> sections.mapNotNull { it.withBlockedTilesHidden() }
+        .takeIf { it.isNotEmpty() }?.let { copy(sections = it) }
+    is SduiSection.Shelf -> items.filter { !it.isBlockedTile() }
+        .takeIf { it.isNotEmpty() }?.let { copy(items = it) }
+}
+
+private fun SectionsParser.Screen.withBlockedTilesHidden(): SectionsParser.Screen =
+    copy(sections = sections.mapNotNull { it.withBlockedTilesHidden() })
 
 /**
  * One tile from their layout.

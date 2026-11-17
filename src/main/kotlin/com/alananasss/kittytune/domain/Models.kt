@@ -1,5 +1,6 @@
     package com.alananasss.kittytune.domain
     
+    import androidx.compose.runtime.Immutable
     import com.alananasss.kittytune.data.network.LongIdAdapter
     import com.google.gson.annotations.JsonAdapter
     import com.google.gson.annotations.SerializedName
@@ -326,6 +327,40 @@
         @SerializedName("user") val user: User?
     )
 
+    // Featured playlists ("Appears in", most popular first) — what the official app shows.
+    // GraphQL: query FeaturedPlaylists($input: FeaturedPlaylistsInput!)
+    //   { featuredPlaylists(input: $input) { urn } }
+    // with variables {"input": {"trackUrn": "soundcloud:tracks:<id>", "filter": "PLAYLIST", "limit": N}}.
+    // The server returns playlist URNs already ordered by popularity, so no client-side
+    // fetching of dozens of /playlists pages + sorting by likes is needed.
+    data class FeaturedPlaylistsGraphQlRequest(
+        @SerializedName("operationName") val operationName: String = "FeaturedPlaylists",
+        @SerializedName("query") val query: String = "query FeaturedPlaylists(\$input: FeaturedPlaylistsInput!) { featuredPlaylists(input: \$input) { urn } }",
+        @SerializedName("variables") val variables: FeaturedPlaylistsVariables
+    )
+
+    data class FeaturedPlaylistsVariables(
+        @SerializedName("input") val input: FeaturedPlaylistsInput
+    )
+
+    data class FeaturedPlaylistsInput(
+        @SerializedName("trackUrn") val trackUrn: String,
+        @SerializedName("filter") val filter: String = "PLAYLIST",
+        @SerializedName("limit") val limit: Int = 100
+    )
+
+    data class FeaturedPlaylistsGraphQlResponse(
+        @SerializedName("data") val data: FeaturedPlaylistsData?
+    )
+
+    data class FeaturedPlaylistsData(
+        @SerializedName("featuredPlaylists") val featuredPlaylists: List<FeaturedPlaylistUrn>?
+    )
+
+    data class FeaturedPlaylistUrn(
+        @SerializedName("urn") val urn: String?
+    )
+
     data class GraphQlUserProfileResponse(
         @SerializedName("data") val data: GraphQlUserProfileData?
     )
@@ -355,6 +390,7 @@
     typealias PublisherMetadata = TrackPublisherMetadata
 
     // track
+    @Immutable
     data class Track(
         val id: Long,
         val title: String?,
@@ -379,6 +415,7 @@
         @SerializedName("policy") val policy: String? = null,
         @SerializedName("monetization_model") val monetizationModel: String? = null,
         @SerializedName("sharing") val sharing: String? = null,
+        @SerializedName("full_duration") val fullDurationMs: Long? = null,
     
         // fixed: source is now nullable to prevent gson crashes
         val source: String? = "soundcloud",
@@ -441,10 +478,29 @@
         }
 
         val displayArtist: String
-            get() = artists?.takeIf { it.isNotEmpty() }?.joinToString(", ") { it.name }?.takeIf { it.isNotBlank() }
+            get() = artists?.takeIf { it.isNotEmpty() }
+                ?.distinctBy { it.id.ifBlank { it.name } }
+                ?.joinToString(", ") { it.name }?.takeIf { it.isNotBlank() }
                 ?: publisherMetadata?.artist?.takeIf { it.isNotBlank() }
+                ?: soloArtistFromTitle(title, user?.username)
                 ?: user?.username?.takeIf { it.isNotBlank() }
                 ?: ""
+
+        val isSnipped: Boolean
+            get() = policy.equals("SNIP", ignoreCase = true) ||
+                monetizationModel.equals("SUB_HIGH_TIER", ignoreCase = true) ||
+                media?.transcodings?.any { it.snipped == true } == true ||
+                (fullDurationMs != null && durationMs != null && durationMs <= 45_000L && (fullDurationMs - durationMs) > 15_000L)
+
+        val isGoPlus: Boolean
+            get() = (source == null || source == "soundcloud") &&
+                (monetizationModel.equals("SUB_HIGH_TIER", ignoreCase = true) ||
+                 policy.equals("SNIP", ignoreCase = true) ||
+                 isSnipped ||
+                 media?.transcodings?.any { it.snipped == true } == true)
+
+        val effectiveFullDurationMs: Long?
+            get() = fullDurationMs?.takeIf { it > 0L } ?: durationMs
 
         val fullResArtwork: String
             get() {
@@ -519,7 +575,8 @@
     data class StationLibraryItem(
         @SerializedName("created_at") val createdAt: String?,
         val type: String?,
-        @SerializedName("system_playlist") val systemPlaylist: SystemPlaylist?
+        @SerializedName("system_playlist") val systemPlaylist: SystemPlaylist?,
+        @SerializedName("playlist") val playlist: Playlist? = null
     )
     data class SystemPlaylist(
         val urn: String?,
@@ -624,6 +681,7 @@
     )
     
     // playlist
+    @Immutable
     data class Playlist(
         @JsonAdapter(LongIdAdapter::class) val id: Long,
         val title: String?,
@@ -714,6 +772,7 @@
     }
     
     // user
+    @Immutable
     data class User(
         val id: Long,
         val username: String?,
@@ -786,7 +845,13 @@
     data class Visuals(val visuals: List<VisualItem>?)
     data class VisualItem(@SerializedName("visual_url") val visualUrl: String)
     data class Media(val transcodings: List<Transcoding>?)
-    data class Transcoding(val url: String, val preset: String, val format: Format?)
+    data class Transcoding(
+        val url: String,
+        val preset: String,
+        val format: Format?,
+        val snipped: Boolean? = null,
+        val duration: Long? = null
+    )
     data class Format(val protocol: String?, @SerializedName("mime_type") val mimeType: String?)
     data class StreamUrlResponse(
         val url: String?,
@@ -836,3 +901,19 @@ internal fun usablePlaylistCover(url: String?): Boolean =
         !url.contains("picsum") &&
         !url.contains("avatars") &&
         !url.contains("default_avatar")
+
+private val ACCOUNT_NAME_SEPARATOR = Regex("""\s*(?:&|,|\+|\s+x\s+|\s+and\s+)\s*""", RegexOption.IGNORE_CASE)
+private val ARTIST_TITLE_SPLIT = Regex("""\s+[-–—]\s+""")
+
+/**
+ * The one artist of "9mice - So Good" posted from an account named "Kai Angel & 9mice": artists who share an
+ * account post everything under both names, and the title says who sings. Null unless the account names several
+ * artists and the title's artist part is one of them (issue #66).
+ */
+internal fun soloArtistFromTitle(title: String?, account: String?): String? {
+    if (title.isNullOrBlank() || account.isNullOrBlank()) return null
+    val names = account.split(ACCOUNT_NAME_SEPARATOR).map { it.trim() }.filter { it.isNotEmpty() }
+    if (names.size < 2) return null
+    val left = title.split(ARTIST_TITLE_SPLIT, limit = 2).takeIf { it.size == 2 }?.first()?.trim() ?: return null
+    return names.firstOrNull { it.equals(left, ignoreCase = true) }
+}

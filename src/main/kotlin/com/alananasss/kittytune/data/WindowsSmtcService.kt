@@ -8,10 +8,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.io.Closeable
 import java.io.File
-import java.io.PrintWriter
-import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
-import kotlin.concurrent.thread
 
 /**
  * KittyTune in the Windows media flyout, on the lock screen and behind the keyboard's media keys.
@@ -29,30 +26,26 @@ class WindowsSmtcService(
     private val onSeek: (Long) -> Unit,
 ) : Closeable {
 
-    private var process: Process? = null
-    private var writer: PrintWriter? = null
     private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var lastSentUpdate: String? = null
+    private val bridge = if (System.getProperty("os.name").lowercase().contains("win") &&
+        !java.lang.Boolean.getBoolean("kittytune.trainStartupCache")
+    ) {
+        SmtcBridgeWorker(::start, ::handleBridgeLine)
+    } else null
+    private var lastTimelineUpdateNanos: Long? = null
 
-    init {
-        if (System.getProperty("os.name").lowercase().contains("win")) {
-            runCatching { start() }.onFailure { e ->
-                println("Windows SMTC unavailable: ${e.message}")
-                close()
-            }
-        }
-    }
-
-    private fun start() {
-        val exe = extractBridge() ?: return
-        val p = ProcessBuilder(exe.absolutePath).redirectErrorStream(true).start()
-        process = p
-        writer = PrintWriter(p.outputStream.bufferedWriter(StandardCharsets.UTF_8), true)
-        thread(isDaemon = true, name = "WindowsSmtc-Reader") {
-            runCatching {
-                p.inputStream.bufferedReader(StandardCharsets.UTF_8).forEachLine { handleBridgeLine(it.trim()) }
-            }
-        }
+    private fun start(): Process? {
+        val exe = extractBridge() ?: return null
+        // Our own launcher path, so the bridge can give Windows's flyout a shortcut to resolve the
+        // session's app identity from (see WindowsSmtcBridge.cs). Dev runs from gradle have no
+        // launcher exe; the bridge then only patches whatever shortcut already exists.
+        val launcher = System.getProperty("jpackage.app-path")?.takeIf {
+            it.substringAfterLast('/').substringAfterLast('\\').equals("KittyTune.exe", ignoreCase = true)
+        } ?: ProcessHandle.current().info().command().orElse(null)
+            ?.takeIf { it.substringAfterLast('/').substringAfterLast('\\').equals("KittyTune.exe", ignoreCase = true) }
+        return ProcessBuilder(
+            mutableListOf(exe.absolutePath).also { if (launcher != null) it.add(launcher) },
+        ).redirectErrorStream(true).start()
     }
 
     private fun handleBridgeLine(line: String) {
@@ -81,14 +74,28 @@ class WindowsSmtcService(
         val hash = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }.take(12)
         val target = File(File(System.getProperty("java.io.tmpdir"), "kittytune_smtc"), hash).resolve("KittyTune.exe")
         if (target.isFile && target.length() == bytes.size.toLong()) return target
+        // Set executable on the temp copy too, not only on dev-mode resources, so a fresh hash-dir
+        // never starts non-executable.
         target.parentFile.mkdirs()
+        target.setExecutable(true)
         target.writeBytes(bytes)
         return target
     }
 
-    /** Pushes what is playing. Cheap to call often: identical updates are not re-sent. */
-    fun updateMedia(track: Track?, isPlaying: Boolean, positionMs: Long, durationMs: Long) {
-        val out = writer ?: return
+    /** Playback events publish immediately. Continuous playback refreshes the Windows timeline once a second. */
+    fun updateMedia(
+        track: Track?,
+        isPlaying: Boolean,
+        positionMs: Long,
+        durationMs: Long,
+        playbackRate: Float,
+        periodic: Boolean = false,
+    ) {
+        if (bridge == null) return
+        val now = System.nanoTime()
+        val lastUpdate = lastTimelineUpdateNanos
+        if (periodic && (track == null || (lastUpdate != null && now - lastUpdate < 1_000_000_000L))) return
+        lastTimelineUpdateNanos = now
         val fields = listOf(
             "UPDATE",
             track?.title.orEmpty(),
@@ -98,24 +105,25 @@ class WindowsSmtcService(
             if (isPlaying) "1" else "0",
             positionMs.coerceAtLeast(0L).toString(),
             durationMs.coerceAtLeast(0L).toString(),
+            playbackRate.toString(),
         )
         val message = fields.joinToString("\t") { it.replace(CONTROL_CHARS, " ") }
-        if (message == lastSentUpdate) return
-        lastSentUpdate = message
-        out.println(message)
+        bridge.update(message)
+    }
+
+    /** Queued with media writes; the new helper receives the latest known update automatically. */
+    fun restart() {
+        bridge?.restart()
     }
 
     override fun close() {
-        runCatching { writer?.println("QUIT") }
-        runCatching { writer?.close() }
-        process?.destroy()
-        process = null
-        writer = null
+        bridge?.close()
         mainScope.cancel()
     }
 
-    private companion object {
-        const val BRIDGE_RESOURCE = "WindowsSmtcBridge.exe"
+    companion object {
+        const val APP_USER_MODEL_ID = "KittyTune.KittyTune"
+        private const val BRIDGE_RESOURCE = "WindowsSmtcBridge.exe"
         val CONTROL_CHARS = Regex("[\\t\\r\\n]")
     }
 }

@@ -1,6 +1,8 @@
 @file:OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
 package com.alananasss.kittytune.ui.main
 
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -41,6 +43,12 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.PersonOff
 import androidx.compose.material.icons.automirrored.rounded.Comment
 import androidx.compose.material.icons.rounded.ContentCut
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
@@ -52,13 +60,15 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.outlined.Cancel
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.FavoriteBorder
-import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.MicOff
 import androidx.compose.material.icons.rounded.Radio
@@ -120,6 +130,7 @@ import com.alananasss.kittytune.domain.Comment
 import com.alananasss.kittytune.ui.player.CommentSort
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.data.local.PlayerPreferences
+import com.alananasss.kittytune.data.local.RadioEligibility
 import com.alananasss.kittytune.ui.player.RepeatMode
 import sh.calvin.reorderable.ReorderableCollectionItemScope
 import sh.calvin.reorderable.ReorderableItem
@@ -158,14 +169,8 @@ private val SpotifyAccentGreen = androidx.compose.ui.graphics.Color(0xFF1DB954)
 fun TrackOptionsOverlays(viewModel: PlayerViewModel) {
     if (viewModel.showMenuSheet) {
         BackHandler(onBack = { viewModel.showMenuSheet = false })
-        Dialog(onDismissRequest = { viewModel.showMenuSheet = false }) {
-            Surface(
-                shape = RoundedCornerShape(28.dp),
-                color = MaterialTheme.colorScheme.surfaceContainer,
-                modifier = Modifier.width(420.dp),
-            ) {
-                MenuSheetContent(viewModel)
-            }
+        TrackMenuAtPointer(onDismiss = { viewModel.showMenuSheet = false }) {
+            MenuSheetContent(viewModel)
         }
     }
     if (viewModel.showCommentsSheet) {
@@ -212,6 +217,51 @@ fun TrackOptionsOverlays(viewModel: PlayerViewModel) {
 }
 
 /**
+ * The track's menu where it was asked for: at the pointer, as a context menu, instead of a dialog in the middle of
+ * the window, a long way from the row that was right-clicked (issue #66). It grows out of the pointer and shrinks
+ * back into it, and closes on a click outside or Escape.
+ */
+@Composable
+private fun TrackMenuAtPointer(onDismiss: () -> Unit, content: @Composable () -> Unit) {
+    val anchor = remember {
+        val press = com.alananasss.kittytune.ui.common.PointerAnchor.lastPress.value
+        androidx.compose.ui.unit.IntOffset(press.x.toInt(), press.y.toInt())
+    }
+    val shown = remember { androidx.compose.animation.core.MutableTransitionState(false).apply { targetState = true } }
+    var closing by remember { mutableStateOf(false) }
+    val close = { if (!closing) { closing = true; shown.targetState = false } }
+    LaunchedEffect(shown.currentState, shown.isIdle) {
+        if (closing && shown.isIdle && !shown.currentState) onDismiss()
+    }
+    androidx.compose.ui.window.Popup(
+        popupPositionProvider = remember(anchor) { com.alananasss.kittytune.ui.common.AtPointPositionProvider(anchor) },
+        onDismissRequest = close,
+        properties = androidx.compose.ui.window.PopupProperties(focusable = true),
+        onKeyEvent = { event ->
+            if (event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown && event.key == androidx.compose.ui.input.key.Key.Escape) { close(); true } else false
+        },
+    ) {
+        androidx.compose.animation.AnimatedVisibility(
+            visibleState = shown,
+            enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(140)) +
+                androidx.compose.animation.scaleIn(androidx.compose.animation.core.tween(200), initialScale = 0.9f, transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)),
+            exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(110)) +
+                androidx.compose.animation.scaleOut(androidx.compose.animation.core.tween(140), targetScale = 0.94f, transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                shadowElevation = 12.dp,
+                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)),
+                modifier = Modifier.padding(6.dp).width(400.dp).heightIn(max = 600.dp),
+            ) {
+                Box(Modifier.verticalScroll(rememberScrollState())) { content() }
+            }
+        }
+    }
+}
+
+/**
  * Shown when the user opens an artist from a track credited to several
  * Spotify artists (feat / duets): pick which artist profile to open.
  */
@@ -219,7 +269,7 @@ fun TrackOptionsOverlays(viewModel: PlayerViewModel) {
 private fun SelectArtistDialog(viewModel: PlayerViewModel) {
     // The artist list is authoritative: headers open the dialog without a track.
     val track = viewModel.selectedArtistDialogTrack
-    val artistsList = viewModel.selectArtistOptions.takeIf { it.isNotEmpty() }
+    val artistsList = (viewModel.selectArtistOptions.takeIf { it.isNotEmpty() }
         ?: track?.artists?.takeIf { it.isNotEmpty() }
         ?: listOfNotNull(
             track?.user?.let { u ->
@@ -230,7 +280,7 @@ private fun SelectArtistDialog(viewModel: PlayerViewModel) {
                     verified = u.verified
                 )
             }
-        )
+        )).distinctBy { it.id.ifBlank { it.name } }
     if (artistsList.isEmpty()) return
 
     EscapableAlertDialog(
@@ -318,7 +368,7 @@ private fun ArtistPickerRow(
                     contentScale = ContentScale.Crop
                 )
             } else {
-                Icon(Icons.Default.Person, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Icon(Icons.Rounded.Person, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         Spacer(Modifier.width(12.dp))
@@ -344,7 +394,7 @@ private fun ArtistPickerRow(
 
 @Composable
 private fun MenuSheetContent(viewModel: PlayerViewModel) {
-    val track = viewModel.trackForMenu ?: viewModel.currentTrack ?: return
+    val track = viewModel.trackForMenu ?: viewModel.uiCurrentTrack ?: return
     val downloadProgress by DownloadManager.downloadProgress.collectAsState()
     val storageTrigger by DownloadManager.storageTrigger.collectAsState()
     val likedTracks by com.alananasss.kittytune.data.LikeRepository.likedTracks.collectAsState()
@@ -371,11 +421,11 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
             title = { Text(if (isLocalFile) str("menu_remove_local_q") else str("menu_remove_download_q")) },
             text = { Text(if (isLocalFile) str("menu_remove_local_body") else str("menu_remove_download_body")) },
             confirmButton = {
-                TextButton(onClick = { DownloadManager.deleteTrack(track.id); showDeleteDialog = false; viewModel.showMenuSheet = false }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { DownloadManager.deleteTrack(track.id); showDeleteDialog = false; viewModel.showMenuSheet = false }) {
                     Text(str("btn_delete"), color = MaterialTheme.colorScheme.error)
                 }
             },
-            dismissButton = { TextButton(onClick = { showDeleteDialog = false }) { Text(str("btn_cancel")) } }
+            dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { showDeleteDialog = false }) { Text(str("btn_cancel")) } }
         )
     }
 
@@ -392,11 +442,11 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
             title = { Text(str("dialog_repost_delete_title")) },
             text = { Text(str("dialog_repost_delete_msg")) },
             confirmButton = {
-                TextButton(onClick = { viewModel.deleteRepost(track.id); showDeleteRepostConfirm = false; viewModel.showMenuSheet = false },
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { viewModel.deleteRepost(track.id); showDeleteRepostConfirm = false; viewModel.showMenuSheet = false },
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
                 ) { Text(str("btn_delete")) }
             },
-            dismissButton = { TextButton(onClick = { showDeleteRepostConfirm = false }) { Text(str("btn_cancel")) } }
+            dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { showDeleteRepostConfirm = false }) { Text(str("btn_cancel")) } }
         )
     }
 
@@ -433,7 +483,7 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
         val activeColor = MaterialTheme.colorScheme.primary
 
         val gridItems = mutableListOf<MenuOptionItem>().apply {
-            if (!isLocalFile && !viewModel.isMenuContextFromPlayer) {
+            if (!isLocalFile) {
                 add(
                     MenuOptionItem(
                         id = "like",
@@ -451,26 +501,40 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
                         id = "shuffle",
                         icon = Icons.Rounded.Shuffle,
                         text = str("menu_shuffle"),
-                        tint = activeColor.takeIf { viewModel.shuffleEnabled },
+                        tint = activeColor.takeIf { viewModel.uiShuffleEnabled },
                     ) { viewModel.toggleShuffle() }
                 )
                 add(
                     MenuOptionItem(
                         id = "repeat",
-                        icon = if (viewModel.repeatMode == RepeatMode.ONE) Icons.Rounded.RepeatOne
+                        icon = if (viewModel.uiRepeatMode == RepeatMode.ONE) Icons.Rounded.RepeatOne
                         else Icons.Rounded.Repeat,
-                        text = when (viewModel.repeatMode) {
+                        text = when (viewModel.uiRepeatMode) {
                             RepeatMode.ALL -> str("menu_repeat_all")
                             RepeatMode.ONE -> str("menu_repeat_one")
                             else -> str("menu_repeat")
                         },
-                        tint = activeColor.takeIf { viewModel.repeatMode != RepeatMode.NONE },
+                        tint = activeColor.takeIf { viewModel.uiRepeatMode != RepeatMode.NONE },
                     ) { viewModel.toggleRepeatMode() }
                 )
             }
-            if (!viewModel.isMenuContextFromPlayer) {
-                add(MenuOptionItem("play_next", Icons.AutoMirrored.Rounded.PlaylistPlay, str("menu_play_next")) { viewModel.insertNext(listOf(track)); viewModel.showMenuSheet = false })
+            if ((!viewModel.isMenuContextFromPlayer || viewModel.menuContextQueueIndex != null) &&
+                viewModel.menuContextQueueIndex != viewModel.currentQueueIndex) {
+                add(MenuOptionItem("play_next", Icons.AutoMirrored.Rounded.PlaylistPlay, str("menu_play_next")) { viewModel.playMenuTrackNext() })
                 add(MenuOptionItem("add_queue", Icons.AutoMirrored.Rounded.QueueMusic, str("menu_add_queue")) { viewModel.addToQueue(listOf(track)); viewModel.showMenuSheet = false })
+            }
+            // In a shared playlist a song can go next for everyone, or be offered to the playlist itself.
+            val togetherCode = com.alananasss.kittytune.data.together.Together.active.collectAsState().value
+            if (togetherCode != null) {
+                val shared = com.alananasss.kittytune.data.together.SharedTrack.of(track)
+                add(MenuOptionItem("together_next", Icons.Rounded.Groups, str("together_play_next")) {
+                    com.alananasss.kittytune.data.together.Together.playNext(shared)
+                    viewModel.showMenuSheet = false
+                })
+                add(MenuOptionItem("together_suggest", Icons.Rounded.Groups, str("together_suggest")) {
+                    com.alananasss.kittytune.data.together.Together.suggest(togetherCode, shared)
+                    viewModel.showMenuSheet = false
+                })
             }
             if (track.source != "youtube" && !isSpotify && !isLocalFile) {
                 add(MenuOptionItem("comments", Icons.AutoMirrored.Rounded.Comment, str("menu_comments")) { viewModel.openComments(track) })
@@ -499,7 +563,7 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
                     viewModel.toggleTrackDuetBlacklist(track.id)
                 }
             )
-            add(MenuOptionItem("add_playlist", Icons.Default.Add, str("menu_add_playlist")) { viewModel.showMenuSheet = false; viewModel.showAddToPlaylistSheet = true })
+            add(MenuOptionItem("add_playlist", Icons.Rounded.Add, str("menu_add_playlist")) { viewModel.showMenuSheet = false; viewModel.showAddToPlaylistSheet = true })
 
             // Catalog tracks carry their album id: jump straight to it.
             val albumId = track.publisherMetadata?.albumId?.takeIf { it.isNotBlank() }
@@ -511,7 +575,7 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
             }
             if (track.source != "youtube" && !isLocalFile) {
                 add(
-                    MenuOptionItem("go_artist", Icons.Default.Person, str("menu_go_artist")) {
+                    MenuOptionItem("go_artist", Icons.Rounded.Person, str("menu_go_artist")) {
                         if (isSpotify) {
                             viewModel.navigateToTrackArtist(track)
                             viewModel.showMenuSheet = false
@@ -522,19 +586,68 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
                 )
                 val isOwnTrack = track.user?.id != null && track.user?.id == viewModel.currentUserId && track.id > 0
                 if (isOwnTrack) {
-                    add(MenuOptionItem("edit_track", Icons.Default.Edit, str("menu_edit_track")) {
+                    add(MenuOptionItem("edit_track", Icons.Rounded.Edit, str("menu_edit_track")) {
                         viewModel.showMenuSheet = false
                         viewModel.navigateToEditTrack(track.id)
                     })
                 }
             }
-            if (!isLocalFile) {
+            if (!isLocalFile && RadioEligibility.canStartRadio(track)) {
                 add(MenuOptionItem("track_radio", Icons.Rounded.Radio, str("menu_track_radio")) {
-                    if (track.source == "youtube") viewModel.startYoutubeRadio(track) else viewModel.startRadioFromTrack(track)
+                    if (RadioEligibility.radioKind(track) == RadioEligibility.Kind.YOUTUBE) viewModel.startYoutubeRadio(track) else viewModel.startRadioFromTrack(track)
                 })
-                add(MenuOptionItem("share", Icons.Outlined.Share, str("btn_share")) { viewModel.shareTrack(track) })
+                add(MenuOptionItem("share", Icons.Outlined.Link, str("cover_copy_link")) { viewModel.shareTrack(track) })
+                add(MenuOptionItem("share_card", Icons.Outlined.PhotoLibrary, str("share_card_title")) { viewModel.openShareCard(track) })
             }
-            if (viewModel.menuContextPlaylistId != null && (viewModel.menuContextPlaylistId!! < 0 || viewModel.menuContextPlaylistId == -2L)) {
+            // Content filtering (issue #41): hide track / block artist, like Android.
+            run {
+                val blockedTrackIds by com.alananasss.kittytune.data.BlockManager.blockedTrackIdsFlow.collectAsState()
+                val blockedArtistIds by com.alananasss.kittytune.data.BlockManager.blockedArtistIdsFlow.collectAsState()
+                val isTrackBlocked = track.id in blockedTrackIds
+                val menuArtistId = track.user?.id
+                val menuArtistName = track.user?.username
+                val isArtistBlocked = menuArtistId != null && menuArtistId in blockedArtistIds
+                add(
+                    MenuOptionItem(
+                        id = "block_track",
+                        icon = if (isTrackBlocked) Icons.Outlined.VisibilityOff else Icons.Rounded.VisibilityOff,
+                        text = if (isTrackBlocked) str("menu_unblock_track") else str("menu_block_track"),
+                    ) {
+                        if (isTrackBlocked) {
+                            com.alananasss.kittytune.data.BlockManager.unblockTrack(track.id)
+                        } else {
+                            com.alananasss.kittytune.data.BlockManager.blockTrack(
+                                track,
+                                currentlyPlayingId = viewModel.currentTrack?.id,
+                            )
+                        }
+                        viewModel.showMenuSheet = false
+                    }
+                )
+                if (menuArtistId != null && menuArtistId != 0L && !menuArtistName.isNullOrBlank()) {
+                    add(
+                        MenuOptionItem(
+                            id = "block_artist",
+                            icon = if (isArtistBlocked) Icons.Rounded.Person else Icons.Rounded.PersonOff,
+                            text = if (isArtistBlocked) str("menu_unblock_artist") else str("menu_block_artist"),
+                        ) {
+                            if (isArtistBlocked) {
+                                com.alananasss.kittytune.data.BlockManager.unblockArtist(menuArtistId)
+                            } else {
+                                com.alananasss.kittytune.data.BlockManager.blockArtist(
+                                    artistId = menuArtistId,
+                                    artistName = menuArtistName,
+                                    avatarUrl = track.user?.avatarUrl,
+                                    source = track.source ?: "soundcloud",
+                                    currentlyPlayingTrack = viewModel.currentTrack,
+                                )
+                            }
+                            viewModel.showMenuSheet = false
+                        }
+                    )
+                }
+            }
+            if (viewModel.menuContextPlaylistId != null) {
                 add(MenuOptionItem("remove_from_playlist", Icons.Outlined.Delete, str("menu_remove")) { viewModel.removeFromContextPlaylist(viewModel.menuContextPlaylistId!!, track) })
             }
             if (viewModel.isMenuContextFromPlayer) {
@@ -561,7 +674,7 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
                 add(
                     MenuOptionItem(
                         id = "download",
-                        icon = if (isDownloaded) Icons.Default.Delete else Icons.Rounded.Download,
+                        icon = if (isDownloaded) Icons.Rounded.Delete else Icons.Rounded.Download,
                         text = when {
                             isDownloaded -> str("btn_delete")
                             isDownloading -> "${downloadProgressVal ?: 0}%"
@@ -569,7 +682,7 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
                         },
                         tint = MaterialTheme.colorScheme.error.takeIf { isDownloaded },
                         iconContent = { tint ->
-                            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(30.dp)) {
+                            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(26.dp)) {
                                 if (isDownloading) {
                                     val animatedProgress by animateFloatAsState(
                                         targetValue = (downloadProgressVal ?: 0) / 100f,
@@ -579,12 +692,12 @@ private fun MenuSheetContent(viewModel: PlayerViewModel) {
                                         progress = { animatedProgress },
                                         modifier = Modifier.fillMaxSize(),
                                     )
-                                    Icon(Icons.Outlined.Cancel, null, modifier = Modifier.size(18.dp))
+                                    Icon(Icons.Outlined.Cancel, null, modifier = Modifier.size(16.dp))
                                 } else {
                                     Icon(
-                                        if (isDownloaded) Icons.Default.Delete else Icons.Rounded.Download,
+                                        if (isDownloaded) Icons.Rounded.Delete else Icons.Rounded.Download,
                                         null,
-                                        modifier = Modifier.size(30.dp),
+                                        modifier = Modifier.size(26.dp),
                                         tint = tint,
                                     )
                                 }
@@ -626,7 +739,7 @@ private fun AddToPlaylistContent(viewModel: PlayerViewModel) {
                     singleLine = true
                 )
                 Spacer(Modifier.width(8.dp))
-                Button(onClick = {
+                Button(shapes = ButtonDefaults.shapes(), onClick = {
                     if (newName.isNotBlank()) {
                         if (bulkTracks != null) viewModel.createAndAddTracksToPlaylist(newName, bulkTracks)
                         else if (singleTrack != null) viewModel.createAndAddToPlaylist(newName, singleTrack)
@@ -642,7 +755,7 @@ private fun AddToPlaylistContent(viewModel: PlayerViewModel) {
                 modifier = Modifier.fillMaxWidth().height(56.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center, modifier = Modifier.fillMaxSize()) {
-                    Icon(Icons.Default.Add, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                    Icon(Icons.Rounded.Add, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
                     Spacer(Modifier.width(8.dp))
                     Text(
                         str("add_to_playlist_new"),
@@ -714,8 +827,8 @@ private fun RepostDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
                 )
             }
         },
-        confirmButton = { Button(onClick = { onConfirm(caption) }) { Text(str("dialog_repost_confirm")) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(str("btn_cancel")) } }
+        confirmButton = { Button(shapes = ButtonDefaults.shapes(), onClick = { onConfirm(caption) }) { Text(str("dialog_repost_confirm")) } },
+        dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_cancel")) } }
     )
 }
 
@@ -723,8 +836,11 @@ private fun RepostDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
 private fun SleepTimerDialog(viewModel: PlayerViewModel) {
     if (!viewModel.showSleepTimerDialog) return
 
-    var sliderValue by remember { mutableStateOf(30f) }
-    val selectedMinutes = sliderValue.toInt()
+    // Preset steps in minutes — slider snaps to these values
+    val steps = remember { listOf(5, 10, 15, 20, 30, 45, 60, 90, 120) }
+    var selectedIndex by remember { mutableStateOf(steps.indexOf(30).coerceAtLeast(0)) }
+    val selectedMinutes = steps[selectedIndex]
+
     val stopTimeText = remember(selectedMinutes) {
         val cal = java.util.Calendar.getInstance().apply { add(java.util.Calendar.MINUTE, selectedMinutes) }
         java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(cal.time)
@@ -734,32 +850,52 @@ private fun SleepTimerDialog(viewModel: PlayerViewModel) {
         onDismissRequest = { viewModel.showSleepTimerDialog = false },
         containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         shape = RoundedCornerShape(28.dp),
-        icon = { Icon(Icons.Rounded.Bedtime, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(28.dp)) },
+        icon = {
+            Icon(
+                Icons.Rounded.Bedtime, null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(28.dp)
+            )
+        },
+        title = { Text(str("sleep_timer_title")) },
         text = {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
+
+                // Active timer: show remaining time + cancel
                 if (viewModel.isSleepTimerActive) {
                     Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        color = MaterialTheme.colorScheme.primaryContainer,
                         shape = RoundedCornerShape(16.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
                             Text(
                                 text = viewModel.formatSleepTimerRemaining(),
                                 style = MaterialTheme.typography.headlineMedium,
-                                fontWeight = FontWeight.Bold
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
-                            Spacer(Modifier.height(12.dp))
-                            TextButton(onClick = { viewModel.cancelSleepTimer(); viewModel.showSleepTimerDialog = false }) {
+                            Spacer(Modifier.height(8.dp))
+                            TextButton(shapes = ButtonDefaults.shapes(),
+                                onClick = {
+                                    viewModel.cancelSleepTimer()
+                                    viewModel.showSleepTimerDialog = false
+                                }
+                            ) {
                                 Text(str("sleep_timer_cancel"), color = MaterialTheme.colorScheme.error)
                             }
                         }
                     }
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(20.dp))
                 }
+
+                // Large minute display
                 Text(
                     text = str("sleep_timer_slider_minutes", selectedMinutes),
-                    style = MaterialTheme.typography.headlineMedium,
+                    style = MaterialTheme.typography.displaySmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -769,22 +905,64 @@ private fun SleepTimerDialog(viewModel: PlayerViewModel) {
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(16.dp))
-                Slider(value = sliderValue, onValueChange = { sliderValue = it }, valueRange = 5f..120f)
+
+                Spacer(Modifier.height(20.dp))
+
+                // Discrete slider — one step per preset
+                Slider(
+                    value = selectedIndex.toFloat(),
+                    onValueChange = { selectedIndex = it.toInt().coerceIn(steps.indices) },
+                    valueRange = 0f..(steps.lastIndex.toFloat()),
+                    steps = steps.size - 2, // internal steps count = total ticks - 2 (endpoints excluded)
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                // Quick-select chips row
+                val chipsState = androidx.compose.foundation.lazy.rememberLazyListState()
+                com.alananasss.kittytune.ui.common.ScrollableLazyRow(
+                    state = chipsState,
+                    showsArrows = false,
+                    fadeLength = 20.dp,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    contentPadding = PaddingValues(horizontal = 2.dp),
+                ) {
+                    items(steps) { min ->
+                        val idx = steps.indexOf(min)
+                        val isSelected = idx == selectedIndex
+                        androidx.compose.material3.FilterChip(
+                            selected = isSelected,
+                            onClick = { selectedIndex = idx },
+                            label = { Text("${min}m", style = MaterialTheme.typography.labelMedium) },
+                            shape = RoundedCornerShape(50),
+                        )
+                    }
+                }
+
                 Spacer(Modifier.height(8.dp))
-                TextButton(onClick = {
-                    viewModel.startSleepTimerEndOfTrack()
-                    viewModel.showSleepTimerDialog = false
-                }) { Text(str("sleep_timer_end_of_track")) }
+
+                // End of track option
+                TextButton(shapes = ButtonDefaults.shapes(),
+                    onClick = {
+                        viewModel.startSleepTimerEndOfTrack()
+                        viewModel.showSleepTimerDialog = false
+                    }
+                ) { Text(str("sleep_timer_end_of_track")) }
             }
         },
         confirmButton = {
-            Button(onClick = {
-                viewModel.startSleepTimer(selectedMinutes * 60_000L)
-                viewModel.showSleepTimerDialog = false
-            }) { Text(str("btn_ok")) }
+            Button(shapes = ButtonDefaults.shapes(),
+                onClick = {
+                    viewModel.startSleepTimer(selectedMinutes * 60_000L)
+                    viewModel.showSleepTimerDialog = false
+                }
+            ) { Text(str("btn_ok")) }
         },
-        dismissButton = { TextButton(onClick = { viewModel.showSleepTimerDialog = false }) { Text(str("btn_cancel")) } }
+        dismissButton = {
+            TextButton(shapes = ButtonDefaults.shapes(), onClick = { viewModel.showSleepTimerDialog = false }) {
+                Text(str("btn_cancel"))
+            }
+        }
     )
 }
 
@@ -884,13 +1062,13 @@ private fun PlaylistMenuSheetContent(viewModel: PlayerViewModel) {
             title = { Text(str("dialog_remove_download_title")) },
             text = { Text(str("dialog_remove_download_msg")) },
             confirmButton = {
-                TextButton(onClick = {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = {
                     DownloadManager.removePlaylistDownloads(playlist.id)
                     showRemoveDownloadDialog = false
                     viewModel.showPlaylistMenuSheet = false
                 }) { Text(str("btn_delete"), color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { showRemoveDownloadDialog = false }) { Text(str("btn_cancel")) } }
+            dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { showRemoveDownloadDialog = false }) { Text(str("btn_cancel")) } }
         )
     }
 
@@ -967,7 +1145,7 @@ private fun PlaylistMenuSheetContent(viewModel: PlayerViewModel) {
                     withTracks { viewModel.playPlaylist(it, 0); viewModel.showPlaylistMenuSheet = false }
                 })
                 add(MenuOptionItem("shuffle", Icons.Rounded.Shuffle, str("btn_shuffle")) {
-                    withTracks { viewModel.playPlaylist(it.shuffled(), 0); viewModel.showPlaylistMenuSheet = false }
+                    withTracks { viewModel.playPlaylistShuffled(it); viewModel.showPlaylistMenuSheet = false }
                 })
                 add(MenuOptionItem("play_next", Icons.AutoMirrored.Rounded.PlaylistPlay, str("menu_play_next")) {
                     withTracks { viewModel.insertNext(it); viewModel.showPlaylistMenuSheet = false }
@@ -975,7 +1153,7 @@ private fun PlaylistMenuSheetContent(viewModel: PlayerViewModel) {
                 add(MenuOptionItem("add_queue", Icons.AutoMirrored.Rounded.QueueMusic, str("menu_add_queue")) {
                     withTracks { viewModel.addToQueue(it); viewModel.showPlaylistMenuSheet = false }
                 })
-                add(MenuOptionItem("add_playlist", Icons.Default.Add, str("menu_add_playlist")) {
+                add(MenuOptionItem("add_playlist", Icons.Rounded.Add, str("menu_add_playlist")) {
                     withTracks {
                         viewModel.showPlaylistMenuSheet = false
                         viewModel.prepareBulkAdd(it)
@@ -986,19 +1164,19 @@ private fun PlaylistMenuSheetContent(viewModel: PlayerViewModel) {
                 add(MenuOptionItem("details", Icons.Rounded.Info, str("menu_playlist_details")) { showDetailsSheet = true })
             }
             playlist.user?.id?.takeIf { it > 0 }?.let { ownerId ->
-                add(MenuOptionItem("go_artist", Icons.Default.Person, str("menu_go_artist")) {
+                add(MenuOptionItem("go_artist", Icons.Rounded.Person, str("menu_go_artist")) {
                     viewModel.showPlaylistMenuSheet = false
                     viewModel.navigateToPlaylistId = "profile:$ownerId"
                 })
             }
             if (shareUrl.isNotEmpty()) {
-                add(MenuOptionItem("share", Icons.Outlined.Share, str("btn_share")) { viewModel.sharePlaylist(playlist) })
+                add(MenuOptionItem("share", Icons.Outlined.Link, str("cover_copy_link")) { viewModel.sharePlaylist(playlist) })
             }
             if (!isLocal && offerTrackActions && !isStation) {
                 add(
                     MenuOptionItem(
                         id = "download",
-                        icon = if (isFullyDownloaded) Icons.Default.Delete else Icons.Rounded.Download,
+                        icon = if (isFullyDownloaded) Icons.Rounded.Delete else Icons.Rounded.Download,
                         text = when {
                             isFullyDownloaded -> str("btn_delete")
                             isPlaylistDownloading -> str("btn_cancel")
@@ -1090,7 +1268,7 @@ internal suspend fun loadPlaylistTracksForMenu(
 
 @Composable
 private fun CommentsSheetContent(viewModel: PlayerViewModel) {
-    val track = viewModel.selectedTrackForSheet ?: viewModel.trackForMenu ?: viewModel.currentTrack
+    val track = viewModel.selectedTrackForSheet ?: viewModel.trackForMenu ?: viewModel.uiCurrentTrack
     var newCommentText by remember { mutableStateOf("") }
     val isPosting = viewModel.isPostingComment
 
@@ -1153,7 +1331,7 @@ private fun CommentsSheetContent(viewModel: PlayerViewModel) {
                 }
             }
 
-            IconButton(onClick = { viewModel.showCommentsSheet = false }, modifier = Modifier.size(32.dp)) {
+            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { viewModel.showCommentsSheet = false }, modifier = Modifier.size(32.dp)) {
                 Icon(Icons.Rounded.Close, contentDescription = str("btn_close"))
             }
         }
@@ -1177,46 +1355,14 @@ private fun CommentsSheetContent(viewModel: PlayerViewModel) {
                 }
             }
 
-            var isSortMenuExpanded by remember { mutableStateOf(false) }
-            Box {
-                OutlinedButton(
-                    onClick = { isSortMenuExpanded = true },
-                    shapes = ButtonDefaults.shapes(),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                ) {
-                    Icon(Icons.AutoMirrored.Rounded.Sort, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = str("sorted_by", str(viewModel.commentSort.labelResId)),
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Icon(Icons.Rounded.ArrowDropDown, contentDescription = null, modifier = Modifier.size(18.dp))
-                }
-
-                DropdownMenu(
-                    expanded = isSortMenuExpanded,
-                    onDismissRequest = { isSortMenuExpanded = false }
-                ) {
-                    CommentSort.values().forEach { sortOption ->
-                        DropdownMenuItem(
-                            text = { Text(str(sortOption.labelResId)) },
-                            onClick = {
-                                viewModel.onCommentSortChanged(sortOption)
-                                isSortMenuExpanded = false
-                            },
-                            trailingIcon = {
-                                if (sortOption == viewModel.commentSort) {
-                                    Icon(Icons.Rounded.Check, contentDescription = str("desc_selected"), modifier = Modifier.size(16.dp))
-                                }
-                            }
-                        )
-                    }
-                }
-            }
+            com.alananasss.kittytune.ui.common.IconChoiceButton(
+                options = CommentSort.entries,
+                selected = viewModel.commentSort,
+                onSelect = viewModel::onCommentSortChanged,
+                icon = { it.icon },
+                label = { str(it.labelResId) },
+                tooltip = { str("sorted_by", str(it.labelResId)) },
+            )
         }
 
         Spacer(Modifier.height(8.dp))
@@ -1303,7 +1449,7 @@ private fun CommentsSheetContent(viewModel: PlayerViewModel) {
                 shape = RoundedCornerShape(24.dp),
                 enabled = !isPosting
             )
-            IconButton(
+            IconButton(shapes = IconButtonDefaults.shapes(),
                 onClick = {
                     if (newCommentText.isNotBlank()) {
                         viewModel.postComment(newCommentText, null)
@@ -1372,7 +1518,7 @@ private fun MenuTileGrid(menu: String, items: List<MenuOptionItem>) {
     LazyVerticalGrid(
         columns = GridCells.Fixed(3),
         state = gridState,
-        verticalArrangement = Arrangement.spacedBy(20.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.heightIn(max = 420.dp)
     ) {
@@ -1401,50 +1547,61 @@ private fun ReorderableCollectionItemScope.MenuTile(
     // Lifted rather than shadowed: the tile has no container of its own to cast one.
     val scale by animateFloatAsState(if (isDragging) 1.12f else 1f, label = "menuTileScale")
 
-    Box {
+    Box(modifier = Modifier.fillMaxWidth().height(88.dp)) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
-                // Fills its cell, which it used to get for free.
+                // Fills its cell with uniform width and height for every tile in the grid.
                 //
-                // A grid cell hands its item an exact width, so the tile filled it and its icon sat in
-                // the middle. [ReorderableItem] wraps what it is given in a Box, and a Box does not
-                // pass a minimum width down, so the tile started measuring itself against its own
-                // label instead: short labels ended up hugging the left of their cell and long ones
-                // reaching the middle, and no two icons in a column lined up. Asking for the width
-                // back restores it, and gives the click and its ripple the whole tile while it is
-                // there (issue #33).
-                .fillMaxWidth()
+                // A grid cell hands its item an exact width, and giving every tile a matching fixed
+                // height (88.dp) ensures all tiles have identical size and rounded container boundaries
+                // regardless of whether their label is 1 or 2 lines. Icons line up in straight rows
+                // and labels sit vertically centered in their allocated slot.
+                .fillMaxSize()
                 .graphicsLayer { scaleX = scale; scaleY = scale }
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(16.dp))
+                .background(
+                    if (item.tint != null) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                    else MaterialTheme.colorScheme.surfaceContainerHigh,
+                )
                 .longPressDraggableHandle()
                 .onClick(
                     matcher = PointerMatcher.mouse(PointerButton.Secondary),
                     onClick = { contextMenuOpen = true },
                 )
                 .clickable { item.onClick() }
-                .padding(vertical = 6.dp)
+                .pointerHoverIcon(PointerIcon.Hand)
+                .padding(horizontal = 6.dp, vertical = 10.dp)
         ) {
+            // One size and one tone for every icon: 26.dp centered in a matching slot.
             val icon = item.iconContent
-            if (icon != null) {
-                icon(tint)
-            } else {
-                Icon(item.icon, null, modifier = Modifier.size(30.dp), tint = tint)
+            Box(modifier = Modifier.size(26.dp), contentAlignment = Alignment.Center) {
+                if (icon != null) {
+                    icon(tint)
+                } else {
+                    Icon(item.icon, null, modifier = Modifier.size(26.dp), tint = tint)
+                }
             }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = item.text,
-                style = MaterialTheme.typography.labelMedium,
-                textAlign = TextAlign.Center,
-                color = tint,
-                maxLines = 2,
-            )
+            Spacer(Modifier.height(6.dp))
+            Box(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = item.text,
+                    style = MaterialTheme.typography.labelMedium,
+                    textAlign = TextAlign.Center,
+                    color = tint,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
 
         DropdownMenu(expanded = contextMenuOpen, onDismissRequest = { contextMenuOpen = false }) {
             DropdownMenuItem(
                 text = { Text(str("menu_tile_hide")) },
-                leadingIcon = { Icon(Icons.Outlined.VisibilityOff, null, modifier = Modifier.size(18.dp)) },
+                leadingIcon = { Icon(Icons.Rounded.VisibilityOff, null, modifier = Modifier.size(18.dp)) },
                 onClick = {
                     onHide()
                     contextMenuOpen = false

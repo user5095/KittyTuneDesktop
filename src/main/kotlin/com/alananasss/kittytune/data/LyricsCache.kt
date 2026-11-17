@@ -3,6 +3,7 @@ package com.alananasss.kittytune.data
 import com.alananasss.kittytune.core.AppDirs
 import com.alananasss.kittytune.ui.player.lyrics.LyricLine
 import com.alananasss.kittytune.ui.player.lyrics.LyricSinger
+import com.alananasss.kittytune.ui.player.lyrics.LyricsUtils
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
@@ -38,9 +39,19 @@ object LyricsCache {
         val translationLang: String? = null,
         val romanized: Boolean = false,
         val savedAtMs: Long = System.currentTimeMillis(),
+        /**
+         * Stamped with [CURRENT_SCHEMA] by [put]; anything else was resolved by rules since changed. Zero by
+         * default, so a file written before the field existed reads as old.
+         */
+        val schema: Int = 0,
     ) {
         @Suppress("SENSELESS_COMPARISON")
         fun sanitized(): Entry {
+            val cleanPlain = plain?.let { p ->
+                if (com.alananasss.kittytune.ui.player.lyrics.LyricsUtils.isYamlContent(p)) {
+                    com.alananasss.kittytune.ui.player.lyrics.LyricsUtils.extractPlainLyricsFromYaml(p)
+                } else p
+            }?.takeIf { it.isNotBlank() }
             val rawLines: List<LyricLine>? = lines
             val cleanLines = (rawLines ?: emptyList()).map { line ->
                 var updated = line
@@ -52,11 +63,22 @@ object LyricsCache {
                 }
                 updated
             }
-            return copy(lines = cleanLines)
+            return copy(lines = cleanLines, plain = cleanPlain)
         }
     }
 
-    private const val MAX_MEMORY_ENTRIES = 64
+    /**
+     * Raised whenever resolving changes enough that old answers are wrong rather than just old: 2 dropped
+     * YouTube Music, which had won with another song's words, and started telling fake timings and
+     * watermark lines apart. Older entries miss and are resolved again.
+     */
+    private const val CURRENT_SCHEMA = 2
+
+    // 24 entries is enough for upcoming + recently-played; anything older reloads from disk in
+    // <5 ms. The previous 64 was wasteful for word-synced / enhanced lyrics (TTML, QRC) which can
+    // be 50-150 KB per entry — 64 × 150 KB = ~10 MB worst case. 24 × 150 KB = ~3.6 MB (audit
+    // Phase 2 RAM gain).
+    private const val MAX_MEMORY_ENTRIES = 24
     private val FOUND_TTL_MS = 90L * 24 * 60 * 60 * 1000 // 90 days
     private val MISS_TTL_MS = 12L * 60 * 60 * 1000 // 12 hours
 
@@ -80,16 +102,20 @@ object LyricsCache {
         romanized: Boolean,
     ): Entry? {
         val entry = memory[trackId] ?: readFromDisk(trackId)?.also { remember(trackId, it) } ?: return null
+        if (entry.schema != CURRENT_SCHEMA) return null
         if (entry.providerPreference != providerPreference) return null
         if (entry.translationLang != translationLang) return null
         if (entry.romanized != romanized) return null
+        // Older entries could store an unparsed TTML document as "plain": treat them as a miss
+        // so the track is resolved again instead of displaying raw <tt> tags.
+        if (entry.lines.isEmpty() && entry.plain?.let(LyricsUtils::looksLikeTtml) == true) return null
         val ttl = if (entry.found) FOUND_TTL_MS else MISS_TTL_MS
         if (System.currentTimeMillis() - entry.savedAtMs > ttl) return null
         return entry
     }
 
     fun put(trackId: Long, entry: Entry) {
-        val cleanEntry = entry.sanitized()
+        val cleanEntry = entry.sanitized().copy(schema = CURRENT_SCHEMA)
         remember(trackId, cleanEntry)
         runCatching { File(dir, "$trackId.json").writeText(gson.toJson(cleanEntry)) }
     }

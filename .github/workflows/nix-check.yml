@@ -1,0 +1,79 @@
+name: Nix Flake Build & Check
+
+on:
+  push:
+    paths:
+      - 'flake.nix'
+      - 'default.nix'
+      - 'shell.nix'
+      - 'nix/**'
+      - '.github/workflows/nix-check.yml'
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'default.nix'
+      - 'shell.nix'
+      - 'nix/**'
+      - '.github/workflows/nix-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-nix:
+    name: Test Nix Build & Flake on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Generate & Lock flake.lock
+        run: |
+          nix flake lock
+          echo "=== Content of flake.lock ==="
+          cat flake.lock
+
+      - name: Commit flake.lock if missing
+        run: |
+          if [ -n "$(git status --porcelain flake.lock)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add flake.lock
+            git commit -m "chore(nix): add flake.lock"
+            git push origin ${{ github.ref_name }} || echo "Push failed or not permitted, artifact is preserved."
+          fi
+
+      - name: Upload flake.lock as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-lock
+          path: flake.lock
+
+      - name: Check Flake Syntax & Outputs
+        run: nix flake check
+
+      - name: Build KittyTune Package via Flake
+        run: nix build .#default --print-build-logs
+
+      - name: Validate Output Derivation
+        run: |
+          echo "=== Built binaries in result/bin ==="
+          ls -la result/bin
+          echo "=== Desktop and icon files ==="
+          ls -la result/share/applications || true
+          ls -la result/share/icons/hicolor/256x256/apps || true
+          echo "=== Testing executable wrapper ==="
+          file result/bin/kitty-tune
+          test -x result/bin/kitty-tune
+          test -x result/bin/KittyTune
+          echo "Nix package built successfully and executable is verified!"

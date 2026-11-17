@@ -1,6 +1,7 @@
 @file:OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
 package com.alananasss.kittytune.ui.profile
 
+import androidx.compose.material.icons.automirrored.rounded.Comment
 import androidx.compose.material3.IconButtonDefaults
 
 import androidx.compose.material3.ButtonDefaults
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.selection.SelectionContainer
 import com.alananasss.kittytune.ui.common.ScrollableLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import com.alananasss.kittytune.ui.utils.fadedHorizontalEdges
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -100,6 +102,8 @@ import com.alananasss.kittytune.domain.User
 import com.alananasss.kittytune.domain.isDefaultAvatar
 import com.alananasss.kittytune.domain.getHighResAvatarUrl
 import com.alananasss.kittytune.ui.common.ShimmerLine
+import com.alananasss.kittytune.ui.common.rememberFilteredArtists
+import com.alananasss.kittytune.ui.common.rememberFilteredTracks
 import com.alananasss.kittytune.ui.common.viewableCover
 import com.alananasss.kittytune.ui.common.TrackListItemShimmer
 import com.alananasss.kittytune.ui.library.TrackListItem
@@ -150,6 +154,18 @@ fun ProfileScreen(
     }
 
     val user = profileViewModel.user
+    // Another artist's page, as opposed to the listener's own profile, which keeps its own header and sections.
+    val isArtistPage = user != null && !profileViewModel.isCurrentUser
+    var showAbout by remember { mutableStateOf(false) }
+    val artistMixes = if (user != null && isArtistPage) rememberArtistMixes(user, profileViewModel) else emptyList()
+    // Content filtering (issue #41): every rendered track/artist list below reads
+    // these, so blocked tracks — and tracks of blocked artists — stay hidden and
+    // the playback queues built from the same lists skip them too.
+    val popularTracks = rememberFilteredTracks(profileViewModel.popularTracks)
+    val allTracks = rememberFilteredTracks(profileViewModel.allTracks)
+    val likedTracks = rememberFilteredTracks(profileViewModel.likedTracks)
+    val repostedTracks = rememberFilteredTracks(profileViewModel.repostedTracks)
+    val similarArtists = rememberFilteredArtists(profileViewModel.similarArtists)
 
     val artistText = str("generic_artist")
     val artistPlaybackContext = remember(user, artistText) {
@@ -353,23 +369,82 @@ fun ProfileScreen(
                 modifier = Modifier.fillMaxSize()
             ) {
                 item {
-                    ModernProfileHeader(
-                        user = user,
-                        isCurrentUser = profileViewModel.isCurrentUser,
-                        onEditClick = { showEditSheet = true },
-                        playerViewModel = playerViewModel,
-                        onNavigate = onNavigate,
-                        profileViewModel = profileViewModel,
-                        artistContext = artistPlaybackContext,
-                        onFollowersClick = { userListDialogType = "followers" },
-                        onFollowingClick = { userListDialogType = "followings" },
-                        hasMotionVideo = !artistVideoUrl.isNullOrBlank(),
-                        artistVideoUrl = artistVideoUrl
-                    )
+                    if (isArtistPage) {
+                        ArtistHero(
+                            user = user,
+                            profileViewModel = profileViewModel,
+                            playerViewModel = playerViewModel,
+                            artistContext = artistPlaybackContext,
+                            onNavigate = onNavigate,
+                            onAbout = { showAbout = true },
+                        )
+                    } else {
+                        ModernProfileHeader(
+                            user = user,
+                            isCurrentUser = profileViewModel.isCurrentUser,
+                            onEditClick = { showEditSheet = true },
+                            playerViewModel = playerViewModel,
+                            onNavigate = onNavigate,
+                            profileViewModel = profileViewModel,
+                            artistContext = artistPlaybackContext,
+                            onFollowersClick = { userListDialogType = "followers" },
+                            onFollowingClick = { userListDialogType = "followings" },
+                            hasMotionVideo = !artistVideoUrl.isNullOrBlank(),
+                            artistVideoUrl = artistVideoUrl
+                        )
+                    }
+                }
+
+                // On an artist's page the popular songs come first and the newest release beside them; who they
+                // are moved to the header's "about", which a page opened to listen does not need first (issue #66).
+                if (isArtistPage && (popularTracks.isNotEmpty() || allTracks.isNotEmpty())) {
+                    item {
+                        val popular = popularTracks.ifEmpty { allTracks }
+                        val latest = remember(allTracks.size, profileViewModel.albums.size, profileViewModel.singles.size) {
+                            ArtistRelease.latestOf(allTracks.take(10), profileViewModel.albums + profileViewModel.singles)
+                        }
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val popularColumn: @Composable (Modifier) -> Unit = { m ->
+                                Column(m) {
+                                    ArtistSectionTitle(str("profile_tab_popular"), onOpen = { onNavigate("profile_collection:${user.id}:popular") })
+                                    popular.take(5).forEachIndexed { index, track ->
+                                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, popular, artistPlaybackContext, showPlays = true, showDate = false)
+                                    }
+                                }
+                            }
+                            val releaseColumn: @Composable (Modifier) -> Unit = { m ->
+                                if (latest.isNotEmpty()) Column(m) {
+                                    ArtistSectionTitle(
+                                        str("artist_new_releases"),
+                                        // Every release, songs and records, newest first.
+                                        onOpen = { onNavigate("profile_collection:${user.id}:releases_all") },
+                                    )
+                                    latest.forEachIndexed { index, release ->
+                                        NewReleaseCard(
+                                            release, playerViewModel, artistPlaybackContext, onNavigate,
+                                            Modifier.padding(start = 16.dp, end = 16.dp, top = if (index == 0) 0.dp else 16.dp).fillMaxWidth(),
+                                            previous = index > 0,
+                                        )
+                                    }
+                                }
+                            }
+                            if (maxWidth >= 860.dp && latest.isNotEmpty()) {
+                                Row(Modifier.fillMaxWidth()) {
+                                    popularColumn(Modifier.weight(1.5f))
+                                    releaseColumn(Modifier.weight(1f).padding(top = 0.dp))
+                                }
+                            } else {
+                                Column {
+                                    popularColumn(Modifier.fillMaxWidth())
+                                    releaseColumn(Modifier.fillMaxWidth().padding(top = 8.dp))
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // bio section
-                if (!user.description.isNullOrBlank()) {
+                if (!isArtistPage && !user.description.isNullOrBlank()) {
                     item {
                         Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)) {
                             Text(
@@ -389,17 +464,32 @@ fun ProfileScreen(
                     }
                 }
 
-                if (profileViewModel.popularTracks.isNotEmpty()) {
-                    item { ProfileSectionTitle(title = str("profile_tab_popular"), showMore = profileViewModel.popularTracks.size > 5, onMoreClick = { onNavigate("profile_collection:${user.id}:popular") }) }
-                    itemsIndexed(profileViewModel.popularTracks.take(5)) { index, track ->
-                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, profileViewModel.popularTracks, artistPlaybackContext, showPlays = true, showDate = false)
+                if (!isArtistPage && popularTracks.isNotEmpty()) {
+                    item { ProfileSectionTitle(title = str("profile_tab_popular"), showMore = popularTracks.size > 5, onMoreClick = { onNavigate("profile_collection:${user.id}:popular") }) }
+                    itemsIndexed(popularTracks.take(5)) { index, track ->
+                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, popularTracks, artistPlaybackContext, showPlays = true, showDate = false)
                     }
                 }
 
-                if (profileViewModel.allTracks.isNotEmpty()) {
-                    item { ProfileSectionTitle(title = str("profile_latest_tracks"), showMore = true, onMoreClick = { onNavigate("profile_collection:${user.id}:tracks") }) }
-                    itemsIndexed(profileViewModel.allTracks.take(5)) { index, track ->
-                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, profileViewModel.allTracks, artistPlaybackContext, showPlays = true, showDate = false)
+                if (allTracks.isNotEmpty()) {
+                    item {
+                        if (isArtistPage) {
+                            ArtistSectionTitle(
+                                str("profile_tab_tracks"),
+                                onOpen = { onNavigate("profile_collection:${user.id}:tracks") },
+                                modifier = Modifier.padding(top = 16.dp)
+                            )
+                        } else {
+                            ProfileSectionTitle(
+                                title = str("profile_latest_tracks"),
+                                showMore = true,
+                                onMoreClick = { onNavigate("profile_collection:${user.id}:tracks") }
+                            )
+                        }
+                    }
+                    val tracksToShow = if (isArtistPage) allTracks.take(8) else allTracks.take(5)
+                    itemsIndexed(tracksToShow) { index, track ->
+                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, allTracks, artistPlaybackContext, showPlays = true, showDate = true)
                     }
                 }
 
@@ -420,7 +510,8 @@ fun ProfileScreen(
                             title = str("profile_tab_albums"),
                             items = profileViewModel.albums,
                             showMore = profileViewModel.isSpotifyProfile && profileViewModel.hasMoreDiscography(),
-                            onMoreClick = { profileViewModel.loadMoreDiscography() }
+                            onMoreClick = { profileViewModel.loadMoreDiscography() },
+                            onTitleClick = if (isArtistPage) ({ onNavigate("profile_collection:${user.id}:albums") }) else null,
                         ) { playlist ->
                             ProfileSquareCard(playlist) { onNavigate(if (playlist.urn?.contains("spotify") == true) playlist.urn!! else playlist.id.toString()) }
                         }
@@ -433,7 +524,8 @@ fun ProfileScreen(
                             title = str("spotify_singles_eps"),
                             items = profileViewModel.singles,
                             showMore = profileViewModel.isSpotifyProfile && profileViewModel.hasMoreDiscography(),
-                            onMoreClick = { profileViewModel.loadMoreDiscography() }
+                            onMoreClick = { profileViewModel.loadMoreDiscography() },
+                            onTitleClick = if (isArtistPage) ({ onNavigate("profile_collection:${user.id}:singles") }) else null,
                         ) { playlist ->
                             ProfileSquareCard(playlist) { onNavigate(if (playlist.urn?.contains("spotify") == true) playlist.urn!! else playlist.id.toString()) }
                         }
@@ -446,14 +538,31 @@ fun ProfileScreen(
                             title = str("spotify_compilations"),
                             items = profileViewModel.compilations,
                             showMore = profileViewModel.isSpotifyProfile && profileViewModel.hasMoreDiscography(),
-                            onMoreClick = { profileViewModel.loadMoreDiscography() }
+                            onMoreClick = { profileViewModel.loadMoreDiscography() },
+                            onTitleClick = if (isArtistPage) ({ onNavigate("profile_collection:${user.id}:compilations") }) else null,
                         ) { playlist ->
                             ProfileSquareCard(playlist) { onNavigate(if (playlist.urn?.contains("spotify") == true) playlist.urn!! else playlist.id.toString()) }
                         }
                     }
                 }
 
-                if (artistPresets.isNotEmpty()) {
+                if (isArtistPage && artistMixes.isNotEmpty()) {
+                    item {
+                        Column {
+                            ArtistSectionTitle(str("artist_mixes_title"), onOpen = null)
+                            com.alananasss.kittytune.ui.common.ScrollableLazyRow(
+                                contentPadding = PaddingValues(horizontal = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            ) {
+                                items(artistMixes.size) { index ->
+                                    ArtistMixCard(artistMixes[index], accentIndex = index) { tracks ->
+                                        playerViewModel.playPlaylist(tracks, 0, artistPlaybackContext, respectShuffle = false)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (artistPresets.isNotEmpty()) {
                     item {
                         ProfileHorizontalCarouselRow(
                             title = str("artist_presets_title"),
@@ -461,6 +570,12 @@ fun ProfileScreen(
                         ) { preset ->
                             ArtistPresetCard(preset)
                         }
+                    }
+                }
+
+                if (isArtistPage) {
+                    item(key = "artist_clips") {
+                        ArtistClipsSection(user.username.orEmpty(), playerViewModel)
                     }
                 }
 
@@ -486,7 +601,7 @@ fun ProfileScreen(
                     }
                 }
 
-                if (profileViewModel.playlists.isNotEmpty()) {
+                if (!isArtistPage && profileViewModel.playlists.isNotEmpty()) {
                     item {
                         val name = user.username ?: str("generic_artist")
                         ProfileHorizontalCarouselRow(
@@ -498,26 +613,26 @@ fun ProfileScreen(
                     }
                 }
 
-                if (profileViewModel.likedTracks.isNotEmpty()) {
+                if (!isArtistPage && likedTracks.isNotEmpty()) {
                     item {
                         val name = user.username ?: str("generic_artist")
                         ProfileSectionTitle(title = str("profile_likes_by_user", name), showMore = true, onMoreClick = { onNavigate("profile_collection:${user.id}:likes") })
                     }
-                    itemsIndexed(profileViewModel.likedTracks.take(3)) { index, track ->
-                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, profileViewModel.likedTracks, null, showPlays = false, showDate = true)
+                    itemsIndexed(likedTracks.take(3)) { index, track ->
+                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, likedTracks, null, showPlays = false, showDate = true)
                     }
                 }
 
-                if (profileViewModel.repostedTracks.isNotEmpty()) {
+                if (!isArtistPage && repostedTracks.isNotEmpty()) {
                     item {
                         ProfileSectionTitle(title = str("profile_tab_reposts"), showMore = true, onMoreClick = { onNavigate("profile_collection:${user.id}:reposts") })
                     }
-                    itemsIndexed(profileViewModel.repostedTracks.take(5)) { index, track ->
-                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, profileViewModel.repostedTracks, null, showPlays = false, showDate = true)
+                    itemsIndexed(repostedTracks.take(5)) { index, track ->
+                        ProfileTrackItem(track, index, playerViewModel, downloadProgress, repostedTracks, null, showPlays = false, showDate = true)
                     }
                 }
 
-                if (profileViewModel.userComments.isNotEmpty()) {
+                if (!isArtistPage && profileViewModel.userComments.isNotEmpty()) {
                     item {
                         ProfileSectionTitle(
                             title = str("profile_tab_comments"),
@@ -541,12 +656,31 @@ fun ProfileScreen(
                     }
                 }
 
-                if (profileViewModel.similarArtists.isNotEmpty()) {
+                // What an artist has made of the platform besides their music (their playlists, what they liked and
+                // reposted, what they commented) is rarely what somebody opened their page for: a row of buttons
+                // at the foot, not five reposted songs of other people between their music and the artists like them.
+                if (isArtistPage) {
+                    val entries = listOfNotNull(
+                        (if (user.trackCount > 0) user.trackCount else profileViewModel.allTracks.size).takeIf { it > 0 }?.let { ArtistMoreEntry(Icons.Rounded.MusicNote, str("profile_tab_tracks"), it, "tracks") },
+                        (if (user.playlistCount > 0) user.playlistCount else profileViewModel.playlists.size).takeIf { it > 0 }?.let { ArtistMoreEntry(Icons.Rounded.QueueMusic, str("artist_more_playlists"), it, "playlists") },
+                        (if (user.likesCount > 0) user.likesCount else profileViewModel.likedTracks.size).takeIf { it > 0 }?.let { ArtistMoreEntry(Icons.Rounded.FavoriteBorder, str("profile_tab_likes"), it, "likes") },
+                        profileViewModel.repostedTracks.size.takeIf { it > 0 }?.let { ArtistMoreEntry(Icons.Rounded.Repeat, str("profile_tab_reposts"), it, "reposts") },
+                        profileViewModel.userComments.size.takeIf { it > 0 }?.let { ArtistMoreEntry(Icons.AutoMirrored.Rounded.Comment, str("profile_tab_comments"), it, "comments") },
+                    )
+                    if (entries.isNotEmpty()) {
+                        item(key = "artist_more") {
+                            ArtistMoreRow(entries) { section -> onNavigate("profile_collection:${user.id}:$section") }
+                        }
+                    }
+                }
+
+                if (similarArtists.isNotEmpty()) {
                     item { Spacer(Modifier.height(24.dp)) }
                     item {
                         ProfileHorizontalCarouselRow(
                             title = str("profile_similar_artists"),
-                            items = profileViewModel.similarArtists
+                            // The biggest neighbours first: the order SoundCloud gave read as random (issue #66).
+                            items = similarArtists.sortedByDescending { it.followersCount }
                         ) { artist ->
                             ArtistCircle(artist) { onNavigate(artist.profileNavId) }
                         }
@@ -576,28 +710,21 @@ fun ProfileScreen(
                 actions = {
                     if (profileViewModel.isCurrentUser) {
                         AnimatedVisibility(visible = showBarBackground, enter = fadeIn(), exit = fadeOut()) {
-                            IconButton(onClick = { showEditSheet = true }) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { showEditSheet = true }) {
                                 Icon(Icons.Outlined.Edit, str("profile_edit"), tint = contentColor)
                             }
                         }
-                    } else {
-                        IconButton(onClick = { DownloadManager.toggleSaveArtist(user) },
-                            colors = IconButtonDefaults.iconButtonColors(containerColor = if (showBarBackground) Color.Transparent else Color.Black.copy(alpha = 0.3f), contentColor = if (isArtistSaved != null) Color(0xFFFF4081) else contentColor)
+                    } else if (showBarBackground) {
+                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = { DownloadManager.toggleSaveArtist(user) },
+                            colors = IconButtonDefaults.iconButtonColors(containerColor = if (showBarBackground) Color.Transparent else Color.Black.copy(alpha = 0.3f), contentColor = if (isArtistSaved != null) MaterialTheme.colorScheme.primary else contentColor)
                         ) {
                             Icon(if (isArtistSaved != null) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder, str("btn_follow"))
                         }
                     }
 
-                    IconButton(onClick = {
-                            val cleanUsername = user.username?.replace(" ", "")?.lowercase() ?: "user"
-                            val shareUrl = user.permalinkUrl ?: if (profileViewModel.isSpotifyProfile) {
-                                "https://open.spotify.com/artist/${user.permalink}"
-                            } else {
-                                "https://soundcloud.com/$cleanUsername"
-                            }
-                            val selection = java.awt.datatransfer.StringSelection(shareUrl)
-                            java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(selection, selection)
-                        },
+                    var showShare by remember { mutableStateOf(false) }
+                    if (showShare) ArtistShareDialog(rememberArtistShareCard(user, profileViewModel), onDismiss = { showShare = false })
+                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = { showShare = true },
                         colors = IconButtonDefaults.iconButtonColors(containerColor = if (showBarBackground) Color.Transparent else Color.Black.copy(alpha = 0.3f), contentColor = contentColor)
                     ) {
                         Icon(Icons.Outlined.Share, str("btn_share"))
@@ -606,6 +733,10 @@ fun ProfileScreen(
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = barColor, titleContentColor = MaterialTheme.colorScheme.onSurface, actionIconContentColor = MaterialTheme.colorScheme.onSurface),
                 modifier = Modifier.align(Alignment.TopCenter).zIndex(1f)
             )
+
+            if (showAbout) {
+                ArtistAboutDialog(user = user, onDismiss = { showAbout = false }, playerViewModel = playerViewModel)
+            }
 
             if (showEditSheet) {
                 EditProfileDialog(
@@ -711,7 +842,7 @@ fun ModernProfileHeader(
     val bgModel = if (user.bannerUrl != null) user.bannerUrl else if (!user.avatarUrl.isDefaultAvatar()) user.avatarUrl else null
     val showVideo = hasMotionVideo && !artistVideoUrl.isNullOrBlank()
 
-    Box(modifier = Modifier.fillMaxWidth().height(420.dp).clipToBounds()) {
+    Box(modifier = Modifier.fillMaxWidth().height(if (isCurrentUser) 560.dp else 420.dp).clipToBounds()) {
         if (bgModel != null || showVideo) {
             Box(modifier = Modifier.fillMaxSize()) {
                 if (bgModel != null) {
@@ -731,7 +862,7 @@ fun ModernProfileHeader(
                 if (showVideo && !artistVideoUrl.isNullOrBlank()) {
                     CanvasVideo(
                         canvasUrl = artistVideoUrl,
-                        isPlaying = true,
+                        isPlaying = playerViewModel.uiIsPlaying,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -850,9 +981,8 @@ fun ModernProfileHeader(
                     Button(
                         onClick = {
                             if (profileViewModel.popularTracks.isNotEmpty()) {
-                                playerViewModel.playPlaylist(
-                                    tracks = profileViewModel.popularTracks.toList().shuffled(),
-                                    startIndex = 0,
+                                playerViewModel.playPlaylistShuffled(
+                                    tracks = profileViewModel.popularTracks.toList(),
                                     context = artistContext
                                 )
                             }
@@ -922,13 +1052,25 @@ fun ModernProfileHeader(
                         Text(str("history_title"), fontWeight = FontWeight.SemiBold)
                     }
                 }
+                Spacer(Modifier.height(10.dp))
+                com.alananasss.kittytune.ui.profile.passport.MusicPassportButton(
+                    onClick = { onNavigate("music_passport") },
+                )
+                Spacer(Modifier.height(16.dp))
+                // What the listener has, as numbers to open: it was a page of buttons with nothing about the person.
+                OwnProfileStats(
+                    tracks = user.trackCount,
+                    likes = if (user.likesCount > 0) user.likesCount else profileViewModel.likedTracks.size,
+                    playlists = if (user.playlistCount > 0) user.playlistCount else profileViewModel.playlists.size,
+                    reposts = profileViewModel.repostedTracks.size,
+                    onOpen = { section -> onNavigate("profile_collection:${user.id}:$section") },
+                )
             } else {
                 if (user.trackCount > 0) {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         Button(shapes = ButtonDefaults.shapes(), onClick = {
-                                playerViewModel.playPlaylist(
-                                    tracks = profileViewModel.allTracks.toList().shuffled(),
-                                    startIndex = 0,
+                                playerViewModel.playPlaylistShuffled(
+                                    tracks = profileViewModel.allTracks.toList(),
                                     context = artistContext
                                 )
                             },
@@ -1173,7 +1315,7 @@ fun EditProfileDialog(
 }
 
 @Composable
-fun FullListScreen(
+internal fun FullListScreen(
     title: String,
     tracks: List<Track>,
     onBack: () -> Unit,
@@ -1181,12 +1323,27 @@ fun FullListScreen(
     downloadProgress: Map<Long, Int>,
     context: PlaybackContext?,
     isLoading: Boolean = false,
-    showPlays: Boolean = true
+    showPlays: Boolean = true,
+    /** Orders the list can be put in; none leaves it as given. [initialSort] is the one it opens in. */
+    sorts: List<ArtistOrder.TrackSort> = emptyList(),
+    initialSort: ArtistOrder.TrackSort? = null,
+    /** The songs shown as popular on the page, which the "now" order starts with. */
+    cardOrder: List<Track> = emptyList(),
+    hasMore: Boolean = false,
+    isLoadingMore: Boolean = false,
+    onLoadMore: () -> Unit = {},
 ) {
     var searchQuery by remember { mutableStateOf("") }
+    var sort by remember { mutableStateOf(initialSort ?: sorts.firstOrNull()) }
+    // Content filtering (issue #41): the sort, search and queue below all read
+    // this, so blocked tracks never surface in full-list pages.
+    val visibleTracks = rememberFilteredTracks(tracks)
+    val ordered = remember(visibleTracks, sort, cardOrder) {
+        sort?.takeIf { sorts.isNotEmpty() }?.let { ArtistOrder.sortTracks(it, visibleTracks, cardOrder) } ?: visibleTracks
+    }
 
-    val filteredTracks = remember(tracks, searchQuery) {
-        if (searchQuery.isBlank()) tracks else tracks.filter {
+    val filteredTracks = remember(ordered, searchQuery) {
+        if (searchQuery.isBlank()) ordered else ordered.filter {
             (it.title ?: "").contains(searchQuery, ignoreCase = true) ||
             (it.user?.username ?: "").contains(searchQuery, ignoreCase = true)
         }
@@ -1205,6 +1362,11 @@ fun FullListScreen(
         topBar = {
             TopAppBar(
                 title = { Text(title, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = onBack, shapes = IconButtonDefaults.shapes()) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = str("btn_back"))
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
         },
@@ -1225,7 +1387,7 @@ fun FullListScreen(
                     ) {
                         Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(str("btn_play"), fontWeight = FontWeight.Bold)
                     }
-                    FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { playerViewModel.playPlaylist(filteredTracks.shuffled(), context = context) },
+                    FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { playerViewModel.playPlaylistShuffled(filteredTracks, context = context) },
                         modifier = Modifier.weight(1f).height(44.dp)
                     ) {
                         Icon(Icons.Default.Shuffle, null); Spacer(Modifier.width(8.dp)); Text(str("btn_shuffle"), fontWeight = FontWeight.Bold)
@@ -1235,7 +1397,7 @@ fun FullListScreen(
 
             if (isLoading) {
                 items(10) { TrackListItemShimmer() }
-            } else if (tracks.isNotEmpty()) {
+            } else if (visibleTracks.isNotEmpty()) {
                 item(key = "search_and_sort") {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 4.dp),
@@ -1250,7 +1412,7 @@ fun FullListScreen(
                             leadingIcon = { Icon(Icons.Default.Search, null) },
                             trailingIcon = {
                                 if (searchQuery.isNotEmpty()) {
-                                    IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Default.Close, null) }
+                                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = { searchQuery = "" }) { Icon(Icons.Default.Close, null) }
                                 }
                             },
                             singleLine = true,
@@ -1259,6 +1421,15 @@ fun FullListScreen(
                                 unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
                             ),
                             modifier = Modifier.fillMaxWidth().trackTextInput()
+                        )
+                    }
+                    if (sorts.isNotEmpty()) {
+                        SortChips(
+                            options = sorts,
+                            selected = sort ?: sorts.first(),
+                            labelOf = { str(it.labelKey) },
+                            onSelect = { sort = it },
+                            sidePadding = 24.dp,
                         )
                     }
                     Spacer(Modifier.height(8.dp))
@@ -1284,6 +1455,12 @@ fun FullListScreen(
                 }
 
                 itemsIndexed(filteredTracks) { index, track ->
+                    if (hasMore && !isLoadingMore && index >= filteredTracks.size - 5) {
+                        LaunchedEffect(filteredTracks.size, isLoadingMore) {
+                            onLoadMore()
+                        }
+                    }
+
                     val progress = downloadProgress[track.id]
                     val isDownloading = progress != null
                     val isDownloaded by produceState(false, track.id, downloadProgress) {
@@ -1292,7 +1469,7 @@ fun FullListScreen(
 
                     com.alananasss.kittytune.ui.library.TrackTableItem(
                         track = track,
-                        currentlyPlayingTrack = playerViewModel.currentTrack,
+                        currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
                         index = index,
                         isDownloading = isDownloading,
                         isDownloaded = isDownloaded,
@@ -1311,6 +1488,17 @@ fun FullListScreen(
                         onAlbumClick = { albumId -> playerViewModel.navigateToPlaylistId = albumId },
                         onArtistClick = { playerViewModel.navigateToTrackArtist(it) }
                     )
+                }
+
+                if (isLoadingMore) {
+                    item(key = "full_list_loading_more") {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularWavyProgressIndicator(modifier = Modifier.size(28.dp))
+                        }
+                    }
                 }
             } else {
                 item(key = "empty_tracks") {
@@ -1344,7 +1532,7 @@ fun ProfileTrackItem(
 
     com.alananasss.kittytune.ui.library.TrackTableItem(
         track = track,
-        currentlyPlayingTrack = playerViewModel.currentTrack,
+        currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
         index = index,
         isDownloading = isDownloading,
         isDownloaded = isDownloaded,
@@ -1388,6 +1576,8 @@ fun <T> ProfileHorizontalCarouselRow(
     items: List<T>,
     showMore: Boolean = false,
     onMoreClick: () -> Unit = {},
+    /** An artist's page: the title itself opens the section, with an arrow after the words. */
+    onTitleClick: (() -> Unit)? = null,
     itemContent: @Composable (T) -> Unit
 ) {
     val listState = rememberLazyListState()
@@ -1409,11 +1599,15 @@ fun <T> ProfileHorizontalCarouselRow(
     }
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        ProfileSectionTitle(
-            title = title,
-            showMore = showMore,
-            onMoreClick = onMoreClick
-        )
+        if (onTitleClick != null) {
+            ArtistSectionTitle(title, onOpen = onTitleClick)
+        } else {
+            ProfileSectionTitle(
+                title = title,
+                showMore = showMore,
+                onMoreClick = onMoreClick
+            )
+        }
         Box(modifier = Modifier.fillMaxWidth()) {
             LazyRow(
                 state = listState,
@@ -1422,6 +1616,7 @@ fun <T> ProfileHorizontalCarouselRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .horizontalMouseSwipe(listState, enabled = isScrollable)
+                    .fadedHorizontalEdges(listState)
             ) {
                 items(items) { item ->
                     itemContent(item)
@@ -1443,7 +1638,7 @@ fun <T> ProfileHorizontalCarouselRow(
                             ),
                         contentAlignment = Alignment.CenterStart
                     ) {
-                        IconButton(
+                        IconButton(shapes = IconButtonDefaults.shapes(),
                             onClick = {
                                 coroutineScope.launch {
                                     val first = listState.firstVisibleItemIndex
@@ -1480,7 +1675,7 @@ fun <T> ProfileHorizontalCarouselRow(
                             ),
                         contentAlignment = Alignment.CenterEnd
                     ) {
-                        IconButton(
+                        IconButton(shapes = IconButtonDefaults.shapes(),
                             onClick = {
                                 coroutineScope.launch {
                                     val first = listState.firstVisibleItemIndex
@@ -1760,22 +1955,14 @@ fun UserCommentItem(
                     loc.getDisplayLanguage(loc).replaceFirstChar { if (it.isLowerCase()) it.titlecase(loc) else it.toString() }
                 }
 
-                var isTargetLanguage by remember(comment.body, langCode) { mutableStateOf(false) }
-                LaunchedEffect(comment.body, langCode) {
-                    val cleanText = comment.body.replace(Regex("[^\\p{L}\\p{Nd}\\s]"), "").trim()
-                    if (cleanText.isBlank()) {
-                        isTargetLanguage = true
-                    } else {
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            val language = com.alananasss.kittytune.util.LanguageDetection.identifyLanguage(cleanText)
-                            if (language == langCode || language == "und") {
-                                isTargetLanguage = true
-                            }
-                        }
+                // Hidden until the detector has answered, so it never flashes up on a comment already in the reader's language.
+                val needsTranslation by androidx.compose.runtime.produceState(false, comment.body, langCode) {
+                    value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        com.alananasss.kittytune.util.LanguageDetection.needsTranslation(comment.body, langCode)
                     }
                 }
 
-                if (translatedText == null && !isTranslating && !isTargetLanguage) {
+                if (translatedText == null && !isTranslating && needsTranslation) {
                     Text(
                         text = str("comment_translate", langName),
                         style = MaterialTheme.typography.labelMedium,
@@ -1921,6 +2108,9 @@ fun getRelativeTime(dateStr: String?): String {
     }
 }
 
+/** Sections of a profile that open as a grid of releases rather than a list of songs. */
+private val RELEASE_SECTIONS = setOf("albums", "singles", "compilations", "playlists", "releases")
+
 @Composable
 fun ProfileCollectionScreen(
     userId: String,
@@ -1928,7 +2118,7 @@ fun ProfileCollectionScreen(
     onBackClick: () -> Unit,
     playerViewModel: PlayerViewModel
 ) {
-    val profileViewModel: ProfileViewModel = viewModel(key = "profile_coll_$userId") { ProfileViewModel(AppInstance.application) }
+    val profileViewModel: ProfileViewModel = viewModel(key = "profile_$userId") { ProfileViewModel(AppInstance.application) }
 
     LaunchedEffect(userId) {
         userId.toLongOrNull()?.let { id ->
@@ -1957,7 +2147,49 @@ fun ProfileCollectionScreen(
             CircularWavyProgressIndicator(modifier = Modifier.size(36.dp))
         }
     } else {
+        val openRelease: (Playlist) -> Unit = { playlist ->
+            playerViewModel.navigateToPlaylistId = if (playlist.urn?.contains("spotify") == true) playlist.urn!! else playlist.id.toString()
+        }
         when {
+            section == "releases_all" -> {
+                val records = (profileViewModel.albums + profileViewModel.singles + profileViewModel.compilations).distinctBy { it.id }
+                // Content filtering (issue #41): Song releases of blocked tracks
+                // are hidden; Record releases are playlists and stay.
+                val visibleSongs = rememberFilteredTracks(profileViewModel.allTracks.toList())
+                AllReleasesScreen(
+                    title = str("artist_new_releases"),
+                    releases = ArtistRelease.latestOf(visibleSongs, records, count = Int.MAX_VALUE),
+                    onBack = onBackClick,
+                    onOpen = { release ->
+                        when (release) {
+                            is ArtistRelease.Song -> playerViewModel.playPlaylist(listOf(release.track), 0, artistPlaybackContext)
+                            is ArtistRelease.Record -> openRelease(release.playlist)
+                        }
+                    },
+                    hasMore = profileViewModel.isSpotifyProfile && profileViewModel.hasMoreDiscography(),
+                    onLoadMore = { profileViewModel.loadMoreDiscography() },
+                )
+            }
+            // Covers, not a line of five: every album, single or compilation, or all of them as releases.
+            section in RELEASE_SECTIONS -> {
+                val (title, releases) = when (section) {
+                    "albums" -> str("profile_tab_albums") to profileViewModel.albums.toList()
+                    "singles" -> str("spotify_singles_eps") to profileViewModel.singles.toList()
+                    "compilations" -> str("spotify_compilations") to profileViewModel.compilations.toList()
+                    "playlists" -> str("profile_playlists_by_user", user?.username ?: str("generic_artist")) to profileViewModel.playlists.toList()
+                    else -> str("artist_new_releases") to (profileViewModel.albums + profileViewModel.singles + profileViewModel.compilations)
+                        .distinctBy { it.id }
+                }
+                ReleaseGridScreen(
+                    title = title,
+                    releases = releases,
+                    initialSort = if (section == "playlists") ArtistOrder.ReleaseSort.LIKES else ArtistOrder.ReleaseSort.NEWEST,
+                    onBack = onBackClick,
+                    onOpen = openRelease,
+                    hasMore = profileViewModel.isSpotifyProfile && section != "playlists" && profileViewModel.hasMoreDiscography(),
+                    onLoadMore = { profileViewModel.loadMoreDiscography() },
+                )
+            }
             section == "comments" -> FullCommentListScreen(
                 comments = profileViewModel.userComments,
                 onBack = onBackClick,
@@ -1966,10 +2198,17 @@ fun ProfileCollectionScreen(
             )
             else -> {
                 val (title, list) = when (section) {
-                    "popular" -> str("profile_tab_popular") to profileViewModel.popularTracks.toList()
+                    // Every song of theirs. It opens in the order the card's popular songs are in, then by what is
+                    // played now, not by plays of all time, which put the song that had longest to collect them first;
+                    // the chips below the search change that (round 2 of the tester's list, item 8).
+                    "popular" -> str("profile_tab_popular") to (profileViewModel.popularTracks + profileViewModel.allTracks)
+                        .distinctBy { it.id }
+                    // The artist's newest songs: a page of releases when the artist has none of their own, since a
+                    // new single of theirs is a song first.
+                    "latest" -> str("artist_new_releases") to profileViewModel.allTracks.toList()
                     "tracks" -> str("profile_tab_tracks") to profileViewModel.allTracks.toList()
                     "reposts" -> str("profile_tab_reposts") to profileViewModel.repostedTracks.toList()
-                    "likes" -> str("profile_tab_likes", user?.username ?: "") to profileViewModel.likedTracks.toList()
+                    "likes" -> str("profile_likes_by_user", user?.username ?: "") to profileViewModel.likedTracks.toList()
                     else -> "" to emptyList<Track>()
                 }
                 FullListScreen(
@@ -1980,7 +2219,34 @@ fun ProfileCollectionScreen(
                     downloadProgress = downloadProgress,
                     context = if (section == "likes" || section == "reposts") null else artistPlaybackContext,
                     isLoading = profileViewModel.isLoading,
-                    showPlays = section != "likes" && section != "reposts"
+                    showPlays = section != "likes" && section != "reposts",
+                    sorts = when (section) {
+                        "popular" -> ArtistOrder.TrackSort.entries
+                        "latest", "tracks" -> listOf(ArtistOrder.TrackSort.NEWEST, ArtistOrder.TrackSort.OLDEST, ArtistOrder.TrackSort.NOW, ArtistOrder.TrackSort.ALL_TIME)
+                        else -> emptyList()
+                    },
+                    initialSort = when (section) {
+                        "popular" -> ArtistOrder.TrackSort.NOW
+                        "latest", "tracks" -> ArtistOrder.TrackSort.NEWEST
+                        else -> null
+                    },
+                    cardOrder = if (section == "popular") profileViewModel.popularTracks.toList() else emptyList(),
+                    hasMore = when (section) {
+                        "likes" -> profileViewModel.hasMoreLikes()
+                        "tracks" -> profileViewModel.hasMoreTracks()
+                        else -> false
+                    },
+                    isLoadingMore = when (section) {
+                        "likes" -> profileViewModel.isLikesLoadingMore
+                        "tracks" -> profileViewModel.isTracksLoadingMore
+                        else -> false
+                    },
+                    onLoadMore = {
+                        when (section) {
+                            "likes" -> profileViewModel.loadMoreLikes()
+                            "tracks" -> profileViewModel.loadMoreTracks()
+                        }
+                    },
                 )
             }
         }
@@ -2143,5 +2409,75 @@ fun ArtistPresetCard(preset: ArtistPresetItem) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(horizontal = 8.dp)
         )
+    }
+}
+
+
+/** Everything about the artist, from their page's menu or the header's "more". */
+@Composable
+private fun ArtistAboutDialog(user: User, onDismiss: () -> Unit, playerViewModel: PlayerViewModel) {
+    val profile = com.alananasss.kittytune.ui.common.rememberArtistProfile(user.username)
+    val text = user.description?.takeIf { it.isNotBlank() } ?: profile?.biography.orEmpty()
+    val uriHandler = LocalUriHandler.current
+    com.alananasss.kittytune.core.EscapableAlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(user.username ?: str("artist_about"), fontWeight = FontWeight.Bold) },
+        text = {
+            Column(Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+                profile?.monthlyListeners?.let {
+                    Text(
+                        com.alananasss.kittytune.ui.common.monthlyListenersLabel(it),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                }
+                ExpandableDescription(
+                    text = text,
+                    onUrlClick = { url -> uriHandler.openUri(url) },
+                    onMentionClick = { username -> playerViewModel.resolveAndNavigateToArtist(username.removePrefix("@")) },
+                )
+            }
+        },
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_close")) } },
+    )
+}
+
+/** Four numbers for the listener's own page, each one opening what it counts. */
+@Composable
+private fun OwnProfileStats(tracks: Int, likes: Int, playlists: Int, reposts: Int, onOpen: (String) -> Unit) {
+    val items = listOf(
+        Triple(tracks, str("profile_tracks"), "tracks"),
+        Triple(likes, str("profile_tab_likes"), "likes"),
+        Triple(playlists, str("artist_more_playlists"), "playlists"),
+        Triple(reposts, str("profile_tab_reposts"), "reposts"),
+    )
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        items.forEach { (count, label, section) ->
+            Surface(
+                onClick = { onOpen(section) },
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                modifier = Modifier.weight(1f),
+            ) {
+                Column(Modifier.padding(vertical = 14.dp, horizontal = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        NumberFormat.getIntegerInstance(com.alananasss.kittytune.core.Strings.locale()).format(count),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Black,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
     }
 }

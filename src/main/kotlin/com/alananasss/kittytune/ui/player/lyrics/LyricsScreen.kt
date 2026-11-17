@@ -60,6 +60,7 @@ import androidx.compose.material3.ContainedLoadingIndicator
     import androidx.compose.ui.draw.blur
     import androidx.compose.ui.draw.clip
     import androidx.compose.ui.draw.drawWithContent
+    import androidx.compose.ui.draw.drawBehind
     import androidx.compose.ui.draw.scale
     import androidx.compose.ui.graphics.BlendMode
     import androidx.compose.ui.graphics.Brush
@@ -125,7 +126,7 @@ import kotlin.math.roundToInt
         onClose: () -> Unit
     ) {
         val isSearching = viewModel.isSearchingLyrics
-        val currentTrack = viewModel.currentTrack
+        val currentTrack = viewModel.uiCurrentTrack
         var showQuickSettingsDialog by remember { mutableStateOf(false) }
         var showUploadYamlDialog by remember { mutableStateOf(false) }
 
@@ -254,7 +255,7 @@ import kotlin.math.roundToInt
                     } else {
                         if (viewModel.lyricsLines.isEmpty() && viewModel.rawPlainLyrics.isNullOrBlank()) {
                             if (viewModel.isLyricsLoading) {
-                                SearchingLyricsState()
+                                SearchingLyricsState(viewModel)
                             } else {
                                 EmptyLyricsState(onManualSearch = { viewModel.isSearchingLyrics = true })
                             }
@@ -393,14 +394,12 @@ import kotlin.math.roundToInt
     
     @Composable
     fun SyncedLyricsView(viewModel: PlayerViewModel) {
-        val currentPosition = viewModel.currentPosition
-        val adjustedPosition = currentPosition + viewModel.lyricsOffset
         val lyrics = viewModel.lyricsLines
         // Built on the line being sung, not on line one: the placement below runs after the first frame, and
         // that frame — the top of the song, mid-fade — was the jolt at every opening (issue #33, round 5).
-        val listState = key(viewModel.currentTrack?.id) {
+        val listState = key(viewModel.uiCurrentTrack?.id) {
             rememberLazyListState(
-                initialFirstVisibleItemIndex = LyricsUtils.activeLineIndex(lyrics, adjustedPosition).coerceAtLeast(0)
+                initialFirstVisibleItemIndex = LyricsUtils.activeLineIndex(lyrics, viewModel.uiCurrentPosition + viewModel.lyricsOffset).coerceAtLeast(0)
             )
         }
         val fontSize = viewModel.lyricsFontSize
@@ -412,45 +411,55 @@ import kotlin.math.roundToInt
 
         // Interpolated between the player's four-per-second reports so the word fill moves per frame.
         // Shared with the panel, which needs exactly the same thing for exactly the same reason
-        // (issue #33) — see [rememberSmoothPosition] for why the estimate is bounded.
+        // (issue #33) — see [rememberSmoothPosition] for why the estimate is bounded, and for why
+        // the State is handed on rather than read here.
+        //
+        // positionMs is a lambda so this composable doesn't recompose on every position tick (4–5×/sec).
+        // The smooth position is read via State<Float> in the draw phase only (audit Phase 3 CPU gain).
         val smoothDrawPosition = rememberSmoothPosition(
-            positionMs = currentPosition,
-            isPlaying = viewModel.isPlaying,
+            positionMs = { viewModel.uiCurrentPosition },
+            isPlaying = viewModel.uiIsPlaying,
             speed = viewModel.effectsState.speed,
         )
-    
+
         val fadeBrush = remember {
             Brush.verticalGradient(
                 0f to Color.Transparent,
-                0.15f to Color.Black,
+                0.04f to Color.Black,
                 0.85f to Color.Black,
                 1f to Color.Transparent
             )
         }
-    
-        val activeIndex = remember(adjustedPosition, lyrics) {
-            LyricsUtils.activeLineIndex(lyrics, adjustedPosition)
+
+        // Derived: the frame-clock position is recomputed every frame but observed only when the
+        // active line index actually changes. Computing the index from a per-frame value — as the
+        // `remember(adjustedPosition, lyrics)` this replaces did — recomposed the whole lyrics
+        // screen 4–5 times a second for the whole song (audit Phase 3 CPU gain).
+        val activeIndex by remember(lyrics) {
+            derivedStateOf { LyricsUtils.activeLineIndex(lyrics, viewModel.uiCurrentPosition + viewModel.lyricsOffset) }
         }
     
         // Reading along by hand wins for a while; the panel's copy of the lyrics follows the same
         // rule, which is why this lives in one place (issue #33).
-        val readingByHand = FollowActiveLine(listState, activeIndex, centred = true)
+        val readingByHand = FollowActiveLine(listState, activeIndex, centred = true, contentKey = lyrics.size to lyrics.firstOrNull()?.startTime)
         val focusIndex = rememberFocusLine(listState, activeIndex, readingByHand)
     
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val screenHeight = maxHeight
             val halfHeight = screenHeight / 2
-            val topPadding = halfHeight - 50.dp
+            val topPadding = halfHeight
     
             LazyColumn(
                 state = listState,
                 contentPadding = PaddingValues(top = topPadding, bottom = halfHeight),
                 modifier = Modifier
                     .fillMaxSize()
+                    .revealWhenPlaced(listState, activeIndex, contentKey = lyrics.size to lyrics.firstOrNull()?.startTime)
+                    .stopAtLastLine(listState)
                     .fadingEdge(fadeBrush),
                 verticalArrangement = Arrangement.spacedBy(24.dp)
             ) {
-                itemsIndexed(lyrics) { index, line ->
+                itemsIndexed(lyrics, key = { _, line -> "${line.startTime}-${line.endTime}" }) { index, line ->
                     val isActive = index == activeIndex
     
                     // Three ways to set the current line apart, asked for with screenshots of another
@@ -463,7 +472,9 @@ import kotlin.math.roundToInt
                         // Zero for every line until the song reaches the words: with no current line there
                         // is nothing to measure distance from, and shrinking everything would be wrong.
                         distance = if (focusIndex < 0) 0 else index - focusIndex,
-                        blurEnabled = viewModel.lyricsLineBlurEnabled,
+                        // Not while reading by hand: the lines being scrolled through are the ones the reader
+                        // wants to read, and they were the ones under the heaviest blur (issue #66).
+                        blurEnabled = viewModel.lyricsLineBlurEnabled && !readingByHand,
                     )
 
                     val scale by animateFloatAsState(treatment.scale, tween(400), label = "scale")
@@ -475,11 +486,6 @@ import kotlin.math.roundToInt
                     val lineInteractionSource = remember { MutableInteractionSource() }
                     val isHovered by lineInteractionSource.collectIsHoveredAsState()
     
-                    // The hover rule is drawn by [lyricUnderline] rather than set as a
-                    // TextDecoration: Skia underlines each font run separately, so a line that
-                    // falls back out of the variable font (Cyrillic, Arabic, CJK…) came out as a
-                    // broken dashed rule at mismatched thicknesses (issue #33).
-                    var hoverLayout by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
     
                     val hzAlignment = when(alignment) {
                         TextAlign.Left -> Alignment.Start
@@ -489,7 +495,7 @@ import kotlin.math.roundToInt
                     }
 
                     // For duet lines, override alignment per singer (normal style, no bubbles)
-                    val isDuetActive = viewModel.isDuetActiveForTrack(viewModel.currentTrack)
+                    val isDuetActive = viewModel.isDuetActiveForTrack(viewModel.uiCurrentTrack)
                     val effectiveSinger = if (isDuetActive) {
                         line.singer?.takeIf { it != LyricSinger.DEFAULT }
                             ?: when (line.agent?.trim()?.lowercase()) {
@@ -526,7 +532,22 @@ import kotlin.math.roundToInt
                                 start = if (effectiveSinger == LyricSinger.SINGER_2) 100.dp else 24.dp,
                                 end = if (effectiveSinger == LyricSinger.SINGER_1) 100.dp else 24.dp
                             )
-                            .scale(scale)
+                            .lyricHoverHighlight(isHovered, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f))
+                            // Grown from the side the line is aligned to. Scaled from its centre, a full-width
+                            // line grew past both edges by more than its padding, and the second singer's
+                            // right-aligned words ran off the screen (issue #66).
+                            .graphicsLayer {
+                                scaleX = scale
+                                scaleY = scale
+                                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(
+                                    pivotFractionX = when (lineHzAlignment) {
+                                        Alignment.Start -> 0f
+                                        Alignment.End -> 1f
+                                        else -> 0.5f
+                                    },
+                                    pivotFractionY = 0.5f,
+                                )
+                            }
                             .alpha(alpha)
                             // Only when there is something to blur: the modifier forces the line
                             // into its own layer, which is not worth paying for at 0.dp.
@@ -541,8 +562,8 @@ import kotlin.math.roundToInt
                                 // forget the offset that its own highlight applies.
                                 LyricsUtils.seekTargetFor(
                                     line = line,
-                                    lyricsOffsetMs = viewModel.lyricsOffset,
-                                    durationMs = viewModel.duration,
+                                    lyricsOffsetMs = viewModel.lyricsOffsetAtLyricTime(line.startTime),
+                                    durationMs = viewModel.uiDuration,
                                 )?.let(viewModel::seekTo)
                             }
                     ) {
@@ -555,15 +576,24 @@ import kotlin.math.roundToInt
                             lineHeight = (fontSize * 1.4).sp,
                             fontFamily = lyricsFontFamily
                         )
-                        val ruleColor =
-                            if (isActive) MaterialTheme.colorScheme.onSurface
-                            else MaterialTheme.colorScheme.onSurfaceVariant
-
-                        LyricLineText(
+                        if (line.isInstrumental && line.text.isBlank()) {
+                            // A long instrumental gap: the chosen indicator counts it down instead of an empty line.
+                            InstrumentalLineIndicator(
+                                style = viewModel.instrumentalIndicatorStyle,
+                                startMs = line.startTime,
+                                endMs = line.endTime,
+                                positionProvider = { smoothDrawPosition.value.toLong() + viewModel.lyricsOffset },
+                                textAlign = lineTextAlign,
+                                accentColor = MaterialTheme.colorScheme.onSurface,
+                                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else LyricLineText(
                             line = line,
                             isActive = isActive,
-                            // Interpolated, so the fill moves per frame rather than per report.
-                            positionMs = smoothDrawPosition + viewModel.lyricsOffset,
+                            // Interpolated, so the fill moves per frame rather than per report — and
+                            // read inside the fill's draw phase, so that per-frame motion redraws
+                            // the line instead of recomposing it.
+                            positionMs = { smoothDrawPosition.value + viewModel.lyricsOffset },
                             wordSync = viewModel.isWordSyncEnabled,
                             fillEffect = viewModel.isAppleMusicEffectEnabled,
                             activeStyle = lineFont.copy(fontWeight = FontWeight.ExtraBold),
@@ -572,16 +602,16 @@ import kotlin.math.roundToInt
                             inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant,
                             unsungColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                             textAlign = lineTextAlign,
-                            // The hover rule is drawn rather than set as a TextDecoration: Skia underlines
-                            // each font run separately, so a line that falls back out of the variable font
-                            // (Cyrillic, Arabic, CJK…) came out as a broken dashed rule.
-                            textModifier = Modifier.lyricUnderline(
-                                { hoverLayout },
-                                isHovered,
-                                fontSize,
-                                ruleColor,
-                            ),
-                            onTextLayout = { hoverLayout = it },
+                            // The top-to-bottom fill of a line-timed line, when the Sweep animation is chosen.
+                            sweep = if (viewModel.lyricsSweepEnabled) LyricSweepSpec(
+                                brightColor = MaterialTheme.colorScheme.onSurface,
+                                dimColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                                progress = {
+                                    val start = line.startTime.toFloat()
+                                    val end = line.endTime.toFloat().coerceAtLeast(start + 1f)
+                                    ((smoothDrawPosition.value + viewModel.lyricsOffset - start) / (end - start)).coerceIn(0f, 1f)
+                                },
+                            ) else null,
                         )
 
                         AnimatedVisibility(
@@ -603,18 +633,20 @@ import kotlin.math.roundToInt
                         }
 
                         AnimatedVisibility(
-                            visible = viewModel.isLyricsTranslationEnabled && !line.translation.isNullOrBlank(),
+                            visible = viewModel.isLyricsTranslationEnabled && !line.translation.isNullOrBlank() && !LyricsUtils.isDuplicateTranslation(line.text, line.translation),
                             enter = expandVertically() + fadeIn(),
                             exit = shrinkVertically() + fadeOut()
                         ) {
                             Text(
                                 text = line.translation ?: "",
+                                // Quieter than the words it sits under: lighter, smaller, and set a little looser, so it reads as a
+                                // gloss and not as a second line of the song.
                                 style = MaterialTheme.typography.headlineSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = (fontSize * 0.70f).sp,
-                                    lineHeight = (fontSize * 1.0f).sp
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = (fontSize * 0.60f).sp,
+                                    lineHeight = (fontSize * 0.88f).sp
                                 ),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
                                 textAlign = lineTextAlign,
                                 modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
                             )
@@ -676,13 +708,13 @@ import kotlin.math.roundToInt
         val fadeBrush = remember {
             Brush.verticalGradient(
                 0f to Color.Transparent,
-                0.15f to Color.Black,
+                0.04f to Color.Black,
                 0.85f to Color.Black,
                 1f to Color.Transparent
             )
         }
 
-        val listState = key(viewModel.currentTrack?.id) { rememberLazyListState() }
+        val listState = key(viewModel.uiCurrentTrack?.id) { rememberLazyListState() }
         val scrollScope = androidx.compose.runtime.rememberCoroutineScope()
         // Wheel and drag always win: the reader is following the words, and having the view creep
         // out from under them would be worse than no auto-scroll at all. Any manual scroll parks
@@ -697,8 +729,8 @@ import kotlin.math.roundToInt
             enabled = viewModel.isPlainAutoScrollEnabled,
             speed = viewModel.effectivePlainAutoScrollSpeed,
             lineCount = lines.size,
-            positionMs = { viewModel.currentPosition },
-            isPlaying = { viewModel.isPlaying },
+            positionMs = { viewModel.uiCurrentPosition },
+            isPlaying = { viewModel.uiIsPlaying },
             playbackSpeed = { viewModel.effectsState.speed },
             lastManualScrollMs = { lastUserScrollMs },
         )
@@ -708,6 +740,7 @@ import kotlin.math.roundToInt
                 state = listState,
                 modifier = Modifier
                     .fillMaxSize()
+                    .revealWhenPlaced(listState, activeIndex = -1, contentKey = lines)
                     .fadingEdge(fadeBrush)
                     .lyricsWheel(
                         listState = listState,
@@ -751,20 +784,9 @@ import kotlin.math.roundToInt
     }
     
     @Composable
-    fun SearchingLyricsState() {
-        Column(
-            modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            ContainedLoadingIndicator()
-            Spacer(Modifier.height(20.dp))
-            Text(
-                str("lyrics_searching"),
-                color = MaterialTheme.colorScheme.onSurface,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Medium
-            )
+    fun SearchingLyricsState(viewModel: PlayerViewModel) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            LyricsSearchingIndicator(com.alananasss.kittytune.ui.theme.rememberLyricsFontFamily(viewModel.lyricsFont))
         }
     }
 
@@ -825,328 +847,6 @@ import kotlin.math.roundToInt
         }
     }
     
-    @OptIn(ExperimentalMaterial3Api::class)
-    @Composable
-    fun SearchLyricsView(
-        viewModel: PlayerViewModel,
-        onCloseSearch: () -> Unit,
-        modifier: Modifier = Modifier
-    ) {
-        val focusManager = LocalFocusManager.current
-        var query by remember(viewModel.currentTrack?.id, viewModel.manualSearchQuery) {
-            mutableStateOf(viewModel.manualSearchQuery)
-        }
-
-        LaunchedEffect(viewModel.currentTrack?.id) {
-            if (viewModel.unifiedLyricSearchResults.isEmpty() && query.isNotBlank()) {
-                viewModel.searchLyricsManual(query, viewModel.manualSearchProvider)
-            }
-        }
-
-        // Themed rather than hard-coded black (issue #33): this view covers the whole player,
-        // so a flat black panel clashed with both the light theme and the cover-seeded palette.
-        Column(modifier = modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
-            val hasAutoLyrics = viewModel.lyricsLines.isNotEmpty() || !viewModel.rawPlainLyrics.isNullOrBlank()
-            if (hasAutoLyrics) {
-                Surface(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = str("lyrics_auto_found_title"),
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
-                            Text(
-                                text = str("lyrics_auto_found_desc"),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
-                            )
-                        }
-                        Spacer(Modifier.width(12.dp))
-                        Button(
-                            onClick = onCloseSearch,
-                            shapes = ButtonDefaults.shapes(),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.primary,
-                                contentColor = MaterialTheme.colorScheme.onPrimary
-                            ),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-                        ) {
-                            Text(str("lyrics_auto_found_use"), fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                }
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().padding(16.dp)
-            ) {
-                IconButton(onClick = onCloseSearch, shapes = IconButtonDefaults.shapes()) {
-                    Icon(
-                        Icons.Rounded.Close,
-                        str("btn_close"),
-                        tint = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-                OutlinedTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    modifier = Modifier
-                        .weight(1f)
-                        .trackTextInput()
-                        .escapeDismisses(onCloseSearch),
-                    placeholder = {
-                        Text(
-                            str("lyrics_search_hint"),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    },
-                    singleLine = true,
-                    shape = CircleShape,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
-                    ),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = {
-                        viewModel.searchLyricsManual(query, viewModel.manualSearchProvider)
-                        focusManager.clearFocus()
-                    })
-                )
-                IconButton(
-                    onClick = {
-                        viewModel.searchLyricsManual(query, viewModel.manualSearchProvider)
-                        focusManager.clearFocus()
-                    },
-                    shapes = IconButtonDefaults.shapes()
-                ) {
-                    Icon(
-                        Icons.Rounded.Search,
-                        str("search_hint"),
-                        tint = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-            }
-
-            // --- SÉLECTEUR DE FOURNISSEUR (MENU DÉROULANT) ---
-            val allProviders = remember {
-                val userOrder = viewModel.playerPrefs.getLyricsProviderOrder()
-                val all = (userOrder + com.alananasss.kittytune.data.lyrics.providers.PreferredLyricsProvider.entries).distinct()
-                val (enabled, disabled) = all.partition { viewModel.playerPrefs.getLyricsProviderEnabled(it) }
-                enabled + disabled
-            }
-            val currentProvider = allProviders.firstOrNull { it.name.equals(viewModel.manualSearchProvider, ignoreCase = true) }
-            var providerExpanded by remember { mutableStateOf(false) }
-
-            Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                OutlinedButton(
-                    onClick = { providerExpanded = true },
-                    shapes = ButtonDefaults.shapes(),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                    ),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                ) {
-                    Text(
-                        text = currentProvider?.displayName ?: "Auto",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Icon(
-                        Icons.Rounded.ArrowDropDown,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-
-                DropdownMenu(
-                    expanded = providerExpanded,
-                    onDismissRequest = { providerExpanded = false },
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                    tonalElevation = 2.dp,
-                ) {
-                    allProviders.forEach { provider ->
-                        val isActive = viewModel.manualSearchProvider.equals(provider.name, ignoreCase = true)
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    text = provider.displayName,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                )
-                            },
-                            onClick = {
-                                providerExpanded = false
-                                viewModel.searchLyricsManual(query, provider.name)
-                            },
-                            leadingIcon = if (isActive) ({
-                                Icon(
-                                    Icons.Rounded.Check,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }) else null
-                        )
-                    }
-                }
-            }
-
-            if (viewModel.isManualSearchLoading) {
-                LinearWavyProgressIndicator(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
-
-            val searchResults = remember(viewModel.unifiedLyricSearchResults.toList()) {
-                viewModel.unifiedLyricSearchResults.toList()
-            }
-
-            if (searchResults.isEmpty() && !viewModel.isManualSearchLoading) {
-                Box(
-                    modifier = Modifier.fillMaxSize().padding(32.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = str("no_results"),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            } else {
-                LazyColumn(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(items = searchResults, key = { it.id + it.provider }) { result ->
-                        Card(
-                            onClick = { viewModel.selectUnifiedLyricResult(result) },
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                                contentColor = MaterialTheme.colorScheme.onSurface
-                            ),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(16.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(result.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text(result.artistName, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    if (!result.albumName.isNullOrEmpty()) {
-                                        Text(result.albumName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    }
-                                }
-                                Spacer(Modifier.width(8.dp))
-                                Column(horizontalAlignment = Alignment.End) {
-                                    if (result.durationSec > 0.0) {
-                                        Text(
-                                            makeTimeString((result.durationSec * 1000).toLong()),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        if (result.hasLineSync) {
-                                            Icon(
-                                                Icons.Rounded.Timer,
-                                                str("lyrics_badge_line_sync"),
-                                                tint = MaterialTheme.colorScheme.tertiary,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                        if (result.hasWordSync) {
-                                            Icon(
-                                                Icons.Rounded.Verified,
-                                                str("lyrics_badge_word_sync"),
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    @Composable
-    fun SearchLyricsDialog(
-        viewModel: PlayerViewModel,
-        onDismiss: () -> Unit
-    ) {
-        BackHandler(onBack = onDismiss)
-        Dialog(
-            onDismissRequest = onDismiss,
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.5f))
-                    .escapeDismisses(onDismiss)
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = onDismiss
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                BoxWithConstraints(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier.escapeDismisses(onDismiss)
-                ) {
-                    val panelWidth = min(720.dp, maxWidth * 0.92f)
-                    val panelHeight = min(680.dp, maxHeight * 0.88f)
-                    Surface(
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surface,
-                        tonalElevation = 6.dp,
-                        modifier = Modifier
-                            .width(panelWidth)
-                            .height(panelHeight)
-                            .padding(8.dp)
-                            .clip(RoundedCornerShape(24.dp))
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
-                                onClick = {} // Stop click from bubbling to dismiss backdrop
-                            )
-                            .escapeDismisses(onDismiss)
-                    ) {
-                        SearchLyricsView(
-                            viewModel = viewModel,
-                            onCloseSearch = onDismiss,
-                            modifier = Modifier.escapeDismisses(onDismiss)
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-
-
     /**
      * The lyrics timing panel: how far the words are shifted against the song, nudged in tenths of a second.
      *
@@ -1182,7 +882,7 @@ import kotlin.math.roundToInt
                         color = scheme.onSurface,
                         modifier = Modifier.weight(1f),
                     )
-                    IconButton(onClick = onClose) {
+                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = onClose) {
                         Icon(Icons.Rounded.Close, contentDescription = str("btn_close"), tint = scheme.onSurfaceVariant)
                     }
                 }
@@ -1206,7 +906,7 @@ import kotlin.math.roundToInt
                     RepeatingIconButton(onClick = { onAdjust(OFFSET_STEP_MS) }, icon = Icons.Rounded.Add, tint = scheme.onSurface)
                 }
 
-                TextButton(
+                TextButton(shapes = ButtonDefaults.shapes(),
                     onClick = onReset,
                     enabled = offset != 0L,
                     modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 4.dp, end = 12.dp),
@@ -1263,1287 +963,6 @@ import kotlin.math.roundToInt
             }
         }
     }
-
-/**
- * How large the lyrics quick-settings panel is allowed to get.
- *
- * A cap rather than a size: the panel takes 94% of the window up to these, so it grows on a big screen
- * without ever running past the edges of a small one. Wide because the left column carries four-up button
- * groups whose labels have to fit on one line, tall because the alternative to scrolling inside itself was
- * being cut off by the bottom of the window.
- */
-private val QUICK_SETTINGS_MAX_WIDTH = 1080.dp
-private val QUICK_SETTINGS_MAX_HEIGHT = 940.dp
-
-@Composable
-fun QuickLyricsSettingsDialog(
-    viewModel: PlayerViewModel,
-    isFullScreen: Boolean = false,
-    isSidebar: Boolean = false,
-    onDismiss: () -> Unit
-) {
-    val prefs = remember { PlayerPreferences() }
-    val defaultFontSize = when {
-        isFullScreen -> 42f
-        isSidebar -> 22f
-        else -> 42f
-    }
-    val fontSize = when {
-        isFullScreen -> viewModel.lyricsFullScreenFontSize
-        isSidebar -> viewModel.lyricsSidebarFontSize
-        else -> viewModel.lyricsFontSize
-    }
-    val updateFontSize: (Float) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenFontSize(it)
-            isSidebar -> viewModel.updateLyricsSidebarFontSize(it)
-            else -> viewModel.updateLyricsFontSize(it)
-        }
-    }
-    val uiStyle = when {
-        isFullScreen -> viewModel.lyricsFullScreenUiStyle
-        isSidebar -> viewModel.lyricsSidebarUiStyle
-        else -> viewModel.lyricsUiStyle
-    }
-    val updateUiStyle: (com.alananasss.kittytune.data.local.LyricsUiStyle) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenUiStyle(it)
-            isSidebar -> viewModel.updateLyricsSidebarUiStyle(it)
-            else -> viewModel.updateLyricsUiStyle(it)
-        }
-    }
-    val alignment = when {
-        isFullScreen -> viewModel.lyricsFullScreenAlignment
-        isSidebar -> viewModel.lyricsSidebarAlignment
-        else -> viewModel.lyricsAlignment
-    }
-    val updateAlignment: (LyricsAlignment) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenAlignment(it)
-            isSidebar -> viewModel.updateLyricsSidebarAlignment(it)
-            else -> viewModel.updateLyricsAlignment(it)
-        }
-    }
-    val displayStyle = when {
-        isFullScreen -> viewModel.lyricsFullScreenDisplayStyle
-        isSidebar -> viewModel.lyricsSidebarDisplayStyle
-        else -> viewModel.lyricsDisplayStyle
-    }
-    val updateDisplayStyle: (LyricsDisplayStyle) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenDisplayStyle(it)
-            isSidebar -> viewModel.updateLyricsSidebarDisplayStyle(it)
-            else -> viewModel.updateLyricsDisplayStyle(it)
-        }
-    }
-    val lineSpacing = when {
-        isFullScreen -> viewModel.lyricsFullScreenLineSpacing
-        isSidebar -> viewModel.lyricsSidebarLineSpacing
-        else -> viewModel.lyricsLineSpacing
-    }
-    val updateLineSpacing: (Float) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenLineSpacing(it)
-            isSidebar -> viewModel.updateLyricsSidebarLineSpacing(it)
-            else -> viewModel.updateLyricsLineSpacing(it)
-        }
-    }
-    val horizontalMargin = when {
-        isFullScreen -> viewModel.lyricsFullScreenHorizontalMargin
-        isSidebar -> viewModel.lyricsSidebarHorizontalMargin
-        else -> viewModel.lyricsHorizontalMargin
-    }
-    val updateHorizontalMargin: (Float) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenHorizontalMargin(it)
-            isSidebar -> viewModel.updateLyricsSidebarHorizontalMargin(it)
-            else -> viewModel.updateLyricsHorizontalMargin(it)
-        }
-    }
-    val verticalOffset = when {
-        isFullScreen -> viewModel.lyricsFullScreenVerticalOffset
-        isSidebar -> viewModel.lyricsSidebarVerticalOffset
-        else -> viewModel.lyricsVerticalOffset
-    }
-    val updateVerticalOffset: (Float) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenVerticalOffset(it)
-            isSidebar -> viewModel.updateLyricsSidebarVerticalOffset(it)
-            else -> viewModel.updateLyricsVerticalOffset(it)
-        }
-    }
-    val activeScale = when {
-        isFullScreen -> viewModel.lyricsFullScreenActiveScale
-        isSidebar -> viewModel.lyricsSidebarActiveScale
-        else -> viewModel.lyricsActiveScale
-    }
-    val updateActiveScale: (Float) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenActiveScale(it)
-            isSidebar -> viewModel.updateLyricsSidebarActiveScale(it)
-            else -> viewModel.updateLyricsActiveScale(it)
-        }
-    }
-    val lineBlurEnabled = when {
-        isFullScreen -> viewModel.lyricsFullScreenLineBlurEnabled
-        isSidebar -> viewModel.lyricsSidebarLineBlurEnabled
-        else -> viewModel.lyricsLineBlurEnabled
-    }
-    val updateLineBlurEnabled: (Boolean) -> Unit = {
-        when {
-            isFullScreen -> viewModel.updateLyricsFullScreenLineBlurEnabled(it)
-            isSidebar -> viewModel.updateLyricsSidebarLineBlurEnabled(it)
-            else -> viewModel.updateLyricsLineBlurEnabled(it)
-        }
-    }
-    var preferLocal by remember { mutableStateOf(prefs.getLyricsPreferLocal()) }
-    val currentOffsetMs = viewModel.lyricsOffset
-    val currentOffsetSec = currentOffsetMs / 1000f
-
-    var enableTranslation by remember { mutableStateOf(prefs.getLyricsTranslationEnabled()) }
-    var targetLang by remember { mutableStateOf(prefs.getLyricsTranslationLang()) }
-    var showLangDialog by remember { mutableStateOf(false) }
-
-    if (showLangDialog) {
-        val systemLangCode = java.util.Locale.getDefault().language
-        val allLanguages = remember {
-            val locales = java.util.Locale.getISOLanguages()
-                .map { code ->
-                    val loc = java.util.Locale(code)
-                    code to loc.getDisplayLanguage(loc).replaceFirstChar { if (it.isLowerCase()) it.titlecase(loc) else it.toString() }
-                }
-                .filter { it.second.isNotBlank() && it.first.length == 2 }
-                .distinctBy { it.first }
-                .sortedBy { it.second }
-
-            val list = mutableListOf<Pair<String, String>>()
-            val systemLoc = locales.find { it.first == systemLangCode }
-            if (systemLoc != null) {
-                list.add(systemLoc.first to "${systemLoc.second} (${str("theme_system")})")
-            }
-            list.addAll(locales.filter { it.first != systemLangCode })
-            list
-        }
-
-        EscapableAlertDialog(
-            onDismissRequest = { showLangDialog = false },
-            title = { Text(str("pref_lyrics_translation_lang")) },
-            text = {
-                LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)) {
-                    items(allLanguages) { (code, name) ->
-                        Row(
-                            Modifier.fillMaxWidth().clickable { 
-                                targetLang = code
-                                showLangDialog = false 
-                                viewModel.setLyricsTranslationLanguage(code)
-                            }.padding(vertical = 12.dp), 
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            RadioButton(selected = (targetLang == code), onClick = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(name)
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = { showLangDialog = false }) { Text(str("btn_cancel")) } }
-        )
-    }
-
-    BackHandler(onBack = onDismiss)
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
-    ) {
-        // Sized against the window rather than fixed at 860 dp. Two columns of cards inside 860 left each
-        // segment of a four-up button group about forty dp of text, which is why "Gradient" was breaking
-        // across two lines in the middle of the word; and a panel taller than the window was simply cut off
-        // at the bottom edge instead of scrolling inside itself. `min` also copes with an unbounded
-        // measurement, where the fractions come back infinite and the caps are what is left.
-        BoxWithConstraints {
-            val panelWidth = min(QUICK_SETTINGS_MAX_WIDTH, maxWidth * 0.94f)
-            val panelHeight = min(QUICK_SETTINGS_MAX_HEIGHT, maxHeight * 0.94f)
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                tonalElevation = 6.dp,
-                modifier = Modifier.width(panelWidth).heightIn(max = panelHeight).padding(8.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .padding(24.dp)
-                        .verticalScroll(rememberScrollState()) 
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Rounded.Settings,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(28.dp)
-                            )
-                            Spacer(Modifier.width(12.dp))
-                            Text(
-                                text = str("pref_lyrics_title"),
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = onDismiss) {
-                            Icon(Icons.Rounded.Close, str("btn_close"))
-                        }
-                    }
-
-                    Spacer(Modifier.height(20.dp))
-
-                    // --- LAYOUT EN 2 COLONNES ---
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalAlignment = Alignment.Top
-                    ) {
-                    
-                        // ==========================================
-                        // COLONNE GAUCHE (Visuel & Synchro)
-                        // ==========================================
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            if (isFullScreen) {
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(
-                                                text = str("full_player_bg_style"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            // Beside the heading rather than beside the Apple Music button,
-                                            // because four buttons split this card between them and none of
-                                            // them has room for a dot. Only while that style is the one in
-                                            // use, since the aside is about that style.
-                                            if (viewModel.fullPlayerBgStyle ==
-                                                com.alananasss.kittytune.data.local.FullPlayerBgStyle.APPLE_MUSIC
-                                            ) {
-                                                com.alananasss.kittytune.ui.common.FunFactDot(
-                                                    str("full_player_bg_apple_music_fact")
-                                                )
-                                            }
-                                        }
-                                        Spacer(Modifier.height(10.dp))
-                                        ExpressiveConnectedButtonGroup(
-                                            fillMaxWidth = true,
-                                            // Four segments across one column of the panel: at the button's
-                                            // own 24 dp either side there is no room for "Apple Music" on a
-                                            // single line.
-                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
-                                            options = com.alananasss.kittytune.data.local.FullPlayerBgStyle.entries,
-                                            selectedOption = viewModel.fullPlayerBgStyle,
-                                            onOptionSelected = { viewModel.updateFullPlayerBgStyle(it) },
-                                            labelProvider = { style ->
-                                                val text = when (style) {
-                                                    com.alananasss.kittytune.data.local.FullPlayerBgStyle.APPLE_MUSIC -> str("full_player_bg_apple_music")
-                                                    com.alananasss.kittytune.data.local.FullPlayerBgStyle.BLUR -> str("full_player_bg_blur")
-                                                    com.alananasss.kittytune.data.local.FullPlayerBgStyle.GRADIENT -> str("full_player_bg_gradient")
-                                                    com.alananasss.kittytune.data.local.FullPlayerBgStyle.PURE_BLACK -> str("full_player_bg_pure_black")
-                                                }
-                                                Text(text, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                                            }
-                                        )
-
-                                        Spacer(Modifier.height(14.dp))
-                                        Text(
-                                            text = str("full_player_layout"),
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Spacer(Modifier.height(10.dp))
-                                        ExpressiveConnectedButtonGroup(
-                                            fillMaxWidth = true,
-                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
-                                            options = com.alananasss.kittytune.data.local.FullPlayerLayout.entries,
-                                            selectedOption = viewModel.fullPlayerLayout,
-                                            onOptionSelected = { viewModel.updateFullPlayerLayout(it) },
-                                            labelProvider = { layout ->
-                                                val text = when (layout) {
-                                                    com.alananasss.kittytune.data.local.FullPlayerLayout.LYRICS_RIGHT -> str("full_player_layout_right")
-                                                    com.alananasss.kittytune.data.local.FullPlayerLayout.LYRICS_LEFT -> str("full_player_layout_left")
-                                                    com.alananasss.kittytune.data.local.FullPlayerLayout.LYRICS_CENTRED -> str("full_player_layout_centred")
-                                                    com.alananasss.kittytune.data.local.FullPlayerLayout.COVER_AND_LINE -> str("full_player_layout_single_line")
-                                                }
-                                                Text(text, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                                            }
-                                        )
-
-                                        Spacer(Modifier.height(14.dp))
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = str("full_player_cover_zoom"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Text(
-                                                text = "${(viewModel.fullPlayerCoverScale * 100).toInt()}%",
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.primary
-                                            )
-                                        }
-                                        Spacer(Modifier.height(6.dp))
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { viewModel.updateFullPlayerCoverScale(viewModel.fullPlayerCoverScale - 0.05f) }) {
-                                                Icon(Icons.Rounded.Remove, null)
-                                            }
-                                            Slider(
-                                                value = viewModel.fullPlayerCoverScale,
-                                                onValueChange = { viewModel.updateFullPlayerCoverScale(it) },
-                                                valueRange = 0.6f..1.4f,
-                                                steps = 15,
-                                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                            )
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { viewModel.updateFullPlayerCoverScale(viewModel.fullPlayerCoverScale + 0.05f) }) {
-                                                Icon(Icons.Rounded.Add, null)
-                                            }
-                                        }
-
-                                    }
-                                }
-                            }
-
-
-                            // UI STYLE
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Text(
-                                        text = str("pref_lyrics_ui_style", "Style des paroles"),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(Modifier.height(10.dp))
-                                    ExpressiveConnectedButtonGroup(
-                                        fillMaxWidth = true,
-                                        options = com.alananasss.kittytune.data.local.LyricsUiStyle.entries,
-                                        selectedOption = uiStyle,
-                                        onOptionSelected = { updateUiStyle(it) },
-                                        labelProvider = { style ->
-                                            val text = when (style) {
-                                                com.alananasss.kittytune.data.local.LyricsUiStyle.ENHANCED -> str("pref_lyrics_ui_style_enhanced", "Apple Music")
-                                                com.alananasss.kittytune.data.local.LyricsUiStyle.CLASSIC -> str("pref_lyrics_ui_style_classic", "Classique")
-                                            }
-                                            Text(text, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                                        }
-                                    )
-                                    if (uiStyle != com.alananasss.kittytune.data.local.LyricsUiStyle.CLASSIC) {
-                                        Spacer(Modifier.height(12.dp))
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = when {
-                                                        isFullScreen -> str("pref_lyrics_fullscreen_line_blur_title", "Flou des lignes en plein écran")
-                                                        isSidebar -> str("pref_lyrics_sidebar_line_blur_title", "Lignes inactives floutées (Panneau latéral)")
-                                                        else -> str("pref_lyrics_central_line_blur_title", str("pref_lyrics_line_blur_title", "Lignes inactives floutées (Mode central)"))
-                                                    },
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                                Text(
-                                                    text = str("pref_lyrics_line_blur_desc", "Blur inactive lyric lines progressively"),
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                            Switch(
-                                                checked = lineBlurEnabled,
-                                                onCheckedChange = { updateLineBlurEnabled(it) }
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            // POLICE DES PAROLES
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Text(
-                                        text = str("pref_lyrics_font_title", "Police des paroles"),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(Modifier.height(10.dp))
-                                    val fonts = listOf(
-                                        com.alananasss.kittytune.data.local.LyricsFont.APPLE to str("pref_lyrics_font_apple_short", "Apple"),
-                                        com.alananasss.kittytune.data.local.LyricsFont.APP_DEFAULT to str("pref_lyrics_font_app_default_short", "Défaut")
-                                    )
-                                    ExpressiveConnectedButtonGroup(
-                                        fillMaxWidth = true,
-                                        options = fonts,
-                                        selectedOption = fonts.firstOrNull { it.first == viewModel.lyricsFont } ?: fonts.first(),
-                                        onOptionSelected = { viewModel.updateLyricsFont(it.first) },
-                                        labelProvider = { (_, label) ->
-                                            Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                                        }
-                                    )
-                                }
-                            }
-
-                            // 0. FOURNISSEUR
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Text(
-                                        text = str("pref_lyrics_provider_title"),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(Modifier.height(10.dp))
-                                    ExpressiveConnectedButtonGroup(
-                                        fillMaxWidth = true,
-                                        options = listOf(com.alananasss.kittytune.ui.player.LyricsProvider.MAX_QUALITY, com.alananasss.kittytune.ui.player.LyricsProvider.OPEN_SOURCE),
-                                        selectedOption = viewModel.lyricsProvider,
-                                        onOptionSelected = { viewModel.updateLyricsProvider(it) },
-                                        labelProvider = { prov ->
-                                            val text = when (prov) {
-                                                com.alananasss.kittytune.ui.player.LyricsProvider.MAX_QUALITY -> "Musixmatch"
-                                                com.alananasss.kittytune.ui.player.LyricsProvider.OPEN_SOURCE -> "LrcLib"
-                                            }
-                                            Text(text, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                                        }
-                                    )
-                                }
-                            }
-
-                            // 1. SYNCHRONISATION (SYNC OFFSET)
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Icon(Icons.Rounded.Timer, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                                            Spacer(Modifier.width(8.dp))
-                                            Text(
-                                                text = str("lyrics_sync"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        }
-                                        val sign = if (currentOffsetMs > 0) "+" else ""
-                                        val formattedOffset = String.format("%.2fs", currentOffsetSec)
-                                        Text(
-                                            text = "$sign$formattedOffset",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = if (currentOffsetMs != 0L) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-
-                                    Spacer(Modifier.height(12.dp))
-
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        ToggleButton(
-                                            checked = false,
-                                            onCheckedChange = { viewModel.adjustLyricsOffset(-1000L) },
-                                            shapes = ButtonGroupDefaults.connectedLeadingButtonShapes(),
-                                            modifier = Modifier.weight(1f)
-                                        ) { Text("-1s", style = MaterialTheme.typography.labelMedium) }
-
-                                        ToggleButton(
-                                            checked = false,
-                                            onCheckedChange = { viewModel.adjustLyricsOffset(-100L) },
-                                            shapes = ButtonGroupDefaults.connectedMiddleButtonShapes(),
-                                            modifier = Modifier.weight(1f)
-                                        ) { Text("-.1s", style = MaterialTheme.typography.labelMedium) }
-
-                                        ToggleButton(
-                                            checked = viewModel.lyricsOffset == 0L,
-                                            onCheckedChange = { viewModel.resetLyricsOffset() },
-                                            shapes = ButtonGroupDefaults.connectedMiddleButtonShapes(),
-                                            modifier = Modifier.weight(1f)
-                                        ) { 
-                                            Text("0s", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) 
-                                        }
-
-                                        ToggleButton(
-                                            checked = false,
-                                            onCheckedChange = { viewModel.adjustLyricsOffset(100L) },
-                                            shapes = ButtonGroupDefaults.connectedMiddleButtonShapes(),
-                                            modifier = Modifier.weight(1f)
-                                        ) { Text("+.1s", style = MaterialTheme.typography.labelMedium) }
-
-                                        ToggleButton(
-                                            checked = false,
-                                            onCheckedChange = { viewModel.adjustLyricsOffset(1000L) },
-                                            shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
-                                            modifier = Modifier.weight(1f)
-                                        ) { Text("+1s", style = MaterialTheme.typography.labelMedium) }
-                                    }
-                                }
-                            }
-
-                            // 2. TAILLE DU TEXTE
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = when {
-                                                isFullScreen -> str("pref_lyrics_fullscreen_size", "Size (full screen)")
-                                                isSidebar -> str("pref_lyrics_size_sidebar", "Size (side panel)")
-                                                else -> str("pref_lyrics_size_central", str("pref_lyrics_size", "Size (central mode)"))
-                                            },
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(
-                                                text = "${fontSize.roundToInt()} sp",
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.primary
-                                            )
-                                            Spacer(Modifier.width(6.dp))
-                                            IconButton(
-                                                onClick = { updateFontSize(defaultFontSize) },
-                                                modifier = Modifier.size(24.dp)
-                                            ) {
-                                                Icon(Icons.Rounded.RestartAlt, str("pref_lyrics_reset"), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-                                        }
-                                    }
-                                    Spacer(Modifier.height(6.dp))
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateFontSize((fontSize - 2f).coerceAtLeast(12f)) }) {
-                                            Icon(Icons.Rounded.Remove, null)
-                                        }
-                                        Slider(
-                                            value = fontSize,
-                                            onValueChange = { updateFontSize(it) },
-                                            valueRange = 12f..100f,
-                                            steps = 43,
-                                            modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                        )
-                                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateFontSize((fontSize + 2f).coerceAtMost(100f)) }) {
-                                            Icon(Icons.Rounded.Add, null)
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (uiStyle == com.alananasss.kittytune.data.local.LyricsUiStyle.ENHANCED) {
-                                // 2b. INTERVALLE ENTRE LIGNES (LINE SPACING)
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = if (isFullScreen) str("pref_lyrics_fullscreen_line_spacing_title", "Line Spacing (Fullscreen)") else str("pref_lyrics_line_spacing_title", "Line Spacing"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(
-                                                    text = "${lineSpacing.roundToInt()} dp",
-                                                    style = MaterialTheme.typography.titleMedium,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                                Spacer(Modifier.width(6.dp))
-                                                IconButton(
-                                                    onClick = { updateLineSpacing(0f) },
-                                                    modifier = Modifier.size(24.dp)
-                                                ) {
-                                                    Icon(Icons.Rounded.RestartAlt, str("pref_lyrics_reset"), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
-                                        }
-                                        Spacer(Modifier.height(6.dp))
-                                        val minSpacing = 0f
-                                        val maxSpacing = if (isFullScreen) 64f else 48f
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateLineSpacing((lineSpacing - 2f).coerceAtLeast(minSpacing)) }) {
-                                                Icon(Icons.Rounded.Remove, null)
-                                            }
-                                            Slider(
-                                                value = lineSpacing,
-                                                onValueChange = { updateLineSpacing(it) },
-                                                valueRange = minSpacing..maxSpacing,
-                                                steps = ((maxSpacing - minSpacing) / 2f).toInt() - 1,
-                                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                            )
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateLineSpacing((lineSpacing + 2f).coerceAtMost(maxSpacing)) }) {
-                                                Icon(Icons.Rounded.Add, null)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 2c. ZOOMS DE LIGNE ACTIVE (TEXT SCALING)
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = str("pref_lyrics_active_scale_title", "Active Line Text Scaling"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(
-                                                    text = "${(activeScale * 100).roundToInt()}%",
-                                                    style = MaterialTheme.typography.titleMedium,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                                Spacer(Modifier.width(6.dp))
-                                                IconButton(
-                                                    onClick = { updateActiveScale(1.00f) },
-                                                    modifier = Modifier.size(24.dp)
-                                                ) {
-                                                    Icon(Icons.Rounded.RestartAlt, str("pref_lyrics_reset"), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
-                                        }
-                                        Text(
-                                            text = str("pref_lyrics_active_scale_desc", "Magnify active singing line"),
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        Spacer(Modifier.height(6.dp))
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateActiveScale((activeScale - 0.05f).coerceAtLeast(1.00f)) }) {
-                                                Icon(Icons.Rounded.Remove, null)
-                                            }
-                                            Slider(
-                                                value = activeScale,
-                                                onValueChange = { updateActiveScale(it) },
-                                                valueRange = 1.00f..1.30f,
-                                                steps = 5,
-                                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                            )
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateActiveScale((activeScale + 0.05f).coerceAtMost(1.30f)) }) {
-                                                Icon(Icons.Rounded.Add, null)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 2d. MARGES HORIZONTALES & VERTICALES
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        // Horizontal Margin
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = if (isFullScreen) str("pref_lyrics_fullscreen_horizontal_margin_title", "Horizontal Margins") else str("pref_lyrics_horizontal_margin_title", "Horizontal Margins"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(
-                                                    text = "${horizontalMargin.roundToInt()} dp",
-                                                    style = MaterialTheme.typography.titleMedium,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                                Spacer(Modifier.width(6.dp))
-                                                IconButton(
-                                                    onClick = { updateHorizontalMargin(0f) },
-                                                    modifier = Modifier.size(24.dp)
-                                                ) {
-                                                    Icon(Icons.Rounded.RestartAlt, str("pref_lyrics_reset"), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
-                                        }
-                                        Spacer(Modifier.height(4.dp))
-                                        val maxMargin = if (isFullScreen) 160f else 64f
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateHorizontalMargin((horizontalMargin - 4f).coerceAtLeast(0f)) }) {
-                                                Icon(Icons.Rounded.Remove, null)
-                                            }
-                                            Slider(
-                                                value = horizontalMargin,
-                                                onValueChange = { updateHorizontalMargin(it) },
-                                                valueRange = 0f..maxMargin,
-                                                steps = (maxMargin / 8f).toInt() - 1,
-                                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                            )
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateHorizontalMargin((horizontalMargin + 4f).coerceAtMost(maxMargin)) }) {
-                                                Icon(Icons.Rounded.Add, null)
-                                            }
-                                        }
-
-                                        Spacer(Modifier.height(10.dp))
-
-                                        // Vertical Position
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = if (isFullScreen) str("pref_lyrics_fullscreen_vertical_offset_title", "Vertical Position") else str("pref_lyrics_vertical_offset_title", "Vertical Position"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(
-                                                    text = "${(verticalOffset * 100).roundToInt()}%",
-                                                    style = MaterialTheme.typography.titleMedium,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                                Spacer(Modifier.width(6.dp))
-                                                IconButton(
-                                                    onClick = { updateVerticalOffset(0.38f) },
-                                                    modifier = Modifier.size(24.dp)
-                                                ) {
-                                                    Icon(Icons.Rounded.RestartAlt, str("pref_lyrics_reset"), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                            }
-                                        }
-                                        Spacer(Modifier.height(4.dp))
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateVerticalOffset((verticalOffset - 0.02f).coerceAtLeast(0.20f)) }) {
-                                                Icon(Icons.Rounded.Remove, null)
-                                            }
-                                            Slider(
-                                                value = verticalOffset,
-                                                onValueChange = { updateVerticalOffset(it) },
-                                                valueRange = 0.20f..0.60f,
-                                                steps = 19,
-                                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                            )
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { updateVerticalOffset((verticalOffset + 0.02f).coerceAtMost(0.60f)) }) {
-                                                Icon(Icons.Rounded.Add, null)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                OutlinedButton(
-                                    onClick = { viewModel.resetLyricsTypography(isFullScreen) },
-                                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
-                                    shape = RoundedCornerShape(14.dp)
-                                ) {
-                                    Icon(Icons.Rounded.RestartAlt, null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(
-                                        text = str("pref_lyrics_reset_typography", "Rétablir les tailles par défaut"),
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-
-                            // 2b. VITESSE DE DÉFILEMENT (texte non synchronisé)
-                            // Here as well as in the full settings: this is the screen you are on when
-                            // you notice the speed is wrong (issue #33).
-                            if (viewModel.isPlainAutoScrollEnabled) {
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            Text(
-                                                text = str("pref_lyrics_autoscroll_speed"),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Text(
-                                                text = autoScrollSpeedLabel(viewModel.effectivePlainAutoScrollSpeed),
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.primary
-                                            )
-                                        }
-                                        Spacer(Modifier.height(6.dp))
-
-                                        // One slider for both, because they are one question asked of
-                                        // different scopes: the switch below decides whether the number
-                                        // being dragged belongs to this song or to every song (issue #33).
-                                        val perTrack = viewModel.trackAutoScrollSpeed != null
-                                        val speed = viewModel.effectivePlainAutoScrollSpeed
-                                        val setSpeed: (Float) -> Unit = { value ->
-                                            if (perTrack) viewModel.setTrackAutoScrollSpeed(value)
-                                            else viewModel.updatePlainAutoScrollSpeed(value)
-                                        }
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
-                                                setSpeed(speed - 0.25f)
-                                            }) { Icon(Icons.Rounded.Remove, null) }
-                                            Slider(
-                                                value = speed,
-                                                onValueChange = setSpeed,
-                                                valueRange = 0.25f..4f,
-                                                steps = 14,
-                                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                            )
-                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
-                                                setSpeed(speed + 0.25f)
-                                            }) { Icon(Icons.Rounded.Add, null) }
-                                        }
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                        ) {
-                                            Column(Modifier.weight(1f)) {
-                                                Text(
-                                                    text = str("pref_lyrics_speed_this_track"),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    fontWeight = FontWeight.Bold,
-                                                )
-                                                Text(
-                                                    text = str("pref_lyrics_speed_this_track_sub"),
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                )
-                                            }
-                                            Switch(
-                                                checked = perTrack,
-                                                onCheckedChange = { on ->
-                                                    // Turning it on starts from whatever is on screen, so
-                                                    // the number does not jump when the scope changes.
-                                                    if (on) viewModel.setTrackAutoScrollSpeed(speed)
-                                                    else viewModel.clearTrackAutoScrollSpeed()
-                                                },
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 2c. PAS DE LA MOLETTE
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text(
-                                            text = str("pref_lyrics_wheel_step"),
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Text(
-                                            text = str(
-                                                "pref_lyrics_wheel_step_value",
-                                                wheelLinesLabel(viewModel.lyricsWheelLines),
-                                            ),
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                    }
-                                    Text(
-                                        text = str("pref_lyrics_wheel_step_sub"),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                    Spacer(Modifier.height(6.dp))
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
-                                            viewModel.updateLyricsWheelLines(viewModel.lyricsWheelLines - 0.5f)
-                                        }) { Icon(Icons.Rounded.Remove, null) }
-                                        Slider(
-                                            value = viewModel.lyricsWheelLines,
-                                            onValueChange = { viewModel.updateLyricsWheelLines(it) },
-                                            valueRange = PlayerPreferences.LYRICS_WHEEL_LINES_MIN..PlayerPreferences.LYRICS_WHEEL_LINES_MAX,
-                                            steps = 21,
-                                            modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
-                                        )
-                                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
-                                            viewModel.updateLyricsWheelLines(viewModel.lyricsWheelLines + 0.5f)
-                                        }) { Icon(Icons.Rounded.Add, null) }
-                                    }
-                                }
-                            }
-
-                            // 3. ALIGNEMENT
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
-                                    Text(
-                                        text = str("pref_lyrics_align"),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(Modifier.height(10.dp))
-                                    ExpressiveConnectedButtonGroup(
-                                        fillMaxWidth = true,
-                                        options = listOf(LyricsAlignment.LEFT, LyricsAlignment.CENTER, LyricsAlignment.RIGHT),
-                                        selectedOption = alignment,
-                                        onOptionSelected = { updateAlignment(it) },
-                                        iconProvider = { align ->
-                                            val icon = when (align) {
-                                                LyricsAlignment.LEFT -> Icons.Rounded.FormatAlignLeft
-                                                LyricsAlignment.CENTER -> Icons.Rounded.FormatAlignCenter
-                                                LyricsAlignment.RIGHT -> Icons.Rounded.FormatAlignRight
-                                            }
-                                            Icon(icon, null, modifier = Modifier.size(16.dp))
-                                        },
-                                        labelProvider = { align ->
-                                            val text = when (align) {
-                                                LyricsAlignment.LEFT -> str("align_left")
-                                                LyricsAlignment.CENTER -> str("align_center_simple")
-                                                LyricsAlignment.RIGHT -> str("align_right")
-                                            }
-                                            Text(text, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false)
-                                        }
-                                    )
-                                }
-                            }
-
-                            // 3b. STYLE D'AFFICHAGE DE LA LIGNE COURANTE (Uniquement pour le mode classique)
-                            if (uiStyle == com.alananasss.kittytune.data.local.LyricsUiStyle.CLASSIC) {
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        Text(
-                                            text = str("pref_lyrics_display_style"),
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        Spacer(Modifier.height(10.dp))
-                                        LyricsDisplayStylePicker(selected = displayStyle, onSelect = { updateDisplayStyle(it) })
-                                    }
-                                }
-                            }
-                        }
-
-                        // ==========================================
-                        // COLONNE DROITE (Toggles & Recherche)
-                        // ==========================================
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            // 4. TOGGLES (Fichiers locaux, Karaoké, Effet Apple, etc.)
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)) {
-                                
-                                    // Fichiers locaux
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Text(str("pref_lyrics_local"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            Text(str("pref_lyrics_local_sub"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = preferLocal, onCheckedChange = { preferLocal = it; prefs.setLyricsPreferLocal(it) })
-                                    }
-
-                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
-
-                                    // Synchro Mot par mot
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Text(str("pref_lyrics_word_sync"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            Text(str("pref_lyrics_word_sync_sub"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = viewModel.isWordSyncEnabled, onCheckedChange = { viewModel.toggleWordSync(it) })
-                                    }
-
-                                    // Effet Apple Music (Uniquement si Word Sync activé)
-                                    AnimatedVisibility(visible = viewModel.isWordSyncEnabled) {
-                                        Column {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                                    Text(str("pref_lyrics_apple_effect"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                                    Text(str("pref_lyrics_apple_effect_sub"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                }
-                                                Switch(checked = viewModel.isAppleMusicEffectEnabled, onCheckedChange = { viewModel.toggleAppleMusicEffect(it) })
-                                            }
-                                        }
-                                    }
-
-                                    // Mode Duo
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Text(str("pref_lyrics_duet_title"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            Text(str("pref_lyrics_duet_desc"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = viewModel.isDuetViewEnabled, onCheckedChange = { viewModel.toggleDuetView(it) })
-                                    }
-
-                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
-
-                                    // Prononciation (Romaji)
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Text(str("pref_lyrics_romanization"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            Text(str("pref_lyrics_romanization_sub"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = viewModel.isRomanizationEnabled, onCheckedChange = { viewModel.toggleRomanization(it) })
-                                    }
-
-                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
-
-                                    // Traduction
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Text(str("pref_lyrics_translation_title"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            Text(str("pref_lyrics_translation_sub"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = enableTranslation, onCheckedChange = { 
-                                            enableTranslation = it
-                                            viewModel.toggleLyricsTranslation(it)
-                                        })
-                                    }
-
-                                    AnimatedVisibility(visible = enableTranslation) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth().clickable { showLangDialog = true }.padding(vertical = 12.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(str("pref_lyrics_translation_lang"), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(targetLang.uppercase(), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                                                Icon(Icons.Rounded.ArrowDropDown, null, tint = MaterialTheme.colorScheme.primary)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-
-
-                            // ÉCRAN DE VEILLE & SOURCE AUDIO PLEIN ÉCRAN
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Icon(
-                                                imageVector = Icons.Rounded.DarkMode,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                            Spacer(Modifier.width(8.dp))
-                                            Column {
-                                                Text(
-                                                    text = str("pref_screensaver_title"),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                                Text(
-                                                    text = str("pref_screensaver_desc"),
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                        Switch(
-                                            checked = viewModel.fullPlayerScreensaverEnabled,
-                                            onCheckedChange = { viewModel.updateFullPlayerScreensaverEnabled(it) }
-                                        )
-                                    }
-
-                                    androidx.compose.material3.HorizontalDivider(
-                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-                                            Icon(
-                                                imageVector = Icons.Rounded.GraphicEq,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                            Spacer(Modifier.width(8.dp))
-                                            Column {
-                                                Text(
-                                                    text = str("pref_full_player_source_title"),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                                Text(
-                                                    text = str("pref_full_player_source_desc"),
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                        Switch(
-                                            checked = viewModel.fullPlayerSourceIndicatorEnabled,
-                                            onCheckedChange = { viewModel.updateFullPlayerSourceIndicatorEnabled(it) }
-                                        )
-                                    }
-                                }
-                            }
-
-                            // Bouton RECHERCHE MANUELLE en bas de la colonne de droite
-                            Button(
-                                onClick = {
-                                    onDismiss()
-                                    viewModel.isSearchingLyrics = true
-                                },
-                                shapes = ButtonDefaults.shapes(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primaryContainer, 
-                                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                                ),
-                                modifier = Modifier.fillMaxWidth().height(56.dp)
-                            ) {
-                                Icon(Icons.Rounded.Search, null, modifier = Modifier.size(20.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(str("lyrics_manual_search"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 @Composable
 fun UploadYamlDialog(
@@ -2610,14 +1029,13 @@ fun UploadYamlDialog(
 
                 androidx.compose.material3.Button(
                     onClick = {
-                        val dialog = java.awt.FileDialog(null as java.awt.Frame?, str("btn_upload_yaml"), java.awt.FileDialog.LOAD)
-                        dialog.isVisible = true
-                        if (dialog.directory != null && dialog.file != null) {
-                            val file = java.io.File(dialog.directory, dialog.file)
-                            if (file.exists()) {
-                                viewModel.loadCustomLyrics(file.readText())
-                                onDismiss()
-                            }
+                        val file = com.alananasss.kittytune.core.NativeFileDialog.openFile(
+                            str("btn_upload_yaml"),
+                            com.alananasss.kittytune.core.NativeFileDialog.FileType("Lyrics", listOf(com.alananasss.kittytune.core.NativeFileDialog.ANY_FILE)),
+                        )
+                        if (file != null && file.exists()) {
+                            viewModel.loadCustomLyrics(file.readText())
+                            onDismiss()
                         }
                     },
                     shapes = androidx.compose.material3.ButtonDefaults.shapes(),
@@ -2637,63 +1055,32 @@ fun UploadYamlDialog(
 }
 
 /**
- * Draws the hover rule under a lyric line by hand.
+ * The hover highlight behind a lyric line: a soft rounded box, a little wider than the line, that fades in
+ * and out. The same look as the karaoke view's hover. It replaces a rule drawn under the text, the last of
+ * the old hover styles left in the lyrics views (issue #66).
  *
- * `TextDecoration.Underline` is drawn per font run, and a lyric line routinely spans several
- * runs: the variable UI font has no Cyrillic, Arabic or CJK coverage, so those stretches fall
- * back to a system face with its own underline thickness and position. The result was a rule
- * that looked dashed and stepped — reported for Russian lyrics in issue #33. One rect per
- * laid-out line, at one thickness, is the same rule whatever the script.
- *
- * @param layout the last layout of the text this sits on, read lazily so a relayout is picked
- *   up without recreating the modifier.
- * @param fontSizeSp the line's font size, which the thickness and the drop below the baseline
- *   are both derived from, so the rule scales with the lyrics font-size setting.
+ * Drawn behind the line's own layer, so the line's blur and scale do not smear it.
  */
-/**
- * The hover rule under a lyric line.
- *
- * Internal rather than private because the panel renderer draws the same lines and needs the same affordance:
- * it was relying on `clickable`'s default indication instead, which on a 34 sp line at full-screen width is a
- * ripple the width of the screen — "un gros truc en surbrillance moche" (issue #33).
- */
-internal fun Modifier.lyricUnderline(
-    layout: () -> androidx.compose.ui.text.TextLayoutResult?,
-    visible: Boolean,
-    fontSizeSp: Float,
-    color: Color,
-): Modifier = drawWithContent {
-    drawContent()
-    if (!visible) return@drawWithContent
-    val result = layout() ?: return@drawWithContent
-    val thickness = (fontSizeSp * 0.06f).sp.toPx().coerceAtLeast(1f)
-    val drop = (fontSizeSp * 0.14f).sp.toPx()
-    for (i in 0 until result.lineCount) {
-        val left = result.getLineLeft(i)
-        val right = result.getLineRight(i)
-        if (right - left <= 0f) continue
-        drawRect(
-            color = color,
-            topLeft = androidx.compose.ui.geometry.Offset(left, result.getLineBaseline(i) + drop),
-            size = androidx.compose.ui.geometry.Size(right - left, thickness),
+@Composable
+internal fun Modifier.lyricHoverHighlight(hovered: Boolean, color: Color): Modifier {
+    val shown by animateFloatAsState(if (hovered) 1f else 0f, tween(HOVER_FADE_MS), label = "lyricHover")
+    return drawBehind {
+        if (shown <= 0f) return@drawBehind
+        val bleed = HOVER_BLEED.toPx()
+        drawRoundRect(
+            color = color.copy(alpha = color.alpha * shown),
+            topLeft = androidx.compose.ui.geometry.Offset(-bleed, 0f),
+            size = androidx.compose.ui.geometry.Size(size.width + bleed * 2, size.height),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(HOVER_CORNER.toPx()),
         )
     }
 }
 
+private const val HOVER_FADE_MS = 150
+private val HOVER_BLEED = 8.dp
+private val HOVER_CORNER = 14.dp
 
 
-/** "1.5×" — one decimal only when there is one, matching the label in the full settings. */
-/** "3" rather than "3.0", and "2.5" when it is not whole. */
-private fun wheelLinesLabel(lines: Float): String {
-    val rounded = kotlin.math.round(lines * 2f) / 2f
-    return if (rounded % 1f == 0f) rounded.toInt().toString() else rounded.toString()
-}
-
-private fun autoScrollSpeedLabel(speed: Float): String {
-    val rounded = kotlin.math.round(speed * 100f) / 100f
-    val text = if (rounded % 1f == 0f) rounded.toInt().toString() else rounded.toString()
-    return "$text×"
-}
 
 private const val OFFSET_STEP_MS = 100L
 private const val REPEAT_START_DELAY_MS = 400L

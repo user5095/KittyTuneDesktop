@@ -1,5 +1,6 @@
 package com.alananasss.kittytune.ui.player.lyrics
 
+import androidx.compose.runtime.Immutable
 import com.alananasss.kittytune.data.lyrics.parsers.QRCParser
 import com.alananasss.kittytune.data.lyrics.parsers.TTMLParser
 import com.mpatric.mp3agic.Mp3File
@@ -7,6 +8,7 @@ import org.yaml.snakeyaml.Yaml
 import java.io.File
 import java.util.regex.Pattern
 
+@Immutable
 data class LyricWord(
     val text: String,
     val startTime: Long,
@@ -23,6 +25,7 @@ enum class LyricSinger {
     BOTH
 }
 
+@Immutable
 data class LyricLine(
     val text: String,
     val startTime: Long,
@@ -169,6 +172,58 @@ object LyricsUtils {
     private val ENHANCED_WORD_PATTERN = Pattern.compile("<(\\d{2}):(\\d{2})\\.(\\d{2,3})>([^<]*)")
 
     private val NUMERIC_ENTITY_REGEX = Regex("&#(x)?([0-9a-fA-F]+);")
+    private val TTML_ROOT_REGEX = Regex("""<(?:[A-Za-z_][\w.-]*:)?tt(?:\s|>)""", RegexOption.IGNORE_CASE)
+    private const val MAX_TTML_DETECTION_CHARS = 4096
+
+    private val LRC_TIMESTAMP = Regex("""\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?]""")
+    private val ENHANCED_TIMESTAMP = Regex("""<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>""")
+    private val LRC_HEADER_TAG = Regex("""\[(?i:ar|ti|al|au|by|re|ve|length|offset|id|lr|la|#):.*]""")
+    private val WEB_ADDRESS =
+        Regex("""(?i)(https?://\S+|www\.\S+|\b[\w-]+\.(?:com|net|org|ru|io|info|me|cc|co|xyz)\b\S*)""")
+    private val WATERMARK_WORDS =
+        Regex("""(?i)\b(lyrics?|lrc|generator|made|created|synced|synchronized|by|with|from|at|on|provided|powered|visit)\b""")
+    private val NOT_A_WORD = Regex("""[^\p{L}\p{Nd}]+""")
+
+    /**
+     * A line some lyrics files carry that is not part of the song: the site or tool that made the file,
+     * "—-www.LRCgenerator.com—-", "Lyrics by RentAnAdviser.com", "https://…". A line counts when it holds a
+     * web address and little else: at most three words once the address is taken out.
+     */
+    fun isWatermarkLine(text: String): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || !WEB_ADDRESS.containsMatchIn(trimmed)) return false
+        val rest = trimmed.replace(WEB_ADDRESS, " ").replace(WATERMARK_WORDS, " ")
+            .split(NOT_A_WORD).filter { it.isNotBlank() }
+        return rest.size <= 3
+    }
+
+    /**
+     * Words to show as plain text: LRC timestamps and `[ar:…]`-style header tags taken out, watermark lines
+     * dropped. A file whose timings do not advance ends up here, and used to show its `[00:00.00]` stamps.
+     */
+    fun cleanPlainLyrics(raw: String): String {
+        if (raw.isBlank()) return raw
+        return raw.lines()
+            .filterNot { LRC_HEADER_TAG.matches(it.trim()) }
+            .map { it.replace(LRC_TIMESTAMP, "").replace(ENHANCED_TIMESTAMP, "") }
+            .filterNot { isWatermarkLine(it) }
+            .joinToString("\n")
+            .trim('\n')
+    }
+
+    /**
+     * Whether parsed lines carry real timings. A provider can stamp every line with the same time (often
+     * `[00:00.00]`), or nearly every line: shown as synced, such a sheet sits on its first line for the whole
+     * song while saying it is synchronised (issue #66). At least half the lines have to start at a moment of
+     * their own, and the stamps have to get past the first second.
+     */
+    fun hasRealTimings(lines: List<LyricLine>): Boolean {
+        val sung = lines.filter { !it.isInstrumental && it.text.isNotBlank() }
+        if (sung.size < 2) return sung.size == 1 && sung[0].startTime > 0L
+        val distinctStarts = sung.map { it.startTime }.distinct()
+        if (distinctStarts.size * 2 < sung.size) return false
+        return sung.maxOf { it.startTime } >= 1_000L
+    }
 
     fun decodeHtmlEntities(text: String): String {
         if (!text.contains('&')) return text
@@ -293,23 +348,45 @@ object LyricsUtils {
         return result
     }
 
+    /** True when [content] is TTML (Apple Music, BetterLyrics, YouLyPlus…), not LRC or plain text. */
+    fun looksLikeTtml(content: String): Boolean {
+        val trimmed = content.removePrefix("\uFEFF").trimStart()
+        if (trimmed.isEmpty()) return false
+        if (trimmed.startsWith("<?xml")) return true
+        return TTML_ROOT_REGEX.containsMatchIn(trimmed.take(MAX_TTML_DETECTION_CHARS))
+    }
+
     fun parseLyricsContent(content: String, totalDurationMs: Long): List<LyricLine> {
-        val trimmed = content.trim()
+        // TTML is XML and must be parsed as such, never through the LRC/plain-text path. Decoding
+        // HTML entities first would turn valid XML entities ("R&amp;B", "&lt;3") into bare & / <,
+        // make the document invalid, and let callers fall back to showing the raw <tt> markup.
+        val raw = content.removePrefix("\uFEFF").trim()
         val parsed = when {
-            trimmed.startsWith("<tt") || trimmed.contains("<tt ") || trimmed.contains("<tt:") || trimmed.startsWith("<?xml") -> {
-                parseTtml(trimmed, totalDurationMs)
-            }
-            QRCParser.isQrc(trimmed) -> {
-                parseQrc(trimmed, totalDurationMs)
-            }
-            trimmed.startsWith("version:") -> {
-                parseLyricsFile(content, totalDurationMs)
+            looksLikeTtml(raw) -> {
+                parseTtml(raw, totalDurationMs)
             }
             else -> {
-                parseLrc(content, totalDurationMs)
+                // Some feeds HTML-escape the whole TTML document: decode once, then retry as XML.
+                val decoded = decodeHtmlEntities(raw)
+                when {
+                    decoded != raw && looksLikeTtml(decoded) -> {
+                        parseTtml(decoded, totalDurationMs)
+                    }
+                    QRCParser.isQrc(raw) -> {
+                        parseQrc(raw, totalDurationMs)
+                    }
+                    isYamlContent(raw) -> {
+                        parseLyricsFile(content, totalDurationMs)
+                    }
+                    else -> {
+                        parseLrc(content, totalDurationMs)
+                    }
+                }
             }
         }
-        return insertInstrumentalBreaks(parsed)
+        val withoutWatermarks = parsed.filterNot { isWatermarkLine(it.text) }
+        if (!hasRealTimings(withoutWatermarks)) return emptyList()
+        return insertInstrumentalBreaks(withoutWatermarks)
     }
 
     fun parseTtml(ttml: String, totalDurationMs: Long): List<LyricLine> {
@@ -367,6 +444,39 @@ object LyricsUtils {
                 agent = line.agent
             )
         }
+    }
+
+    fun isYamlContent(content: String?): Boolean {
+        if (content.isNullOrBlank()) return false
+        val trimmed = content.trim().removePrefix("---").trim()
+        return trimmed.startsWith("version:") || (trimmed.startsWith("metadata:") && trimmed.contains("lines:"))
+    }
+
+    fun extractPlainLyricsFromYaml(yamlContent: String): String? {
+        val trimmed = yamlContent.trim().removePrefix("---").trim()
+        if (!isYamlContent(trimmed)) return null
+        return try {
+            val yaml = Yaml()
+            val data = yaml.load<Map<String, Any>>(trimmed)
+            (data["plain"] as? String)?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Determines whether [translation] is identical or near-identical to [original].
+     * Filters out duplicate subtitles, identical machine translation echo lines,
+     * and minor punctuation/whitespace variances (e.g. trailing periods or casing).
+     */
+    fun isDuplicateTranslation(original: String?, translation: String?): Boolean {
+        if (original.isNullOrBlank() || translation.isNullOrBlank()) return false
+        val o = original.trim()
+        val t = translation.trim()
+        if (o.equals(t, ignoreCase = true)) return true
+        val normO = o.filter { it.isLetterOrDigit() }.lowercase()
+        val normT = t.filter { it.isLetterOrDigit() }.lowercase()
+        return normO.isNotEmpty() && normO == normT
     }
 
     private fun parseLyricsFile(yamlContent: String, totalDurationMs: Long): List<LyricLine> {

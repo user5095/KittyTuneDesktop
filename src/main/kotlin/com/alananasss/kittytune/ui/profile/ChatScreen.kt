@@ -72,7 +72,7 @@ import androidx.compose.material3.ButtonDefaults
         }
     
         var messageText by remember { mutableStateOf("") }
-        val isMiniPlayerVisible = playerViewModel.currentTrack != null
+        val isMiniPlayerVisible = playerViewModel.uiCurrentTrack != null
     
         val otherUserAvatar by remember {
             derivedStateOf {
@@ -468,7 +468,7 @@ import androidx.compose.material3.ButtonDefaults
     
                 Spacer(Modifier.width(4.dp))
     
-                FilledIconButton(onClick = onSend,
+                FilledIconButton(shapes = IconButtonDefaults.shapes(), onClick = onSend,
                     enabled = text.isNotBlank() && !isLoading,
                     modifier = Modifier.size(40.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(

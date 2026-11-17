@@ -201,24 +201,35 @@ object MusixmatchClient {
         chain.proceed(newRequest)
     }
 
+    // Shares ProxyManager's pool and dispatcher; the auth interceptor is this API's own.
     private val baseHttpClient by lazy {
-        OkHttpClient.Builder()
+        ProxyManager.getOkHttpClient().newBuilder()
             .addInterceptor(authInterceptor)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(10, TimeUnit.SECONDS)
             .build()
     }
 
-    private val httpClient: OkHttpClient
-        get() = ProxyManager.configureOkHttpClient(baseHttpClient.newBuilder()).build()
+    // Cached, and invalidated only when ProxyManager hands out a different base client (proxy
+    // changes): the getter this replaces built a fresh OkHttpClient AND a fresh Retrofit — with a
+    // new service instance and new connection bookkeeping — on every single API call.
+    @Volatile private var cachedApi: MusixmatchApiService? = null
+    @Volatile private var cachedBaseClient: OkHttpClient? = null
 
     val api: MusixmatchApiService
-        get() = Retrofit.Builder()
-            .baseUrl(BASE_URL)
-            .client(httpClient)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(MusixmatchApiService::class.java)
+        get() {
+            val base = ProxyManager.getOkHttpClient()
+            cachedApi?.takeIf { cachedBaseClient == base }?.let { return it }
+            val built = Retrofit.Builder()
+                .baseUrl(BASE_URL)
+                .client(ProxyManager.configureOkHttpClient(baseHttpClient.newBuilder()).build())
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+                .create(MusixmatchApiService::class.java)
+            cachedBaseClient = base
+            cachedApi = built
+            return built
+        }
 
     private fun generateGuid(): String {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 16)
@@ -301,7 +312,11 @@ object MusixmatchClient {
                 val translationsRes = api.getTranslations(trackId = trackId, lang = targetLang, token = token)
                 translationsRes.message.body?.translationsList?.forEach { wrapper ->
                     wrapper.translation?.let { t ->
-                        translationMap[t.matchedLine.trim()] = t.description.trim()
+                        val matched = t.matchedLine.trim()
+                        val desc = t.description.trim()
+                        if (desc.isNotBlank() && !com.alananasss.kittytune.ui.player.lyrics.LyricsUtils.isDuplicateTranslation(matched, desc)) {
+                            translationMap[matched] = desc
+                        }
                     }
                 }
             } catch (e: Exception) { }
@@ -309,7 +324,13 @@ object MusixmatchClient {
             val missingLines = uniqueOriginalLines.filter { !translationMap.containsKey(it.trim()) }
             if (missingLines.isNotEmpty()) {
                 val machineTranslations = FreeTranslator.translateMissing(missingLines, targetLang)
-                translationMap.putAll(machineTranslations)
+                machineTranslations.forEach { (orig, trans) ->
+                    val trimmedOrig = orig.trim()
+                    val trimmedTrans = trans.trim()
+                    if (trimmedTrans.isNotBlank() && !com.alananasss.kittytune.ui.player.lyrics.LyricsUtils.isDuplicateTranslation(trimmedOrig, trimmedTrans)) {
+                        translationMap[trimmedOrig] = trimmedTrans
+                    }
+                }
             }
         }
 

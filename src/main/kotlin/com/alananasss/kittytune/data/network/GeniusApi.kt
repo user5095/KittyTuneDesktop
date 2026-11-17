@@ -34,8 +34,9 @@ object GeniusClient {
 
     private const val CLIENT_VERSION = "8.1.5"
 
+    // Shares ProxyManager's pool and dispatcher; the header interceptor is this API's own.
     private val baseHttpClient by lazy {
-        okhttp3.OkHttpClient.Builder()
+        ProxyManager.getOkHttpClient().newBuilder()
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
                     .header("Authorization", "Bearer $LOGGED_OUT_TOKEN")
@@ -78,6 +79,16 @@ object GeniusClient {
     suspend fun lyrics(songId: Long): String? = withContext(Dispatchers.IO) {
         runCatching {
             api.song(songId).response?.song?.lyrics?.plain?.let(::tidy)?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    /**
+     * The lyrics as Genius's HTML, which keeps the italics and bold that say who sings which line of a shared
+     * part. See [com.alananasss.kittytune.data.lyrics.GeniusVoices].
+     */
+    suspend fun lyricsHtml(songId: Long): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            api.song(songId, textFormat = "html").response?.song?.lyrics?.html?.takeIf { it.isNotBlank() }
         }.getOrNull()
     }
 
@@ -125,4 +136,4 @@ data class GeniusSongHit(
 data class GeniusSongResponse(val response: GeniusSongBody?)
 data class GeniusSongBody(val song: GeniusSongDetail?)
 data class GeniusSongDetail(val id: Long, val title: String?, val lyrics: GeniusLyrics?)
-data class GeniusLyrics(val plain: String?)
+data class GeniusLyrics(val plain: String?, val html: String? = null)

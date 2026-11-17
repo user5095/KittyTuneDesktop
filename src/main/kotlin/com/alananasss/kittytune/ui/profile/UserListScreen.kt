@@ -31,6 +31,7 @@ import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.domain.User
 import java.text.NumberFormat
 import java.util.Locale
+import androidx.compose.material3.IconButtonDefaults
 
 enum class UserFilterType {
     ALL,
@@ -47,7 +48,11 @@ private fun UserFilterChips(
     val artistsCount = remember(users) { users.count { it.isArtist } }
     val profilesCount = remember(users) { users.count { !it.isArtist } }
 
-    androidx.compose.foundation.lazy.LazyRow(
+    val chipsState = androidx.compose.foundation.lazy.rememberLazyListState()
+    com.alananasss.kittytune.ui.common.ScrollableLazyRow(
+        state = chipsState,
+        showsArrows = false,
+        fadeLength = 24.dp,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
@@ -150,7 +155,7 @@ fun UserListDialog(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(36.dp)) {
+                    IconButton(shapes = IconButtonDefaults.shapes(), onClick = onDismiss, modifier = Modifier.size(36.dp)) {
                         Icon(
                             Icons.Rounded.Close,
                             contentDescription = str("btn_close"),

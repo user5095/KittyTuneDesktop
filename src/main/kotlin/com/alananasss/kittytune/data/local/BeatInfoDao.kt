@@ -15,6 +15,8 @@ class BeatInfoDao(private val db: AppDatabase) {
             mixOutPointMs = rs.getLong("mixOutPointMs").let { if (rs.wasNull()) null else it },
             keyPitchClass = rs.getInt("keyPitchClass").let { if (rs.wasNull()) null else it },
             keyIsMinor = rs.getInt("keyIsMinor").let { if (rs.wasNull()) null else it == 1 },
+            energy = rs.getFloat("energy").let { if (rs.wasNull()) null else it },
+            analysisVersion = rs.getInt("analysisVersion").let { if (rs.wasNull()) 1 else it },
         )
     }
 
@@ -22,8 +24,8 @@ class BeatInfoDao(private val db: AppDatabase) {
         db.execSilent(
             """INSERT OR REPLACE INTO beat_info(
                 songId, bpm, firstBeatOffsetMs, confidence, analyzedAt,
-                mixInPointMs, mixOutPointMs, keyPitchClass, keyIsMinor
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                mixInPointMs, mixOutPointMs, keyPitchClass, keyIsMinor, energy, analysisVersion
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             beatInfo.songId,
             beatInfo.bpm,
             beatInfo.firstBeatOffsetMs,
@@ -32,12 +34,24 @@ class BeatInfoDao(private val db: AppDatabase) {
             beatInfo.mixInPointMs,
             beatInfo.mixOutPointMs,
             beatInfo.keyPitchClass,
-            beatInfo.keyIsMinor?.let { if (it) 1 else 0 }
+            beatInfo.keyIsMinor?.let { if (it) 1 else 0 },
+            beatInfo.energy,
+            beatInfo.analysisVersion,
         )
     }
 
     suspend fun getBeatInfo(songId: String): BeatInfoEntity? =
         db.queryOne("SELECT * FROM beat_info WHERE songId = ? LIMIT 1", songId, mapper = ::row)
+
+    /** The rows of every song in [songIds] that has one, in no particular order. */
+    suspend fun getBeatInfoForSongs(songIds: List<String>): List<BeatInfoEntity> {
+        if (songIds.isEmpty()) return emptyList()
+        // SQLite caps the number of bound parameters; chunk to stay well under it.
+        return songIds.distinct().chunked(500).flatMap { chunk ->
+            val marks = chunk.joinToString(",") { "?" }
+            db.query("SELECT * FROM beat_info WHERE songId IN ($marks)", *chunk.toTypedArray(), mapper = ::row)
+        }
+    }
 
     suspend fun deleteBeatInfo(songId: String) =
         db.execSilent("DELETE FROM beat_info WHERE songId = ?", songId)

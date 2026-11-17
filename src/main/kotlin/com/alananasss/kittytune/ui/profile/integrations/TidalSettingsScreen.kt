@@ -23,6 +23,7 @@ import com.alananasss.kittytune.ui.common.SettingsGroup
 import com.alananasss.kittytune.ui.common.SettingsItem
 import com.alananasss.kittytune.ui.common.SettingsScaffold
 import java.net.URI
+import androidx.compose.material3.ButtonDefaults
 
 @Composable
 fun TidalSettingsScreen(
@@ -77,7 +78,7 @@ fun TidalSettingsScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showQualityDialog = false }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { showQualityDialog = false }) {
                     Text(str("btn_cancel"))
                 }
             }
@@ -109,7 +110,7 @@ fun TidalSettingsScreen(
                 }
             },
             confirmButton = {
-                TextButton(
+                TextButton(shapes = ButtonDefaults.shapes(),
                     onClick = {
                         val cleaned = TidalAudioProvider.normalizeResolverEndpointsInput(tempEndpoints)
                         resolverEndpoints = cleaned
@@ -121,7 +122,7 @@ fun TidalSettingsScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showResolverEndpointsDialog = false }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { showResolverEndpointsDialog = false }) {
                     Text(str("btn_cancel"))
                 }
             }
@@ -153,7 +154,7 @@ fun TidalSettingsScreen(
                 }
             },
             confirmButton = {
-                TextButton(
+                TextButton(shapes = ButtonDefaults.shapes(),
                     onClick = {
                         val cleaned = tempCookie.trim()
                         tidalCookie = cleaned
@@ -165,7 +166,7 @@ fun TidalSettingsScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showCookieDialog = false }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { showCookieDialog = false }) {
                     Text(str("btn_cancel"))
                 }
             }

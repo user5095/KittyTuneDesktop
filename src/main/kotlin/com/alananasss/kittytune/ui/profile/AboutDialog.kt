@@ -25,7 +25,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.alananasss.kittytune.BuildConfig
+import com.alananasss.kittytune.core.AppIconRuntime
 import com.alananasss.kittytune.core.str
+import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.data.UpdateManager
 import com.alananasss.kittytune.data.UpdateStatus
 import com.alananasss.kittytune.ui.common.SettingsGroup
@@ -38,6 +40,9 @@ fun AboutDialog(
     onDismiss: () -> Unit,
     onCreditsClick: () -> Unit = {}
 ) {
+    val prefs = remember { PlayerPreferences() }
+    val iconVariant by prefs.appIconVariantFlow().collectAsState(initial = prefs.getAppIconVariant())
+    val appIcon = remember(iconVariant) { AppIconRuntime.loadAppPainter(iconVariant) }
     val uriHandler = LocalUriHandler.current
     val appVersion = BuildConfig.VERSION_NAME
     val scope = rememberCoroutineScope()
@@ -77,7 +82,7 @@ fun AboutDialog(
                         contentAlignment = Alignment.Center
                     ) {
                         androidx.compose.foundation.Image(
-                            painter = painterResource("icons/kittytune.png"),
+                            painter = appIcon ?: painterResource("icons/kittytune.png"),
                             contentDescription = null,
                             modifier = Modifier.fillMaxSize().scale(0.8f)
                         )
@@ -262,7 +267,7 @@ fun AboutDialog(
                                     shape = shape,
                                     icon = Icons.Rounded.Code,
                                     title = str("about_github"),
-                                    onClick = { uriHandler.openUri("https://github.com/alan7383/kittytune") }
+                                    onClick = { uriHandler.openUri("https://github.com/alan7383/KittyTuneDesktop") }
                                 )
                             },
                             { shape ->
@@ -270,7 +275,7 @@ fun AboutDialog(
                                     shape = shape,
                                     icon = Icons.Filled.BugReport,
                                     title = str("about_bug_report"),
-                                    onClick = { uriHandler.openUri("https://github.com/alan7383/kittytune/issues") }
+                                    onClick = { uriHandler.openUri("https://github.com/alan7383/KittyTuneDesktop/issues") }
                                 )
                             }
                         )

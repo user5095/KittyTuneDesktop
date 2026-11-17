@@ -6,6 +6,7 @@ import androidx.compose.material3.SliderColors
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.WavyProgressIndicatorDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -18,7 +19,6 @@ fun WavySlider(
     modifier: Modifier = Modifier,
     valueRange: ClosedFloatingPointRange<Float> = 0f..1f,
     onValueChangeFinished: (() -> Unit)? = null,
-    onValueCommit: ((Float) -> Unit)? = null,
     colors: SliderColors = SliderDefaults.colors(),
     isPlaying: Boolean = true,
     enabled: Boolean = true,
@@ -26,13 +26,15 @@ fun WavySlider(
     thumbRadius: Dp = 8.dp,
     wavelength: Dp = WavyProgressIndicatorDefaults.LinearDeterminateWavelength,
     waveSpeed: Dp = WavyProgressIndicatorDefaults.LinearDeterminateWavelength / 2f,
-    bufferedValue: Float? = null,
+    mix: MixTransition? = null,
+    mixColor: Color = colors.activeTrackColor,
+    onValueChangeCancelled: (() -> Unit)? = null,
 ) {
     WavySliderExpressive(
         value = { value },
         onValueChange = onValueChange,
-        onValueCommit = onValueCommit ?: onValueChangeFinished?.let { finish -> { _: Float -> finish() } },
         onValueChangeFinished = onValueChangeFinished,
+        onValueChangeCancelled = onValueChangeCancelled,
         modifier = modifier,
         enabled = enabled,
         valueRange = valueRange,
@@ -43,6 +45,8 @@ fun WavySlider(
         strokeWidth = strokeWidth,
         thumbRadius = thumbRadius,
         wavelength = wavelength,
-        waveSpeed = waveSpeed
+        waveSpeed = waveSpeed,
+        mix = mix,
+        mixColor = mixColor,
     )
 }

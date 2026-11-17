@@ -63,18 +63,21 @@ fun KittyTuneTheme(content: @Composable () -> Unit) {
         pixelTheme = themePrefs.pixelTheme,
         typography = typography,
     ) {
+        // Slim and quiet until it is used: an 8 dp grey slab drew more attention than the content it scrolls,
+        // worst in dialogs, where it sat across the fields (issue #66).
         val scrollbarStyle = androidx.compose.foundation.defaultScrollbarStyle().copy(
-            thickness = 8.dp,
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp),
+            thickness = 6.dp,
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(3.dp),
             hoverColor = androidx.compose.material3.MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
-            unhoverColor = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+            unhoverColor = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.28f),
             hoverDurationMillis = 300
         )
 
         androidx.compose.runtime.CompositionLocalProvider(
             androidx.compose.foundation.LocalScrollbarStyle provides scrollbarStyle
         ) {
-            content()
+            // Every window is themed once, at its root, which is exactly the scope an ambient clock needs.
+            com.alananasss.kittytune.ui.common.ProvideAmbientClock(content)
         }
     }
 }

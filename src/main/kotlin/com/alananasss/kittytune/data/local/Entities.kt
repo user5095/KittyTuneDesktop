@@ -1,5 +1,7 @@
 package com.alananasss.kittytune.data.local
 
+import androidx.compose.runtime.Immutable
+
 /**
  * Persistence entities — desktop port of the Room entities.
  * Room @Entity/@PrimaryKey annotations dropped; the schema lives in AppDatabase (JDBC).
@@ -15,7 +17,14 @@ data class LocalTrack(
     val duration: Long,
     val localAudioPath: String,
     val localArtworkPath: String,
-    val downloadedAt: Long = System.currentTimeMillis()
+    val downloadedAt: Long = System.currentTimeMillis(),
+    /**
+     * Where the track plays from, and its page there, for anything that is not a SoundCloud track. Without
+     * them a YouTube track saved into a playlist came back as a SoundCloud id that did not exist, and never
+     * played (issue #66). Null for SoundCloud, which the id alone identifies.
+     */
+    val source: String? = null,
+    val permalinkUrl: String? = null,
 )
 
 // table: downloaded_playlists
@@ -41,6 +50,7 @@ data class PlaylistTrackCrossRef(
 )
 
 // table: saved_artists
+@Immutable
 data class LocalArtist(
     val id: Long,
     val username: String,
@@ -107,6 +117,13 @@ data class ListeningStatsEvent(
      * Rows this device recorded carry their own id too, so its own log is equally safe to replay.
      */
     val syncEventId: String? = null,
+    /**
+     * The track's genre as its uploader tagged it, for the recaps' "most listened genres".
+     *
+     * Null on rows recorded before it was kept and on sources that have none; the recaps fill it
+     * in afterwards for the tracks that matter (see [com.alananasss.kittytune.data.ListeningStatsRepository.backfillGenres]).
+     */
+    val genre: String? = null,
 )
 
 data class TopTrackResult(
@@ -196,6 +213,11 @@ data class LyricsOffsetRow(
     val trackId: Long,
     val offsetMs: Long,
     val updatedAt: Long,
+    /** Where in the track [offsetMs] applies; only matters with a second point. */
+    val anchorMs: Long = 0L,
+    /** The second point of a two-point sync, or null for a single offset (see LyricsSync). */
+    val endAtMs: Long? = null,
+    val endOffsetMs: Long? = null,
 )
 
 // table: library_folders

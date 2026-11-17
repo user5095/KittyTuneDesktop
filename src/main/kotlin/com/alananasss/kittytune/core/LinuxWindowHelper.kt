@@ -1,6 +1,5 @@
 package com.alananasss.kittytune.core
 
-import com.sun.jna.Memory
 import com.sun.jna.Native
 import com.sun.jna.NativeLong
 import com.sun.jna.Pointer
@@ -11,7 +10,6 @@ import com.sun.jna.platform.win32.WinUser
 import java.awt.Window
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
-import java.awt.event.HierarchyEvent
 
 /**
  * Ensures floating utility windows (such as the lyrics mini-player or custom tray menu)
@@ -46,45 +44,16 @@ object LinuxWindowHelper {
 
     /**
      * Configures [window] to act as an unlisted utility window that does not appear in Alt-Tab
-     * or taskbars. Safe to call on all operating systems.
+     * or taskbars. Call once, before the window is shown.
      */
     fun configureUtilityWindow(window: Window) {
-        if (window is javax.swing.RootPaneContainer) {
-            val root = window.rootPane
-            if (root?.getClientProperty("utility_configured") == true) {
-                if (isWindows) applyWindowsToolWindow(window)
-                else if (isLinux) applyLinuxSkipHints(window)
-                return
+        if (!isLinux) return
+        window.type = Window.Type.UTILITY
+        window.addComponentListener(object : ComponentAdapter() {
+            override fun componentShown(e: ComponentEvent) {
+                if (window.isShowing) applyLinuxSkipHints(window)
             }
-            root?.putClientProperty("utility_configured", true)
-        }
-
-        runCatching {
-            window.type = Window.Type.UTILITY
-        }
-
-        if (isWindows) {
-            applyWindowsToolWindow(window)
-        } else if (isLinux) {
-            applyLinuxSkipHints(window)
-        }
-
-        // Install listeners to ensure hints are reapplied whenever the window is shown,
-        // remapped, or gains its native peer.
-        val listener = object : ComponentAdapter() {
-            override fun componentShown(e: ComponentEvent?) {
-                if (isWindows) applyWindowsToolWindow(window)
-                else if (isLinux) applyLinuxSkipHints(window)
-            }
-        }
-        window.addComponentListener(listener)
-
-        window.addHierarchyListener { event ->
-            if ((event.changeFlags and HierarchyEvent.SHOWING_CHANGED.toLong()) != 0L && window.isShowing) {
-                if (isWindows) applyWindowsToolWindow(window)
-                else if (isLinux) applyLinuxSkipHints(window)
-            }
-        }
+        })
     }
 
     private const val WS_EX_TOOLWINDOW = 0x00000080
@@ -111,8 +80,7 @@ object LinuxWindowHelper {
         }
     }
 
-    fun applyLinuxSkipHints(window: Window) {
-        if (!isLinux) return
+    private fun applyLinuxSkipHints(window: Window) {
         runCatching {
             if (!window.isDisplayable) return
 
@@ -131,28 +99,11 @@ object LinuxWindowHelper {
                 val kdeSkipSwitcher = x11.XInternAtom(display, "_KDE_NET_WM_STATE_SKIP_SWITCHER", false)
                 val netSkipSwitcher = x11.XInternAtom(display, "_NET_WM_STATE_SKIP_SWITCHER", false)
 
-                val netWmWindowType = x11.XInternAtom(display, "_NET_WM_WINDOW_TYPE", false)
-                val typeUtility = x11.XInternAtom(display, "_NET_WM_WINDOW_TYPE_UTILITY", false)
-
-                // 1. Direct property writes
-                val atomType = X11.Atom(4) // XA_ATOM = 4
-
-                val typeMem = Memory(Native.LONG_SIZE.toLong())
-                typeMem.setLong(0, typeUtility.toLong())
-                x11.XChangeProperty(display, win, netWmWindowType, atomType, 32, X11.PropModeReplace, typeMem, 1)
-
-                val stateMem = Memory(4L * Native.LONG_SIZE)
-                stateMem.setLong(0L * Native.LONG_SIZE, skipTaskbar.toLong())
-                stateMem.setLong(1L * Native.LONG_SIZE, skipPager.toLong())
-                stateMem.setLong(2L * Native.LONG_SIZE, kdeSkipSwitcher.toLong())
-                stateMem.setLong(3L * Native.LONG_SIZE, netSkipSwitcher.toLong())
-                x11.XChangeProperty(display, win, netWmState, atomType, 32, X11.PropModeReplace, stateMem, 4)
-
-                // 2. EWMH Client messages to root window (essential for active window managers like KWin/Mutter)
-                val atoms = arrayOf(skipTaskbar, skipPager, kdeSkipSwitcher, netSkipSwitcher)
+                // KWin owns _NET_WM_STATE after mapping. Add just the skip flags so
+                // its existing states (such as ABOVE and FOCUSED) stay intact.
                 val mask = NativeLong((X11.SubstructureRedirectMask or X11.SubstructureNotifyMask).toLong())
-
-                for (atom in atoms) {
+                val skipHints = listOf(skipTaskbar to skipPager, kdeSkipSwitcher to netSkipSwitcher)
+                for ((first, second) in skipHints) {
                     val event = X11.XEvent()
                     event.setType(X11.XClientMessageEvent::class.java)
                     event.xclient.type = X11.ClientMessage
@@ -165,8 +116,8 @@ object LinuxWindowHelper {
                     event.xclient.data.setType(Array<NativeLong>::class.java)
                     val data = arrayOf(
                         NativeLong(1), // 1 = _NET_WM_STATE_ADD
-                        NativeLong(atom.toLong()),
-                        NativeLong(0),
+                        NativeLong(first.toLong()),
+                        NativeLong(second.toLong()),
                         NativeLong(1), // 1 = normal client application source
                         NativeLong(0)
                     )
@@ -193,6 +144,13 @@ object LinuxWindowHelper {
         } else null
     }
 
+    val isWayland: Boolean by lazy {
+        isLinux && (
+            System.getenv("WAYLAND_DISPLAY") != null ||
+            System.getenv("XDG_SESSION_TYPE")?.equals("wayland", ignoreCase = true) == true
+        )
+    }
+
     /**
      * Attempts to initiate a native, hardware-accelerated window drag through the host OS window manager
      * (EWMH _NET_WM_MOVERESIZE on Linux/KDE/GNOME, WM_SYSCOMMAND on Windows).
@@ -215,13 +173,28 @@ object LinuxWindowHelper {
 
     fun startNativeMoveLinux(window: Window, xOnScreen: Int, yOnScreen: Int): Boolean {
         if (!isLinux) return false
+        // KWin handles XWayland move requests. Hyprland can advertise the same
+        // EWMH atom without handling the request, so keep the fallback there.
+        val isKde = System.getenv("XDG_CURRENT_DESKTOP").orEmpty()
+            .split(':').any { it.equals("KDE", ignoreCase = true) }
+        if (isWayland && !isKde) return false
         return runCatching {
-            if (!window.isDisplayable) return false
+            if (!window.isDisplayable) {
+                println("MiniPlayer: native move unavailable (window not displayable)")
+                return false
+            }
             val windowId = Native.getWindowID(window)
-            if (windowId == 0L) return false
+            if (windowId == 0L) {
+                println("MiniPlayer: native move unavailable (no X11 window id)")
+                return false
+            }
 
             val x11 = X11.INSTANCE
-            val display = x11.XOpenDisplay(null) ?: return false
+            val display = x11.XOpenDisplay(null)
+            if (display == null) {
+                println("MiniPlayer: native move unavailable (cannot open X display)")
+                return false
+            }
             try {
                 val win = X11.Window(windowId)
                 val root = x11.XDefaultRootWindow(display)
@@ -251,18 +224,23 @@ object LinuxWindowHelper {
                 event.write()
 
                 val mask = NativeLong((X11.SubstructureRedirectMask or X11.SubstructureNotifyMask).toLong())
-                x11.XSendEvent(display, root, 0, mask, event)
+                val sent = x11.XSendEvent(display, root, 0, mask, event)
                 x11.XFlush(display)
-                true
+                sent != 0
             } finally {
                 x11.XCloseDisplay(display)
             }
+        }.onFailure {
+            println("MiniPlayer: native move failed (${it.message})")
         }.getOrDefault(false)
     }
 
     interface ExtendedUser32 : com.sun.jna.Library {
         fun ReleaseCapture(): Boolean
-        fun PostMessage(hWnd: WinDef.HWND, msg: Int, wParam: WinDef.WPARAM, lParam: WinDef.LPARAM): Boolean
+        // NOTE: the W suffix is load-bearing. user32 only exports PostMessageA/W;
+        // a plain "PostMessage" lookup throws UnsatisfiedLinkError on first call,
+        // which used to silently kill every native move (see MiniPlayerDragTest).
+        fun PostMessageW(hWnd: WinDef.HWND, msg: Int, wParam: WinDef.WPARAM, lParam: WinDef.LPARAM): Boolean
     }
 
     private val extendedUser32: ExtendedUser32? by lazy {
@@ -275,14 +253,17 @@ object LinuxWindowHelper {
         if (!isWindows) return false
         return runCatching {
             if (!window.isDisplayable) return false
+            // A null interop (JNA unavailable in this runtime) must report failure so
+            // the manual fallback drag engages — never claim a move that was not posted,
+            // or the window silently stops moving at all.
+            val interop = extendedUser32 ?: return false
             val hwnd = WinDef.HWND(Native.getWindowPointer(window))
             if (hwnd.pointer == null || hwnd.pointer == Pointer.NULL) return false
-            extendedUser32?.ReleaseCapture()
+            interop.ReleaseCapture()
             val WM_SYSCOMMAND = 0x0112
             val SC_MOVE = 0xF010
             val HTCAPTION = 0x0002
-            extendedUser32?.PostMessage(hwnd, WM_SYSCOMMAND, WinDef.WPARAM((SC_MOVE or HTCAPTION).toLong()), WinDef.LPARAM(0))
-            true
+            interop.PostMessageW(hwnd, WM_SYSCOMMAND, WinDef.WPARAM((SC_MOVE or HTCAPTION).toLong()), WinDef.LPARAM(0))
         }.getOrDefault(false)
     }
 }

@@ -1,6 +1,10 @@
 package com.alananasss.kittytune.ui.profile
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -39,10 +43,13 @@ import com.alananasss.kittytune.data.local.*
 import com.alananasss.kittytune.ui.common.SettingsGroup
 import com.alananasss.kittytune.ui.common.SettingsGroupTitle
 import com.alananasss.kittytune.ui.common.SettingsItem
+import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.ui.common.Slider
 import com.alananasss.kittytune.ui.common.pressScale
 import com.materialkolor.PaletteStyle
 import com.materialkolor.rememberDynamicColorScheme
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 
 private val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
@@ -211,6 +218,7 @@ fun ThemesSettingsPage(onOpenCustomTheme: () -> Unit) {
     )
 
     CoversSettingsGroup()
+    HomeScreenCardsSettingsGroup()
 }
 
 /** The theme choices of the mode row: the three modes plus AMOLED, which is Dark with true black. */
@@ -276,13 +284,13 @@ private fun FontPickerDialog(
                             Text("Aa Бб 123 — KittyTune", style = MaterialTheme.typography.bodySmall.copy(fontFamily = family), color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (font == com.alananasss.kittytune.ui.theme.AppFont.Flex) {
-                            IconButton(onClick = { onSelect(font); onTuneFlex() }) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { onSelect(font); onTuneFlex() }) {
                                 Icon(Icons.Rounded.Tune, contentDescription = str("dialog_font_settings_title"))
                             }
                         }
                     }
                 }
-                TextButton(
+                TextButton(shapes = ButtonDefaults.shapes(),
                     onClick = {
                         val picked = pickFontFile(str("font_add")) ?: return@TextButton
                         val stored = fonts.import(picked)
@@ -301,7 +309,7 @@ private fun FontPickerDialog(
                 if (rejected) Text(str("font_rejected"), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(str("btn_close")) } },
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_close")) } },
     )
 }
 
@@ -317,9 +325,12 @@ private fun pickFontFile(title: String): java.io.File? =
  * of the track and playlist menus.
  */
 @Composable
-fun PlayerDesignSettingsPage() {
+fun PlayerDesignSettingsPage(playerViewModel: PlayerViewModel? = null) {
     // Shape, sliders and volume, the bar's buttons and the scroll step.
-    PlayerDesignContent(Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+    PlayerDesignContent(
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        playerViewModel = playerViewModel
+    )
     Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         MenuTilesSection(str("menu_tiles_track"), PlayerPreferences.MENU_TRACK, com.alananasss.kittytune.ui.main.MenuTiles.TRACK)
         MenuTilesSection(str("menu_tiles_playlist"), PlayerPreferences.MENU_PLAYLIST, com.alananasss.kittytune.ui.main.MenuTiles.PLAYLIST)
@@ -379,6 +390,82 @@ internal fun CoversSettingsGroup() {
                 )
             }
         },
+    )
+}
+
+/** Home screen cards: My Wave, the charts, Your mix and Listening statistics, matching KittyTune Android. */
+@Composable
+internal fun HomeScreenCardsSettingsGroup() {
+    val prefs = remember { PlayerPreferences() }
+    var showHomeListeningStats by remember { mutableStateOf(prefs.getShowHomeListeningStats()) }
+    var showHomeYourMix by remember { mutableStateOf(prefs.getShowHomeYourMix()) }
+    var showHomeMyWave by remember { mutableStateOf(prefs.getShowHomeMyWave()) }
+    var showHomeCharts by remember { mutableStateOf(prefs.getShowHomeCharts()) }
+
+    SettingsGroup(
+        title = str("pref_home_cards_group_title"),
+        items = listOf(
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("wave_title"),
+                    subtitle = str("pref_home_my_wave_desc"),
+                    icon = Icons.Rounded.Waves,
+                    hasSwitch = true,
+                    switchState = showHomeMyWave,
+                    onSwitchChange = {
+                        showHomeMyWave = it
+                        prefs.setShowHomeMyWave(it)
+                    },
+                    highlightKey = "pref_home_my_wave",
+                )
+            },
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("pref_home_charts"),
+                    subtitle = str("pref_home_charts_desc"),
+                    icon = Icons.Rounded.Leaderboard,
+                    hasSwitch = true,
+                    switchState = showHomeCharts,
+                    onSwitchChange = {
+                        showHomeCharts = it
+                        prefs.setShowHomeCharts(it)
+                    },
+                    highlightKey = "pref_home_charts",
+                )
+            },
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("listening_stats_title"),
+                    subtitle = str("pref_home_listening_stats_desc"),
+                    icon = Icons.Rounded.BarChart,
+                    hasSwitch = true,
+                    switchState = showHomeListeningStats,
+                    onSwitchChange = {
+                        showHomeListeningStats = it
+                        prefs.setShowHomeListeningStats(it)
+                    },
+                    highlightKey = "pref_home_listening_stats",
+                )
+            },
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("mix_title"),
+                    subtitle = str("pref_home_your_mix_desc"),
+                    icon = Icons.Rounded.AutoAwesome,
+                    hasSwitch = true,
+                    switchState = showHomeYourMix,
+                    onSwitchChange = {
+                        showHomeYourMix = it
+                        prefs.setShowHomeYourMix(it)
+                    },
+                    highlightKey = "pref_home_your_mix",
+                )
+            },
+        ),
     )
 }
 
@@ -468,7 +555,7 @@ private fun ThemePresetCard(
     onClick: () -> Unit,
 ) {
     val scheme = rememberDynamicColorScheme(
-        seedColor = if (seed == 0) Color(0xFFFF7A1A) else Color(seed),
+        seedColor = if (seed == 0) com.alananasss.kittytune.ui.theme.KittyTuneDefaultSeedColor else Color(seed),
         isDark = isDark,
         isAmoled = pureBlack,
         style = style,
@@ -566,7 +653,7 @@ internal fun <T> ChoiceDialog(
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(str("btn_cancel")) } },
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_cancel")) } },
     )
 }
 
@@ -599,64 +686,163 @@ private fun UiScaleDialog(prefs: PlayerPreferences, uiScale: Float, onDismiss: (
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(str("btn_close")) } },
-        dismissButton = { TextButton(onClick = { prefs.setUiScale(1.0f) }) { Text(str("btn_reset")) } },
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_close")) } },
+        dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { prefs.setUiScale(1.0f) }) { Text(str("btn_reset")) } },
     )
+}
+
+private enum class AppIconCategory {
+    OFFICIAL,
+    COMMUNITY
 }
 
 @Composable
 private fun AppIconDialog(prefs: PlayerPreferences, appIconVariant: String, onDismiss: () -> Unit) {
+    val currentVariant = remember(appIconVariant) { com.alananasss.kittytune.core.AppIconVariants.byKey(appIconVariant) }
+    var selectedCategory by remember {
+        mutableStateOf(
+            if (currentVariant?.isCommunity == true) AppIconCategory.COMMUNITY
+            else AppIconCategory.OFFICIAL
+        )
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(str("pref_app_icon")) },
         text = {
-            androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
-                columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(4),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                modifier = Modifier.heightIn(max = 420.dp)
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 440.dp, max = 520.dp)
             ) {
-                val variants = com.alananasss.kittytune.core.AppIconVariants.AVAILABLE
-                items(variants.size) { index ->
-                    val variant = variants[index]
-                    val selected = variant.key == appIconVariant
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
-                            .clickable {
-                                prefs.setAppIconVariant(variant.key)
-                                com.alananasss.kittytune.core.AppIconInstaller.apply(variant.key)
-                                onDismiss()
-                            }
-                            .padding(8.dp)
-                    ) {
-                        // Loaded by hand rather than with painterResource, which throws from
-                        // inside composition when the bitmap is missing (issue #33).
-                        val painter = remember(variant.key) { loadIconVariantPainter(variant.key) }
-                        if (painter != null) {
-                            androidx.compose.foundation.Image(
-                                painter = painter,
-                                contentDescription = com.alananasss.kittytune.core.AppIconVariants.localizedLabel(variant),
-                                modifier = Modifier.size(56.dp)
-                            )
-                        } else {
-                            Spacer(Modifier.size(56.dp))
-                        }
-                        Spacer(Modifier.height(4.dp))
+                com.alananasss.kittytune.ui.common.ExpressiveConnectedButtonGroup(
+                    options = listOf(AppIconCategory.OFFICIAL, AppIconCategory.COMMUNITY),
+                    selectedOption = selectedCategory,
+                    onOptionSelected = { selectedCategory = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    fillMaxWidth = true,
+                    labelProvider = { category ->
                         Text(
-                            text = com.alananasss.kittytune.core.AppIconVariants.localizedLabel(variant),
-                            style = MaterialTheme.typography.labelSmall,
+                            text = when (category) {
+                                AppIconCategory.OFFICIAL -> str("icon_category_official")
+                                AppIconCategory.COMMUNITY -> str("icon_category_community")
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                            softWrap = false
                         )
+                    },
+                    iconProvider = { category ->
+                        Icon(
+                            imageVector = when (category) {
+                                AppIconCategory.OFFICIAL -> Icons.Rounded.Apps
+                                AppIconCategory.COMMUNITY -> Icons.Rounded.Palette
+                            },
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                AnimatedContent(
+                    targetState = selectedCategory,
+                    transitionSpec = { fadeIn() togetherWith fadeOut() },
+                    label = "app_icon_category_transition"
+                ) { category ->
+                    val variantList = when (category) {
+                        AppIconCategory.OFFICIAL -> com.alananasss.kittytune.core.AppIconVariants.AVAILABLE_OFFICIAL
+                        AppIconCategory.COMMUNITY -> com.alananasss.kittytune.core.AppIconVariants.AVAILABLE_COMMUNITY
+                    }
+
+                    androidx.compose.foundation.lazy.LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 440.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(vertical = 4.dp)
+                    ) {
+                        items(variantList.size, key = { variantList[it].key }) { index ->
+                            val variant = variantList[index]
+                            val selected = variant.key == appIconVariant
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = if (selected) {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceContainerHigh
+                                },
+                                contentColor = if (selected) {
+                                    MaterialTheme.colorScheme.onSecondaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .clickable {
+                                        prefs.setAppIconVariant(variant.key)
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    val painter = remember(variant.key) {
+                                        com.alananasss.kittytune.core.AppIconRuntime.loadPreviewPainter(variant.key)
+                                    }
+                                    if (painter != null) {
+                                        androidx.compose.foundation.Image(
+                                            painter = painter,
+                                            contentDescription = null,
+                                            modifier = Modifier
+                                                .size(46.dp)
+                                                .padding(3.dp)
+                                                .clip(RoundedCornerShape(11.dp))
+                                        )
+                                    } else {
+                                        Spacer(Modifier.size(46.dp))
+                                    }
+                                    Spacer(Modifier.width(16.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = com.alananasss.kittytune.core.AppIconVariants.localizedLabel(variant),
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        if (variant.author != null) {
+                                            Spacer(Modifier.height(2.dp))
+                                            Text(
+                                                text = str("icon_by_artist", variant.author),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = if (selected) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                },
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        }
+                                    }
+                                    if (selected) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(24.dp),
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(str("btn_cancel")) } }
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_close")) } }
     )
 }
 
@@ -682,11 +868,16 @@ private fun FontAxesDialog(prefs: PlayerPreferences, onDismiss: () -> Unit) {
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    item { OutlinedButton(contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(400f, 100f, 0f, 0f) }) { Text(str("font_preset_default")) } }
-                    item { OutlinedButton(contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(600f, 100f, 0f, 100f) }) { Text(str("font_preset_rounded")) } }
-                    item { OutlinedButton(contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(250f, 105f, 0f, 0f) }) { Text(str("font_preset_elegant")) } }
-                    item { OutlinedButton(contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(900f, 110f, 0f, 50f) }) { Text(str("font_preset_chunky")) } }
+                com.alananasss.kittytune.ui.common.ScrollableLazyRow(
+                    showsArrows = false,
+                    fadeLength = 24.dp,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    item { OutlinedButton(shapes = ButtonDefaults.shapes(), contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(400f, 100f, 0f, 0f) }) { Text(str("font_preset_default")) } }
+                    item { OutlinedButton(shapes = ButtonDefaults.shapes(), contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(600f, 100f, 0f, 100f) }) { Text(str("font_preset_rounded")) } }
+                    item { OutlinedButton(shapes = ButtonDefaults.shapes(), contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(250f, 105f, 0f, 0f) }) { Text(str("font_preset_elegant")) } }
+                    item { OutlinedButton(shapes = ButtonDefaults.shapes(), contentPadding = PaddingValues(horizontal = 12.dp), onClick = { applyPreset(900f, 110f, 0f, 50f) }) { Text(str("font_preset_chunky")) } }
                 }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                 Column {
@@ -707,8 +898,8 @@ private fun FontAxesDialog(prefs: PlayerPreferences, onDismiss: () -> Unit) {
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(str("btn_close")) } },
-        dismissButton = { TextButton(onClick = { applyPreset(400f, 100f, 0f, 0f) }) { Text(str("btn_reset")) } }
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_close")) } },
+        dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { applyPreset(400f, 100f, 0f, 0f) }) { Text(str("btn_reset")) } }
     )
 }
 
@@ -718,18 +909,6 @@ private fun FontAxesDialog(prefs: PlayerPreferences, onDismiss: () -> Unit) {
  * it throws from composition, which took the whole app down when the icons were missing from
  * the packaged jar (issue #33). Here a missing file is just an empty tile.
  */
-private fun loadIconVariantPainter(key: String): androidx.compose.ui.graphics.painter.Painter? =
-    runCatching {
-        val path = com.alananasss.kittytune.core.AppIconVariants.resourcePath(key)
-        val loader = Thread.currentThread().contextClassLoader
-            ?: com.alananasss.kittytune.core.AppIconVariants::class.java.classLoader
-        loader?.getResourceAsStream(path)?.use { stream ->
-            androidx.compose.ui.graphics.painter.BitmapPainter(
-                androidx.compose.ui.res.loadImageBitmap(stream)
-            )
-        }
-    }.getOrNull()
-
 /** A compact switch row whose whole width is the target, for lists inside dialogs and small windows. */
 @Composable
 internal fun SwitchRow(

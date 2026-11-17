@@ -34,6 +34,7 @@ import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.text.style.TextDecoration
+import com.alananasss.kittytune.ui.player.lyrics.lyricUnderline
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -81,18 +82,18 @@ import com.alananasss.kittytune.data.AlbumResolver
 import com.alananasss.kittytune.data.DownloadManager
 import com.alananasss.kittytune.data.LikeRepository
 import com.alananasss.kittytune.data.local.AppDatabase
+import com.alananasss.kittytune.data.local.ExternalPlaylists
 import com.alananasss.kittytune.data.network.RetrofitClient
 import com.alananasss.kittytune.domain.Playlist
 import com.alananasss.kittytune.domain.Track
 import com.alananasss.kittytune.domain.User
 import com.alananasss.kittytune.ui.common.viewableCover
+import com.alananasss.kittytune.ui.common.rememberFilteredTracks
 import com.alananasss.kittytune.ui.common.TrackListItemShimmer
 import com.alananasss.kittytune.ui.player.PlaybackContext
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.utils.NetworkUtils
 import kotlinx.coroutines.flow.first
-import java.awt.FileDialog
-import java.awt.Frame
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
@@ -270,6 +271,45 @@ private object TrackCompactColumns {
 }
 
 /**
+ * Clickable album title for the track tables.
+ *
+ * Same hand-drawn rule as the lyrics and artist links: album titles are user
+ * text and can be Cyrillic / Arabic / CJK, where the native
+ * TextDecoration.Underline comes out as a mismatched dashed rule (one
+ * underline per font run). One rect per laid-out line instead.
+ */
+@Composable
+private fun AlbumHoverLink(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    var layout by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
+    val style = MaterialTheme.typography.bodyMedium
+    val linkColor = if (hovered) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+    Text(
+        text = text,
+        style = style,
+        color = linkColor,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        onTextLayout = { layout = it },
+        modifier = modifier
+            .hoverable(interaction)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+            .lyricUnderline(
+                layout = { layout },
+                visible = hovered,
+                fontSizeSp = style.fontSize.value,
+                color = linkColor,
+            )
+    )
+}
+
+/**
  * Desktop port of the Android PlaylistDetailScreen.
  * Renders inside the center panel; the Android bottom sheets become dropdown
  * menus, drag-reorder/swipe-delete become menu actions, the photo picker is an
@@ -323,6 +363,7 @@ fun PlaylistDetailScreen(
     // header line offers the picker instead of silently opening the first one.
     var playlistArtists by remember { mutableStateOf<List<com.alananasss.kittytune.data.spotify.SpotifyArtistRef>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+    var hasSavedRadio by remember(playlistId) { mutableStateOf(false) }
     var defaultIcon by remember { mutableStateOf<ImageVector?>(null) }
 
     val downloadProgress by DownloadManager.downloadProgress.collectAsState()
@@ -334,7 +375,7 @@ fun PlaylistDetailScreen(
     val isTidalArtist = playlistId.startsWith("tidal:artist:")
     val isQobuzArtist = playlistId.startsWith("qobuz:artist:")
     val isArtistStation = playlistId.startsWith("station_artist:")
-    val isArtistView = isDeezerArtist || isTidalArtist || isQobuzArtist || isArtistStation
+    val isArtistView = isDeezerArtist || isTidalArtist || isQobuzArtist
 
     val cleanIdStr = playlistId.replace("station_artist:", "")
         .replace("station_spotify:", "")
@@ -345,12 +386,15 @@ fun PlaylistDetailScreen(
         .replace("deezer:album:", "")
         .replace("deezer:playlist:", "")
         .replace("deezer:artist:", "")
+        .replace("deezer_radio:", "")
         .replace("tidal:album:", "")
         .replace("tidal:playlist:", "")
         .replace("tidal:artist:", "")
+        .replace("tidal_radio:", "")
         .replace("qobuz:album:", "")
         .replace("qobuz:playlist:", "")
         .replace("qobuz:artist:", "")
+        .replace("qobuz_radio:", "")
         .replace("station:", "")
         .replace("liked_by:", "")
         .replace("local_playlist:", "")
@@ -361,8 +405,27 @@ fun PlaylistDetailScreen(
     val stationIdFromUrn = cleanIdStr.substringAfterLast(":").toLongOrNull()
     val currentIdLong = stationIdFromUrn ?: cleanIdStr.toLongOrNull() ?: 0L
 
-    val stableId = remember(playlistId, cleanIdStr, currentIdLong) {
+    val isSpotifyRadioRoute = playlistId.startsWith("spotify_radio:") || playlistId.startsWith("station_spotify:")
+    val radioRoutePermalink = remember(playlistId, isSpotifyRadioRoute) {
+        when {
+            playlistId.startsWith("yt_radio:") -> playlistId
+            playlistId.startsWith("tidal_radio:") -> playlistId
+            playlistId.startsWith("deezer_radio:") -> playlistId
+            playlistId.startsWith("qobuz_radio:") -> playlistId
+            isSpotifyRadioRoute -> {
+                val seed = com.alananasss.kittytune.data.spotify.SpotifyRepository.extractId(playlistId)
+                seed.takeIf { it.isNotBlank() }?.let { "spotify_radio:$it" }
+            }
+            else -> null
+        }
+    }
+
+    // Kept for likes saved by older builds, which hashed the raw route.
+    val legacyStableId = remember(playlistId, cleanIdStr, currentIdLong) {
         if (currentIdLong != 0L) currentIdLong else cleanIdStr.hashCode().toLong()
+    }
+    val stableId = remember(playlistId, radioRoutePermalink, legacyStableId) {
+        ExternalPlaylists.radioStableId(radioRoutePermalink) ?: legacyStableId
     }
 
     val playlistInDb by DownloadManager.isPlaylistInLibraryFlow(stableId).collectAsState(initial = null)
@@ -394,8 +457,6 @@ fun PlaylistDetailScreen(
     var showRenameDialog by remember { mutableStateOf(false) }
     var showEditDialog by remember { mutableStateOf(false) }
     var showOptionsMenu by remember { mutableStateOf(false) }
-    var showSortMenu by remember { mutableStateOf(false) }
-    var showViewModeMenu by remember { mutableStateOf(false) }
     var showDetailsSheet by remember { mutableStateOf(false) }
 
     var playlistSearchQuery by remember { mutableStateOf("") }
@@ -409,6 +470,54 @@ fun PlaylistDetailScreen(
     val listState = rememberLazyListState()
 
     val isSpecialPlaylist = playlistId == "likes" || playlistId == "downloads" || playlistId == "local_files" || playlistId.startsWith("liked_by:") || playlistId.startsWith("station") || playlistId.startsWith("system_playlist:")
+
+    // --- Mix Mode (port of Android PR #83) ---------------------------------------------------------------
+    // Every row shows its analysed tempo and Camelot key, a transition connector sits between rows, and the
+    // harmonic smart sort is offered. Only on the user's own playlists: a mix belongs to a list they curate.
+    val mixAvailable = isUserCreated && !isSpecialPlaylist
+    var isMixMode by remember(playlistId) { mutableStateOf(false) }
+    LaunchedEffect(mixAvailable) { if (!mixAvailable) isMixMode = false }
+    // The pair whose transition is being edited; non-null shows the editor on top of the page.
+    var transitionEditor by remember { mutableStateOf<Pair<Track, Track>?>(null) }
+    // The order before the smart sort, restored when Mix Mode is switched off unless a drag saved a new one.
+    var preMixOrder by remember(playlistId) { mutableStateOf<List<Long>?>(null) }
+    // Bumped when a seam's plan is saved, so the connectors re-read the store.
+    var mixPlansVersion by remember { mutableStateOf(0) }
+    val mixScope = rememberCoroutineScope()
+    val mixReferenceProfile by remember(isMixMode, playerViewModel.uiCurrentTrack?.id) {
+        val playing = playerViewModel.uiCurrentTrack
+        if (isMixMode && playing != null) com.alananasss.kittytune.data.mix.MixPlaylistAnalyzer.profileFlow(playing)
+        else kotlinx.coroutines.flow.flowOf(null)
+    }.collectAsState(initial = null)
+    val applySmartMixSort: () -> Unit = {
+        mixScope.launch {
+            val source = tracks.toList()
+            if (source.size > 1) {
+                val profiles = com.alananasss.kittytune.data.mix.MixPlaylistAnalyzer.profilesFor(source)
+                val ordered = com.alananasss.kittytune.data.mix.MixQueuePlanner.greedyMixOrder(source) { profiles[it.id] }
+                if (preMixOrder == null) preMixOrder = source.map { it.id }
+                tracks.clear()
+                tracks.addAll(ordered)
+                com.alananasss.kittytune.core.Toaster.show(str("mix_smart_sort_applied"))
+            }
+        }
+    }
+    val setMixMode: (Boolean) -> Unit = { on ->
+        isMixMode = on
+        if (!on) {
+            transitionEditor = null
+            // Leaving Mix Mode drops the smart sort: the playlist shows its own order again.
+            preMixOrder?.let { original ->
+                val byId = tracks.associateBy { it.id }
+                val restored = original.mapNotNull { byId[it] }
+                if (restored.size == tracks.size) {
+                    tracks.clear()
+                    tracks.addAll(restored)
+                }
+            }
+            preMixOrder = null
+        }
+    }
 
     // Drag-to-reorder — only active for user-owned playlists with no active search/sort
     val canReorder = !isSpecialPlaylist && isUserCreated && playlistSearchQuery.isEmpty() && playlistSortBy == TrackSortBy.FIRST_ADDED
@@ -436,11 +545,25 @@ fun PlaylistDetailScreen(
             val newOrder = tracks.map { it.id }
             DownloadManager.reorderPlaylistTracks(currentIdLong, newOrder)
             DownloadManager.syncPlaylistOrderOnline(currentIdLong, newOrder)
+            // The dragged order is saved: it is the playlist's own order from now on.
+            preMixOrder = null
+            if (isMixMode && tracks.size > 1) {
+                val snapshot = tracks.toList()
+                mixScope.launch {
+                    val profiles = com.alananasss.kittytune.data.mix.MixPlaylistAnalyzer.profilesFor(snapshot)
+                    com.alananasss.kittytune.data.mix.MixQueuePlanner.recomputeTransitionsForReorderedTracks(playlistId, snapshot, profiles)
+                    mixPlansVersion++
+                }
+            }
         }
         wasDragging = isDragging
     }
 
-    val rawTracks: List<Track> = if (playlistId == "likes") likedTracksRepo else tracks
+    val unfilteredTracks: List<Track> = if (playlistId == "likes") likedTracksRepo else tracks
+    // Content filtering (issue #41): blocked tracks — and tracks of blocked
+    // artists, via BlockManager.isBlocked — are hidden from every list below,
+    // including the queue built from it. Uniform for likes too, by design.
+    val rawTracks = rememberFilteredTracks(unfilteredTracks)
 
     // Warm the album cache from SQLite so already-resolved rows render instantly.
     LaunchedEffect(rawTracks.size) {
@@ -567,6 +690,36 @@ fun PlaylistDetailScreen(
 
     LaunchedEffect(playlistId, refreshTrigger) {
         if (playlistId.startsWith("yt_radio:")) {
+            // A liked radio is a snapshot. Reopen it instead of re-resolving
+            // the seed remotely, which used to come back empty after a while.
+            val db = AppDatabase.downloadDao
+            val saved = if (stableId != 0L) db.getPlaylist(stableId) else null
+            val savedTracks = if (saved != null) db.getTracksForPlaylistSync(stableId) else emptyList()
+            if (saved != null && savedTracks.isNotEmpty()) {
+                hasSavedRadio = true
+                playlistTitle = saved.title
+                playlistCover = saved.localCoverPath ?: saved.artworkUrl
+                playlistUser = User(0, saved.artist, null)
+                playlistPermalinkUrl = saved.permalinkUrl ?: playlistId
+                defaultIcon = Icons.Rounded.Radio
+                val addedAtMap = db.getAddedAtForPlaylist(stableId)
+                tracks.clear()
+                tracks.addAll(savedTracks.map { local ->
+                    Track(
+                        id = local.id,
+                        title = local.title,
+                        artworkUrl = local.localArtworkPath.ifEmpty { local.artworkUrl },
+                        durationMs = local.duration,
+                        user = User(0, local.artist, null),
+                        likedAt = addedAtMap[local.id]?.takeIf { it > 0 },
+                        source = local.source ?: "youtube",
+                        permalinkUrl = local.permalinkUrl,
+                    )
+                })
+                isLoading = false
+                return@LaunchedEffect
+            }
+
             val encodedUrl = playlistId.removePrefix("yt_radio:")
             val url = URLDecoder.decode(encodedUrl, "UTF-8")
             youtubeRadioViewModel.loadInitial(url)
@@ -600,8 +753,9 @@ fun PlaylistDetailScreen(
                             isAlbum = true
                             playlistTitle = album.name
                             playlistCover = album.artworkUrl
-                            val firstArtist = album.artists.firstOrNull()
-                            playlistArtists = album.artists
+                            val uniqueArtists = album.artists.distinctBy { it.id.ifBlank { it.name } }
+                            val firstArtist = uniqueArtists.firstOrNull()
+                            playlistArtists = uniqueArtists
                             playlistUser = User(
                                 id = kotlin.math.abs(firstArtist?.id?.hashCode()?.toLong() ?: 0L),
                                 username = album.artistName,
@@ -636,6 +790,31 @@ fun PlaylistDetailScreen(
                             newTracks.addAll(pl.tracks.map { it.toTrack() })
                         }
                     } else if (isSpotifyRadio) {
+                        // Prefer the snapshot saved when the radio was liked.
+                        val saved = if (stableId != 0L) db.getPlaylist(stableId) else null
+                        val savedTracks = if (saved != null) db.getTracksForPlaylistSync(stableId) else emptyList()
+                        if (saved != null && savedTracks.isNotEmpty()) {
+                            isAlbum = false
+                            hasSavedRadio = true
+                            playlistTitle = saved.title
+                            playlistCover = saved.localCoverPath ?: saved.artworkUrl
+                            defaultIcon = Icons.Rounded.Radio
+                            playlistUser = User(0, saved.artist, null)
+                            playlistPermalinkUrl = saved.permalinkUrl ?: radioRoutePermalink
+                            val addedAtMap = db.getAddedAtForPlaylist(stableId)
+                            newTracks.addAll(savedTracks.map { local ->
+                                Track(
+                                    id = local.id,
+                                    title = local.title,
+                                    artworkUrl = local.localArtworkPath.ifEmpty { local.artworkUrl },
+                                    durationMs = local.duration,
+                                    user = User(0, local.artist, null),
+                                    likedAt = addedAtMap[local.id]?.takeIf { it > 0 },
+                                    source = local.source ?: "spotify",
+                                    permalinkUrl = local.permalinkUrl,
+                                )
+                            })
+                        } else {
                         val isArtistStationSeed = playlistId.startsWith("station_artist:") || playlistId.startsWith("spotify:artist:") || playlistId.startsWith("spotify_artist:")
                         var radioPlaylist = com.alananasss.kittytune.data.spotify.SpotifyRepository.getRadio(cleanIdStr, isArtist = isArtistStationSeed)
                         if (radioPlaylist == null) {
@@ -694,6 +873,7 @@ fun PlaylistDetailScreen(
                                 }
                             }
                         }
+                        }
                     }
                 }
 
@@ -744,6 +924,9 @@ fun PlaylistDetailScreen(
                     val isTidalAlbum = playlistId.startsWith("tidal:album:")
                     val isTidalPlaylist = playlistId.startsWith("tidal:playlist:")
                     val isTidalArtist = playlistId.startsWith("tidal:artist:")
+                    val isTidalRadio = playlistId.startsWith("tidal_radio:")
+                    val isDeezerRadio = playlistId.startsWith("deezer_radio:")
+                    val isQobuzRadio = playlistId.startsWith("qobuz_radio:")
 
                     if (isTidalAlbum) {
                         val pl = com.alananasss.kittytune.data.tidal.TidalSearchRepository.getAlbum(cleanIdStr)
@@ -779,6 +962,69 @@ fun PlaylistDetailScreen(
                             playlistPermalinkUrl = pl.permalinkUrl
                             playlistUrn = pl.urn
                             newTracks.addAll(pl.tracks ?: emptyList())
+                        }
+                    } else if (isTidalRadio) {
+                        // TIDAL builds a radio around the seed itself: the seed, then
+                        // the tracks it considers close. The route keeps the seed id
+                        // so the same radio can be reopened from the library.
+                        val radioTracks = com.alananasss.kittytune.data.tidal.TidalSearchRepository.getRadio(cleanIdStr)
+                        // TIDAL refuses to build a radio for some tracks; showing the
+                        // track itself beats an empty screen.
+                        val radio = radioTracks.ifEmpty {
+                            listOfNotNull(com.alananasss.kittytune.data.tidal.TidalSearchRepository.getTrack(cleanIdStr))
+                        }
+                        if (radio.isNotEmpty()) {
+                            val seed = radio.first()
+                            isAlbum = false
+                            playlistTitle = str("tidal_radio_title", seed.title ?: "")
+                            playlistCover = seed.artworkUrl
+                            defaultIcon = Icons.Rounded.Radio
+                            playlistUser = User(
+                                id = kotlin.math.abs("TIDAL".hashCode().toLong()),
+                                username = "TIDAL",
+                                avatarUrl = seed.artworkUrl
+                            )
+                            playlistPermalinkUrl = "https://tidal.com/browse/track/$cleanIdStr"
+                            playlistUrn = "tidal_radio:$cleanIdStr"
+                            newTracks.addAll(radio)
+                        }
+                    } else if (isDeezerRadio) {
+                        // Deezer's own artist radio: a station around the artist,
+                        // not just their greatest hits.
+                        val radioTracks = com.alananasss.kittytune.data.deezer.DeezerSearchRepository.getRadio(cleanIdStr)
+                        if (radioTracks.isNotEmpty()) {
+                            val seed = radioTracks.first()
+                            isAlbum = false
+                            playlistTitle = str("deezer_radio_title", seed.user?.username ?: "Deezer")
+                            playlistCover = seed.artworkUrl
+                            defaultIcon = Icons.Rounded.Radio
+                            playlistUser = User(
+                                id = seed.user?.id ?: 0L,
+                                username = seed.user?.username ?: "Deezer",
+                                avatarUrl = seed.user?.avatarUrl
+                            )
+                            playlistPermalinkUrl = "https://www.deezer.com/artist/$cleanIdStr"
+                            playlistUrn = "deezer_radio:$cleanIdStr"
+                            newTracks.addAll(radioTracks)
+                        }
+                    } else if (isQobuzRadio) {
+                        // A Qobuz station around the seed: the album it belongs to,
+                        // the artist, and the artists Qobuz lists as similar.
+                        val radioTracks = com.alananasss.kittytune.data.qobuz.QobuzSearchRepository.getRadio(cleanIdStr)
+                        if (radioTracks.isNotEmpty()) {
+                            val seed = radioTracks.first()
+                            isAlbum = false
+                            playlistTitle = str("qobuz_radio_title", seed.title ?: "")
+                            playlistCover = seed.artworkUrl
+                            defaultIcon = Icons.Rounded.Radio
+                            playlistUser = User(
+                                id = seed.user?.id ?: 0L,
+                                username = seed.user?.username ?: "Qobuz",
+                                avatarUrl = seed.user?.avatarUrl
+                            )
+                            playlistPermalinkUrl = "https://open.qobuz.com/track/$cleanIdStr"
+                            playlistUrn = "qobuz_radio:$cleanIdStr"
+                            newTracks.addAll(radioTracks)
                         }
                     }
                 }
@@ -829,7 +1075,14 @@ fun PlaylistDetailScreen(
                 playlistId == "likes" -> {
                     playlistTitle = str("lib_liked_tracks")
                     defaultIcon = Icons.Rounded.Favorite
-                    playlistUser = try {
+                    // The profile the library cached, when there is one: asking the API for it every time put
+                    // the "By <you>" line a round-trip behind the rest of the header, popping in last on every
+                    // visit (issue #66).
+                    val prefs = com.alananasss.kittytune.data.local.PlayerPreferences()
+                    val cachedUsername = prefs.getCachedUsername()
+                    playlistUser = playerViewModel.currentUser ?: if (cachedUsername != null && prefs.getCachedUserId() > 0) {
+                        User(prefs.getCachedUserId(), cachedUsername, null)
+                    } else try {
                         api.getMe()
                     } catch (e: Exception) {
                         User(0, str("me_artist"), null)
@@ -939,12 +1192,25 @@ fun PlaylistDetailScreen(
 
                 else -> {
                     val isOffline = !NetworkUtils.isInternetAvailable()
-                    val forceLocal = isOffline || isDownloadedView || currentIdLong < 0
-                    val localPlaylist = if (stableId != 0L && forceLocal) db.getPlaylist(stableId) else null
+                    // A radio is a self-contained snapshot, and so is any
+                    // provider list saved in the library. On a route (liked
+                    // radio) load it when it has tracks; legacy rows are opened
+                    // numerically and must always load locally so they never
+                    // fall through to SoundCloud's playlist endpoint.
+                    val localExternalRow = if (stableId != 0L) db.getPlaylist(stableId)?.takeIf { local ->
+                        radioRoutePermalink != null || ExternalPlaylists.isExternalPermalink(local.permalinkUrl)
+                    } else null
+                    val localExternalTracks = if (localExternalRow != null) db.getTracksForPlaylistSync(stableId) else emptyList()
+                    val forceLocal = isOffline || isDownloadedView || currentIdLong < 0 ||
+                        (localExternalRow != null && (localExternalTracks.isNotEmpty() || radioRoutePermalink == null))
+                    val localPlaylist = if (stableId != 0L && forceLocal) localExternalRow ?: db.getPlaylist(stableId) else null
                     if (localPlaylist != null) {
                         playlistTitle = localPlaylist.title
                         playlistCover = localPlaylist.localCoverPath ?: localPlaylist.artworkUrl
                         playlistUser = User(0, localPlaylist.artist, null)
+                        if (radioRoutePermalink != null || ExternalPlaylists.isRadioPermalink(localExternalRow?.permalinkUrl)) {
+                            defaultIcon = Icons.Rounded.Radio
+                        }
                         isUserCreated = localPlaylist.isUserCreated || currentIdLong < 0
                         isLocalPlaylist = isDownloadedView || currentIdLong < 0
                         playlistPermalinkUrl = localPlaylist.permalinkUrl
@@ -962,7 +1228,9 @@ fun PlaylistDetailScreen(
                                 artworkUrl = local.localArtworkPath.ifEmpty { local.artworkUrl },
                                 durationMs = local.duration,
                                 user = User(0, local.artist, null),
-                                likedAt = addedAtMap[local.id]?.takeIf { it > 0 }
+                                likedAt = addedAtMap[local.id]?.takeIf { it > 0 },
+                                source = local.source ?: "soundcloud",
+                                permalinkUrl = local.permalinkUrl,
                             )
                         })
                     } else {
@@ -1089,7 +1357,7 @@ fun PlaylistDetailScreen(
         }
     }
 
-    if (playlistId.startsWith("yt_radio:")) {
+    if (playlistId.startsWith("yt_radio:") && !hasSavedRadio) {
         playlistTitle = youtubeRadioViewModel.playlistTitle
         playlistCover = youtubeRadioViewModel.playlistCover
         playlistUser = youtubeRadioViewModel.playlistUser
@@ -1106,7 +1374,7 @@ fun PlaylistDetailScreen(
             title = { Text(str(if (isUserCreated) "dialog_delete_playlist_title" else "dialog_delete_playlist_from_lib_title")) },
             text = { Text(str("dialog_delete_playlist_msg")) },
             confirmButton = {
-                TextButton(onClick = {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = {
                     if (stableId != 0L) {
                         DownloadManager.deletePlaylist(
                             playlistId = stableId,
@@ -1118,7 +1386,7 @@ fun PlaylistDetailScreen(
                     onBackClick()
                 }) { Text(str("btn_confirm"), color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { showDeleteDialog = false }) { Text(str("btn_cancel")) } }
+            dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { showDeleteDialog = false }) { Text(str("btn_cancel")) } }
         )
     }
 
@@ -1128,7 +1396,7 @@ fun PlaylistDetailScreen(
             title = { Text(str("dialog_remove_download_title")) },
             text = { Text(str("dialog_remove_download_msg")) },
             confirmButton = {
-                TextButton(onClick = {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = {
                     if (playlistId == "likes") {
                         // Full list, not tracksToDisplay — an active search must not
                         // limit the removal to the visible subset.
@@ -1140,7 +1408,7 @@ fun PlaylistDetailScreen(
                     if (isDownloadedView) onBackClick()
                 }) { Text(str("btn_delete"), color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { showRemoveDownloadDialog = false }) { Text(str("btn_cancel")) } }
+            dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { showRemoveDownloadDialog = false }) { Text(str("btn_cancel")) } }
         )
     }
 
@@ -1158,7 +1426,7 @@ fun PlaylistDetailScreen(
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = {
                     if (currentIdLong != 0L && newTitle.isNotBlank()) {
                         DownloadManager.editPlaylistMetadata(currentIdLong, newTitle)
                         playlistTitle = newTitle
@@ -1166,7 +1434,7 @@ fun PlaylistDetailScreen(
                     showRenameDialog = false
                 }) { Text(str("btn_confirm")) }
             },
-            dismissButton = { TextButton(onClick = { showRenameDialog = false }) { Text(str("btn_cancel")) } }
+            dismissButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = { showRenameDialog = false }) { Text(str("btn_cancel")) } }
         )
     }
 
@@ -1214,9 +1482,9 @@ fun PlaylistDetailScreen(
             onDismissRequest = { showEditDialog = false },
             onSave = { title, description, sharing, tagList, genre, setType, releaseDate, permalink ->
                 showEditDialog = false
-                // Routes through DownloadManager so the local DB stays in sync, the
-                // online track list is preserved (trackUrns re-fetched) and DataDome
-                // 403 captchas are handled — same path as Android.
+                // Routes through DownloadManager so the local DB stays in sync and the
+                // online track list is preserved (trackUrns re-fetched) — same path as
+                // Android.
                 DownloadManager.editPlaylistMetadata(
                     playlistId = currentIdLong,
                     newTitle = title,
@@ -1244,8 +1512,11 @@ fun PlaylistDetailScreen(
         val creatorName = playlistUser?.username
         val isVerified = playlistUser?.verified == true
         when {
-            playlistId == "likes" -> PlaybackContext(str("context_playlist", str("lib_liked_tracks")), "likes", null, artistName = null)
-            playlistId == "downloads" -> PlaybackContext(str("context_playlist", str("lib_downloads")), "downloads", null, artistName = null)
+            // Named for what they are: "Playlist · Liked tracks" called a list of likes a playlist (issue #66).
+            // Only playlists somebody made keep the word.
+            playlistId == "likes" -> PlaybackContext(str("lib_liked_tracks"), "likes", null, artistName = null)
+            playlistId == "downloads" -> PlaybackContext(str("lib_downloads"), "downloads", null, artistName = null)
+            playlistId == "local_files" -> PlaybackContext(str("local_media_title"), "local_files", null, artistName = null)
             playlistId.startsWith("station") || playlistId.startsWith("yt_radio:") ->
                 PlaybackContext(str("context_station", playlistTitle), playlistId, playlistCover, artistName = null, isVerified = isVerified)
             isAlbum -> PlaybackContext(str("context_album", playlistTitle), playlistId, playlistCover, artistName = creatorName, isVerified = isVerified)
@@ -1285,6 +1556,11 @@ fun PlaylistDetailScreen(
             }
         }
 
+        // The colour of the liked songs, from the top, while one of them plays (issue #66).
+        if (playlistId == "likes" && likedTracksRepo.size >= 4) {
+            LikesAura(likedTracksRepo, playerViewModel, modifier = Modifier.align(Alignment.TopCenter))
+        }
+
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
@@ -1292,11 +1568,14 @@ fun PlaylistDetailScreen(
         ) {
             // -------- header: cover + meta + actions
             item {
+                // Narrow, with the right panel open: the cover gives way so the title and the artist keep their room.
+                BoxWithConstraints(Modifier.fillMaxWidth()) {
+                val coverSize = if (maxWidth < 520.dp) 120.dp else 180.dp
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(24.dp).padding(top = 32.dp),
                     verticalAlignment = Alignment.Bottom
                 ) {
-                    Card(shape = RoundedCornerShape(12.dp), elevation = CardDefaults.cardElevation(12.dp), modifier = Modifier.size(180.dp)) {
+                    Card(shape = RoundedCornerShape(12.dp), elevation = CardDefaults.cardElevation(12.dp), modifier = Modifier.size(coverSize)) {
                         if (!playlistCover.isNullOrEmpty()) {
                             AsyncImage(model = playlistCover, contentDescription = null, modifier = Modifier.fillMaxSize().viewableCover(playlistCover), contentScale = ContentScale.Crop)
                         } else if (defaultIcon != null) {
@@ -1350,6 +1629,9 @@ fun PlaylistDetailScreen(
                         } else if (playlistUser != null && playlistUser!!.id > 0) {
                             val ownerInteraction = remember { MutableInteractionSource() }
                             val ownerHovered by ownerInteraction.collectIsHoveredAsState()
+                            // Username: same Cyrillic-safe hand-drawn rule as the lyrics.
+                            var ownerLayout by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
+                            val ownerStyle = MaterialTheme.typography.titleMedium
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
@@ -1358,21 +1640,33 @@ fun PlaylistDetailScreen(
                                     .clickable(interactionSource = ownerInteraction, indication = null) {
                                         val owner = playlistUser!!
                                         val ownerUrn = owner.urn ?: ""
+                                        val uniqueArtists = playlistArtists.distinctBy { it.id.ifBlank { it.name } }
                                         when {
                                             // A record credited to several artists asks which one to open.
-                                            playlistArtists.count { it.id.isNotBlank() } > 1 ->
-                                                playerViewModel.navigateToArtistChoice(playlistArtists, owner.id)
+                                            uniqueArtists.count { it.id.isNotBlank() } > 1 ->
+                                                playerViewModel.navigateToArtistChoice(uniqueArtists, owner.id)
                                             ownerUrn.startsWith("spotify:artist:") ->
                                                 playerViewModel.navigateToSpotifyArtist(ownerUrn.removePrefix("spotify:artist:"))
                                             else -> playerViewModel.navigateToArtist(owner.id)
                                         }
                                     }
                             ) {
+                                // The tracks' own credit when they agree on one: the account's name can be a
+                                // shared one, "Kai Angel & 9mice" on a record only one of them sings.
+                                val credit = remember(tracks.size, playlistUser) {
+                                    albumCreditFor(tracks)?.takeIf { playlistUser?.urn?.startsWith("spotify") != true }
+                                }
                                 Text(
-                                    str("playlist_by_user", playlistUser!!.username ?: ""),
-                                    style = MaterialTheme.typography.titleMedium,
+                                    str("playlist_by_user", credit ?: playlistUser!!.username ?: ""),
+                                    style = ownerStyle,
                                     color = MaterialTheme.colorScheme.primary,
-                                    textDecoration = if (ownerHovered) TextDecoration.Underline else null
+                                    onTextLayout = { ownerLayout = it },
+                                    modifier = Modifier.lyricUnderline(
+                                        layout = { ownerLayout },
+                                        visible = ownerHovered,
+                                        fontSizeSp = ownerStyle.fontSize.value,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
                                 )
                                 if (playlistUser?.verified == true) {
                                     Spacer(Modifier.width(4.dp))
@@ -1413,6 +1707,7 @@ fun PlaylistDetailScreen(
                                 }
                             }
                             isYoutubeRadio -> str("radio") + " • YouTube"
+                            isSpotifyRadioRoute -> str("radio") + " • Spotify"
                             isLoading && playlistId != "likes" -> "..."
                             else -> {
                                 val count = tracksToDisplay.size
@@ -1432,7 +1727,9 @@ fun PlaylistDetailScreen(
                         // Action row
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             if (tracksToDisplay.isNotEmpty()) {
-                                Button(shapes = ButtonDefaults.shapes(), onClick = { playerViewModel.playPlaylist(tracksToDisplay.toList(), 0, playbackContext) },
+                                if (isMixMode) {
+                                    MixCdjPlayButton(onClick = { playerViewModel.playPlaylist(tracksToDisplay.toList(), 0, playbackContext) })
+                                } else Button(shapes = ButtonDefaults.shapes(), onClick = { playerViewModel.playPlaylist(tracksToDisplay.toList(), 0, playbackContext) },
                                     modifier = Modifier.height(44.dp)
                                 ) {
                                     Icon(Icons.Default.PlayArrow, null)
@@ -1440,7 +1737,7 @@ fun PlaylistDetailScreen(
                                     Text(str("btn_play"), fontWeight = FontWeight.Bold)
                                 }
                                 Spacer(Modifier.width(8.dp))
-                                FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { playerViewModel.playPlaylist(tracksToDisplay.toList().shuffled(), context = playbackContext) },
+                                FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { playerViewModel.playPlaylistShuffled(tracksToDisplay.toList(), context = playbackContext) },
                                     modifier = Modifier.height(44.dp)
                                 ) {
                                     Icon(Icons.Default.Shuffle, null)
@@ -1450,34 +1747,23 @@ fun PlaylistDetailScreen(
                                 Spacer(Modifier.width(8.dp))
                             }
 
-                            if ((isLocalPlaylist || isUserCreated) && !isYoutubeRadio) {
-                                IconButton(shapes = IconButtonDefaults.shapes(), onClick = { 
-                                    if (isUserCreated) showEditDialog = true else showRenameDialog = true 
-                                }) {
-                                    Icon(Icons.Outlined.Edit, str("profile_edit"))
-                                }
-                                IconButton(onClick = {
-                                    val dialog = FileDialog(null as Frame?, str("storage_change_btn"), FileDialog.LOAD)
-                                    dialog.setFilenameFilter { _, name ->
-                                        name.endsWith(".png", true) || name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) || name.endsWith(".webp", true)
-                                    }
-                                    dialog.isVisible = true
-                                    val file = dialog.files.firstOrNull()
-                                    if (file != null && currentIdLong != 0L) DownloadManager.updatePlaylistCover(currentIdLong, file, title = playlistTitle, artist = playlistUser?.username)
-                                }) {
-                                    Icon(Icons.Outlined.Image, str("storage_change_btn"))
-                                }
-                            }
+                            // Play and shuffle are the page's two buttons; the heart is the one thing about a
+                            // playlist you flip often. Editing, the cover, downloading and deleting are rarer
+                            // and live in the menu, where a row of five mismatched icons used to sit (issue #66).
+                            val canEdit = (isLocalPlaylist || isUserCreated) && !isYoutubeRadio
+                            val canDownload = !isYoutubeRadio && playlistId != "downloads" && tracksToDisplay.isNotEmpty()
+                            val canDelete = !isYoutubeRadio && stableId != 0L &&
+                                playlistId != "likes" && playlistId != "downloads" && playlistId != "local_files"
 
-                            if (playlistId != "downloads" && playlistId != "likes" && playlistId != "local_files") {
-                                if (isUserCreated) {
-                                    IconButton(onClick = { showDeleteDialog = true }) {
-                                        Icon(Icons.Default.Delete, str("btn_delete"), tint = MaterialTheme.colorScheme.error)
-                                    }
-                                } else {
-                                    val isPlaylistLiked = likedPlaylistsRepo.contains(stableId)
-                                    IconButton(onClick = {
+                            if (playlistId != "downloads" && playlistId != "likes" && playlistId != "local_files" && !isUserCreated) {
+                                val isPlaylistLiked = likedPlaylistsRepo.contains(stableId) ||
+                                    (legacyStableId != stableId && likedPlaylistsRepo.contains(legacyStableId))
+                                FilledTonalIconButton(
+                                    shapes = IconButtonDefaults.shapes(),
+                                    modifier = Modifier.size(44.dp),
+                                    onClick = {
                                         if (!isPlaylistLiked) {
+                                            val savedPermalink = radioRoutePermalink ?: playlistPermalinkUrl
                                             val targetPlaylist = Playlist(
                                                 id = stableId,
                                                 title = playlistTitle,
@@ -1487,68 +1773,47 @@ fun PlaylistDetailScreen(
                                                 user = playlistUser ?: User(0, playlistUser?.username ?: "", null),
                                                 tracks = tracksToDisplay.toList(),
                                                 isAlbum = isAlbum,
-                                                permalinkUrl = playlistPermalinkUrl ?: shareUrl,
+                                                permalinkUrl = savedPermalink ?: shareUrl,
                                                 urn = playlistUrn
                                             )
                                             DownloadManager.importPlaylistToLibrary(
                                                 playlist = targetPlaylist,
                                                 tracks = tracksToDisplay.toList(),
-                                                syncToCloud = !(playlistId.startsWith("spotify") || playlistId.startsWith("station_spotify") || playlistUrn?.startsWith("spotify:") == true || playlistPermalinkUrl?.contains("spotify") == true),
+                                                syncToCloud = radioRoutePermalink == null &&
+                                                    !ExternalPlaylists.isExternalPermalink(savedPermalink ?: shareUrl) &&
+                                                    !(playlistId.startsWith("spotify") || playlistId.startsWith("station_spotify") || playlistUrn?.startsWith("spotify:") == true || playlistPermalinkUrl?.contains("spotify") == true),
                                                 likePlaylist = true
                                             )
                                         } else {
                                             LikeRepository.togglePlaylistLike(
                                                 stableId,
                                                 false,
-                                                playlistPermalinkUrl,
+                                                radioRoutePermalink ?: playlistPermalinkUrl,
                                                 playlistUrn
                                             )
+                                            if (legacyStableId != stableId) {
+                                                LikeRepository.togglePlaylistLike(
+                                                    legacyStableId,
+                                                    false,
+                                                    playlistPermalinkUrl,
+                                                    playlistUrn
+                                                )
+                                            }
                                         }
-                                    }) {
-                                        if (isPlaylistLiked) Icon(Icons.Rounded.Favorite, str("lib_liked_tracks"), tint = MaterialTheme.colorScheme.primary)
-                                        else Icon(Icons.Outlined.FavoriteBorder, str("menu_add_playlist"))
-                                    }
+                                    },
+                                ) {
+                                    if (isPlaylistLiked) Icon(Icons.Rounded.Favorite, str("lib_liked_tracks"), tint = MaterialTheme.colorScheme.primary)
+                                    else Icon(Icons.Outlined.FavoriteBorder, str("menu_add_playlist"))
                                 }
+                                Spacer(Modifier.width(8.dp))
                             }
 
-                            if (!isYoutubeRadio && playlistId != "downloads" && tracksToDisplay.isNotEmpty()) {
-                                IconButton(onClick = {
-                                    val targetBatchId = if (playlistId == "likes") DownloadManager.LIKES_BATCH_ID else stableId
-                                    if (isPlaylistDownloading) {
-                                        DownloadManager.cancelBatch(targetBatchId)
-                                    } else if (isFullyDownloaded) {
-                                        showRemoveDownloadDialog = true
-                                    } else {
-                                        if (playlistId == "likes") {
-                                            DownloadManager.downloadBatch(tracksToDisplay.toList(), DownloadManager.LIKES_BATCH_ID)
-                                        } else if (stableId != 0L) {
-                                            val fakePlaylist = Playlist(
-                                                id = stableId,
-                                                title = playlistTitle,
-                                                artworkUrl = playlistCover,
-                                                calculatedArtworkUrl = null,
-                                                trackCount = tracks.size,
-                                                user = playlistUser,
-                                                tracks = null,
-                                                permalinkUrl = playlistPermalinkUrl,
-                                                urn = playlistUrn,
-                                                isAlbum = isAlbum
-                                            )
-                                            DownloadManager.downloadPlaylist(fakePlaylist, tracks.toList())
-                                        }
-                                    }
-                                }) {
-                                    when {
-                                        isPlaylistDownloading -> Icon(Icons.Rounded.Close, str("btn_cancel"))
-                                        isFullyDownloaded -> Icon(Icons.Rounded.Delete, str("btn_delete"), tint = MaterialTheme.colorScheme.error)
-                                        else -> Icon(Icons.Rounded.Download, str("btn_download"))
-                                    }
-                                }
-                            }
-
-                            // Overflow menu: queue actions + share
                             Box {
-                                IconButton(onClick = { showOptionsMenu = true }) {
+                                FilledTonalIconButton(
+                                    onClick = { showOptionsMenu = true },
+                                    shapes = IconButtonDefaults.shapes(),
+                                    modifier = Modifier.size(44.dp),
+                                ) {
                                     Icon(Icons.Default.MoreVert, str("btn_options"))
                                 }
                                 DropdownMenu(expanded = showOptionsMenu, onDismissRequest = { showOptionsMenu = false }) {
@@ -1575,12 +1840,81 @@ fun PlaylistDetailScreen(
                                             leadingIcon = { Icon(Icons.Rounded.Favorite, null) },
                                             onClick = {
                                                 showOptionsMenu = false
-                                                val likedCount =
-                                                    com.alananasss.kittytune.data.LikeRepository.addLikesBulk(tracksToDisplay.toList())
-                                                if (likedCount > 0) {
-                                                    com.alananasss.kittytune.core.Toaster.show(str("toast_like_all_done", likedCount))
+                                                LikeAllPrompt.ask(tracksToDisplay.toList())
+                                            }
+                                        )
+                                    }
+                                    if (canEdit) {
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text(str("profile_edit")) },
+                                            leadingIcon = { Icon(Icons.Outlined.Edit, null) },
+                                            onClick = {
+                                                showOptionsMenu = false
+                                                if (isUserCreated) showEditDialog = true else showRenameDialog = true
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text(str("playlist_menu_change_cover")) },
+                                            leadingIcon = { Icon(Icons.Outlined.Image, null) },
+                                            onClick = {
+                                                showOptionsMenu = false
+                                                val file = com.alananasss.kittytune.core.NativeFileDialog.openFile(
+                                                    str("storage_change_btn"),
+                                                    com.alananasss.kittytune.core.NativeFileDialog.FileType("Images", listOf("png", "jpg", "jpeg", "webp")),
+                                                )
+                                                if (file != null && currentIdLong != 0L) DownloadManager.updatePlaylistCover(currentIdLong, file, title = playlistTitle, artist = playlistUser?.username)
+                                            }
+                                        )
+                                    }
+                                    if (canDownload) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    str(
+                                                        when {
+                                                            isPlaylistDownloading -> "playlist_menu_cancel_download"
+                                                            isFullyDownloaded -> "playlist_menu_remove_download"
+                                                            else -> "playlist_menu_download"
+                                                        }
+                                                    )
+                                                )
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    when {
+                                                        isPlaylistDownloading -> Icons.Rounded.Close
+                                                        isFullyDownloaded -> Icons.Rounded.DownloadDone
+                                                        else -> Icons.Rounded.Download
+                                                    },
+                                                    null,
+                                                )
+                                            },
+                                            onClick = {
+                                                showOptionsMenu = false
+                                                val targetBatchId = if (playlistId == "likes") DownloadManager.LIKES_BATCH_ID else stableId
+                                                if (isPlaylistDownloading) {
+                                                    DownloadManager.cancelBatch(targetBatchId)
+                                                } else if (isFullyDownloaded) {
+                                                    showRemoveDownloadDialog = true
                                                 } else {
-                                                    com.alananasss.kittytune.core.Toaster.show(str("toast_like_all_nothing"))
+                                                    if (playlistId == "likes") {
+                                                        DownloadManager.downloadBatch(tracksToDisplay.toList(), DownloadManager.LIKES_BATCH_ID)
+                                                    } else if (stableId != 0L) {
+                                                        val fakePlaylist = Playlist(
+                                                            id = stableId,
+                                                            title = playlistTitle,
+                                                            artworkUrl = playlistCover,
+                                                            calculatedArtworkUrl = null,
+                                                            trackCount = tracks.size,
+                                                            user = playlistUser,
+                                                            tracks = null,
+                                                            permalinkUrl = playlistPermalinkUrl,
+                                                            urn = playlistUrn,
+                                                            isAlbum = isAlbum
+                                                        )
+                                                        DownloadManager.downloadPlaylist(fakePlaylist, tracks.toList())
+                                                    }
                                                 }
                                             }
                                         )
@@ -1605,20 +1939,20 @@ fun PlaylistDetailScreen(
                                     }
                                     if (shareUrl.isNotEmpty()) {
                                         DropdownMenuItem(
-                                            text = { Text(str("btn_share")) },
+                                            text = { Text(str("cover_copy_link")) },
                                             leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) },
                                             onClick = {
                                                 Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(shareUrl), null)
+                                                com.alananasss.kittytune.core.Toaster.confirm(str("artist_link_copied"))
                                                 showOptionsMenu = false
                                             }
                                         )
                                     }
-                                    if (!isYoutubeRadio && stableId != 0L &&
-                                        playlistId != "likes" && playlistId != "downloads" && playlistId != "local_files"
-                                    ) {
+                                    if (canDelete) {
+                                        HorizontalDivider()
                                         DropdownMenuItem(
-                                            text = { Text(str(if (isUserCreated) "menu_delete_playlist" else "dialog_delete_playlist_from_lib_title")) },
-                                            leadingIcon = { Icon(Icons.Rounded.Delete, null) },
+                                            text = { Text(str(if (isUserCreated) "menu_delete_playlist" else "dialog_delete_playlist_from_lib_title"), color = MaterialTheme.colorScheme.error) },
+                                            leadingIcon = { Icon(Icons.Rounded.Delete, null, tint = MaterialTheme.colorScheme.error) },
                                             onClick = {
                                                 showOptionsMenu = false
                                                 showDeleteDialog = true
@@ -1629,6 +1963,7 @@ fun PlaylistDetailScreen(
                             }
                         }
                     }
+                }
                 }
             }
 
@@ -1735,7 +2070,7 @@ fun PlaylistDetailScreen(
                                     leadingIcon = { Icon(Icons.Default.Search, null) },
                                     trailingIcon = {
                                         if (playlistSearchQuery.isNotEmpty()) {
-                                            IconButton(onClick = {
+                                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
                                                 playlistSearchQuery = ""
                                                 focusManager.clearFocus()
                                             }) { Icon(Icons.Rounded.Close, null) }
@@ -1754,85 +2089,38 @@ fun PlaylistDetailScreen(
                                             focusManager.clearFocus()
                                         }
                                 )
-                                Box {
-                                    FilledTonalIconButton(onClick = { showSortMenu = true }) {
-                                        Icon(Icons.Rounded.Sort, str("btn_options"))
-                                    }
-                                    DropdownMenu(expanded = showSortMenu, onDismissRequest = { showSortMenu = false }) {
-                                        val options = listOf(
-                                            TrackSortBy.FIRST_ADDED to str("sort_first_added"),
-                                            TrackSortBy.RECENTLY_ADDED to str("sort_recently_added"),
-                                            TrackSortBy.TITLE_AZ to str("sort_title_az"),
-                                            TrackSortBy.ARTIST_AZ to str("sort_artist_az")
-                                        )
-                                        options.forEach { (sortType, label) ->
-                                            DropdownMenuItem(
-                                                text = {
-                                                    Text(
-                                                        label,
-                                                        fontWeight = if (playlistSortBy == sortType) FontWeight.Bold else FontWeight.Normal,
-                                                        color = if (playlistSortBy == sortType) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                                    )
-                                                },
-                                                trailingIcon = {
-                                                    if (playlistSortBy == sortType) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary)
-                                                },
-                                                onClick = { playlistSortBy = sortType; showSortMenu = false }
-                                            )
-                                        }
-                                    }
+                                // The same buttons every list's sort and view use: the icon of what is chosen, its name
+                                // in the tooltip, the options with their icons in the menu (issue #66).
+                                val sortOptions = listOf(
+                                    Triple(TrackSortBy.FIRST_ADDED, str("sort_first_added"), Icons.Rounded.ArrowUpward),
+                                    Triple(TrackSortBy.RECENTLY_ADDED, str("sort_recently_added"), Icons.Rounded.ArrowDownward),
+                                    Triple(TrackSortBy.TITLE_AZ, str("sort_title_az"), Icons.Rounded.SortByAlpha),
+                                    Triple(TrackSortBy.ARTIST_AZ, str("sort_artist_az"), Icons.Rounded.Person),
+                                )
+                                com.alananasss.kittytune.ui.common.IconChoiceButton(
+                                    options = sortOptions,
+                                    selected = sortOptions.firstOrNull { it.first == playlistSortBy } ?: sortOptions.first(),
+                                    onSelect = { playlistSortBy = it.first },
+                                    icon = { it.third },
+                                    label = { it.second },
+                                    tooltip = { str("lib_sort_by_title") + ": " + it.second },
+                                )
+                                val viewModes = listOf(
+                                    Triple(TrackViewMode.COMPACT, str("view_mode_compact"), Icons.Rounded.Menu),
+                                    Triple(TrackViewMode.LIST, str("view_mode_list"), Icons.AutoMirrored.Rounded.FormatListBulleted),
+                                )
+                                if (mixAvailable) {
+                                    if (isMixMode) MixSmartSortButton(onClick = applySmartMixSort)
+                                    MixModeToggleButton(enabled = isMixMode, onToggle = { setMixMode(!isMixMode) })
                                 }
-                                // Spotify-style view mode picker (Compact / List)
-                                Box {
-                                    val viewMode = TrackViewModePref.mode
-                                    TextButton(
-                                        onClick = { showViewModeMenu = true },
-                                        shape = CircleShape,
-                                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    ) {
-                                        Text(
-                                            if (viewMode == TrackViewMode.COMPACT) str("view_mode_compact") else str("view_mode_list"),
-                                            style = MaterialTheme.typography.bodyMedium
-                                        )
-                                        Spacer(Modifier.width(6.dp))
-                                        Icon(
-                                            if (viewMode == TrackViewMode.COMPACT) Icons.Rounded.Menu else Icons.AutoMirrored.Rounded.FormatListBulleted,
-                                            str("lib_view_mode"),
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                    }
-                                    DropdownMenu(expanded = showViewModeMenu, onDismissRequest = { showViewModeMenu = false }) {
-                                        Text(
-                                            str("lib_view_mode"),
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                                        )
-                                        val modes = listOf(
-                                            Triple(TrackViewMode.COMPACT, str("view_mode_compact"), Icons.Rounded.Menu),
-                                            Triple(TrackViewMode.LIST, str("view_mode_list"), Icons.AutoMirrored.Rounded.FormatListBulleted)
-                                        )
-                                        modes.forEach { (mode, label, icon) ->
-                                            val selected = viewMode == mode
-                                            DropdownMenuItem(
-                                                text = {
-                                                    Text(
-                                                        label,
-                                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                                    )
-                                                },
-                                                leadingIcon = {
-                                                    Icon(icon, null, tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
-                                                },
-                                                trailingIcon = {
-                                                    if (selected) Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.primary)
-                                                },
-                                                onClick = { TrackViewModePref.set(mode); showViewModeMenu = false }
-                                            )
-                                        }
-                                    }
-                                }
+                                com.alananasss.kittytune.ui.common.IconChoiceButton(
+                                    options = viewModes,
+                                    selected = viewModes.firstOrNull { it.first == TrackViewModePref.mode } ?: viewModes.first(),
+                                    onSelect = { TrackViewModePref.set(it.first) },
+                                    icon = { it.third },
+                                    label = { it.second },
+                                    tooltip = { str("lib_view_mode") + ": " + it.second },
+                                )
                             }
                             Spacer(Modifier.height(8.dp))
                         }
@@ -1866,15 +2154,28 @@ fun PlaylistDetailScreen(
                         }
 
                         val itemKey = getPlaylistTrackStableKey(index, track.id, tracksToDisplay)
+                        // Mix Mode: the row's tempo and key, coloured against the track playing now. The flow also warms
+                        // the analysis cache the smart sort reads.
+                        val mixBadge = if (isMixMode) {
+                            com.alananasss.kittytune.data.mix.MixPlaylistAnalyzer.profileFlow(track)
+                                .collectAsState(initial = null).value?.let { profile ->
+                                    MixBadgeUi(
+                                        bpm = profile.bpm,
+                                        camelot = profile.camelot,
+                                        fit = com.alananasss.kittytune.data.mix.MixPlaylistAnalyzer.keyFit(profile.camelot, mixReferenceProfile?.camelot),
+                                    )
+                                }
+                        } else null
                         ReorderableItem(reorderableState, key = itemKey) { isDraggingThis ->
                             val dragHandleModifier = if (canReorder)
                                 Modifier.draggableHandle()
                             else Modifier
 
+                            Column {
                             if (TrackViewModePref.mode == TrackViewMode.COMPACT) {
                                 TrackCompactItem(
                                     track = track,
-                                    currentlyPlayingTrack = playerViewModel.currentTrack,
+                                    currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
                                     index = index,
                                     isDownloading = isDownloading,
                                     isDownloaded = isDownloaded,
@@ -1890,12 +2191,14 @@ fun PlaylistDetailScreen(
                                     showAlbum = !isAlbum,
                                     showDate = showDateColumn,
                                     dragHandleModifier = dragHandleModifier,
-                                    isDragging = isDraggingThis
+                                    isDragging = isDraggingThis,
+                                    mixMode = isMixMode,
+                                    mixBadge = mixBadge,
                                 )
                             } else {
                                 TrackTableItem(
                                     track = track,
-                                    currentlyPlayingTrack = playerViewModel.currentTrack,
+                                    currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
                                     index = index,
                                     isDownloading = isDownloading,
                                     isDownloaded = isDownloaded,
@@ -1913,8 +2216,20 @@ fun PlaylistDetailScreen(
                                     showDate = showDateColumn,
                                     useReleaseDate = useReleaseDate,
                                     dragHandleModifier = dragHandleModifier,
-                                    isDragging = isDraggingThis
+                                    isDragging = isDraggingThis,
+                                    mixMode = isMixMode,
+                                    mixBadge = mixBadge,
                                 )
+                            }
+                            // The transition into the next row; clicking it opens the editor for that pair.
+                            if (isMixMode && index < tracksToDisplay.lastIndex && !isDraggingThis) {
+                                val nextTrack = tracksToDisplay[index + 1]
+                                val plan = remember(track.id, nextTrack.id, mixPlansVersion) {
+                                    com.alananasss.kittytune.audio.automix.TransitionStore.loadAny(playlistId, track.id, nextTrack.id, currentIdLong)
+                                        ?: com.alananasss.kittytune.audio.automix.TransitionPlan()
+                                }
+                                MixTransitionConnector(plan = plan, onClick = { transitionEditor = track to nextTrack })
+                            }
                             }
                         }
                     }
@@ -1927,6 +2242,24 @@ fun PlaylistDetailScreen(
                     }
                 }
             }
+        }
+
+        // The transition editor for one connector. Save stores the plan under every route key the pair can be
+        // played from; Cancel just closes it.
+        transitionEditor?.let { (trackA, trackB) ->
+            com.alananasss.kittytune.ui.player.mix.EditTransitionScreen(
+                trackA = trackA,
+                trackB = trackB,
+                initialPlan = com.alananasss.kittytune.audio.automix.TransitionStore.loadAny(playlistId, trackA.id, trackB.id, currentIdLong)
+                    ?: com.alananasss.kittytune.audio.automix.TransitionPlan(),
+                playlistKey = playlistId,
+                onSave = { savedPlan ->
+                    com.alananasss.kittytune.audio.automix.TransitionStore.saveAll(playlistId, currentIdLong, trackA.id, trackB.id, savedPlan)
+                    mixPlansVersion++
+                    com.alananasss.kittytune.core.Toaster.show(str("transition_saved"))
+                },
+                onDismiss = { transitionEditor = null },
+            )
         }
 
     }
@@ -2036,13 +2369,20 @@ fun TrackListItem(
             }
             Spacer(Modifier.width(16.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = track.title ?: str("untitled_track"),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    fontWeight = titleWeight,
-                    color = titleColor
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = track.title ?: str("untitled_track"),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = titleWeight,
+                        color = titleColor,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (track.isGoPlus) {
+                        Spacer(Modifier.width(6.dp))
+                        com.alananasss.kittytune.ui.common.GoPlusBadge(compact = true)
+                    }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (isDownloaded && !isDownloading) {
                         Icon(Icons.Rounded.DownloadDone, str("btn_downloaded"), modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
@@ -2061,9 +2401,6 @@ fun TrackListItem(
                     }
                     com.alananasss.kittytune.ui.common.TrackRowSocialMarkers(track, showLikeIndicator)
                 }
-            }
-            IconButton(onClick = onOptionClick, modifier = Modifier.size(40.dp)) {
-                Icon(Icons.Default.MoreVert, str("btn_options"), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -2137,7 +2474,7 @@ fun TrackTableHeaderRow(
                     )
                 }
             }
-            Box(modifier = Modifier.width(60.dp).padding(end = 16.dp), contentAlignment = Alignment.CenterEnd) {
+            Box(modifier = Modifier.width(60.dp), contentAlignment = Alignment.CenterEnd) {
                 Icon(
                     imageVector = Icons.Rounded.Schedule,
                     contentDescription = null,
@@ -2145,7 +2482,6 @@ fun TrackTableHeaderRow(
                     modifier = Modifier.size(16.dp)
                 )
             }
-            Spacer(Modifier.width(40.dp))
         }
         HorizontalDivider(
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
@@ -2211,7 +2547,10 @@ fun TrackTableItem(
     showPlays: Boolean = false,
     onPlayCountClick: (() -> Unit)? = null,
     dragHandleModifier: Modifier = Modifier,
-    isDragging: Boolean = false
+    isDragging: Boolean = false,
+    /** Mix Mode adds a tempo/key column before the duration; [mixBadge] is null until the track is analysed. */
+    mixMode: Boolean = false,
+    mixBadge: MixBadgeUi? = null,
 ) {
     val isCurrent = currentlyPlayingTrack?.id == track.id
     val titleColor = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
@@ -2285,14 +2624,21 @@ fun TrackTableItem(
                 }
                 Spacer(Modifier.width(12.dp))
                 Column {
-                    Text(
-                        text = track.title ?: str("untitled_track"),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        fontWeight = titleWeight,
-                        color = titleColor,
-                        style = MaterialTheme.typography.bodyLarge
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = track.title ?: str("untitled_track"),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            fontWeight = titleWeight,
+                            color = titleColor,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        if (track.isGoPlus) {
+                            Spacer(Modifier.width(6.dp))
+                            com.alananasss.kittytune.ui.common.GoPlusBadge(compact = true)
+                        }
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (isDownloaded && !isDownloading) {
                             Icon(Icons.Rounded.DownloadDone, str("btn_downloaded"), modifier = Modifier.size(12.dp), tint = MaterialTheme.colorScheme.primary)
@@ -2320,21 +2666,9 @@ fun TrackTableItem(
                 val spotifyAlbumTitle = track.publisherMetadata?.albumTitle
                 when {
                     spotifyAlbumId != null -> {
-                        val interaction = remember { MutableInteractionSource() }
-                        val hovered by interaction.collectIsHoveredAsState()
-                        Text(
+                        AlbumHoverLink(
                             text = spotifyAlbumTitle ?: str("profile_tab_albums"),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (hovered) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                            textDecoration = if (hovered) TextDecoration.Underline else null,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .hoverable(interaction)
-                                .pointerHoverIcon(PointerIcon.Hand)
-                                .clickable(interactionSource = interaction, indication = null) {
-                                    onAlbumClick("spotify:album:$spotifyAlbumId")
-                                }
+                            onClick = { onAlbumClick("spotify:album:$spotifyAlbumId") }
                         )
                     }
                     else -> {
@@ -2342,21 +2676,9 @@ fun TrackTableItem(
                 if (resolved != null) {
                     val albumId = resolved.info.playlistId
                     if (albumId != null) {
-                        val interaction = remember { MutableInteractionSource() }
-                        val hovered by interaction.collectIsHoveredAsState()
-                        Text(
+                        AlbumHoverLink(
                             text = resolved.info.title,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (hovered) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                            textDecoration = if (hovered) TextDecoration.Underline else null,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .hoverable(interaction)
-                                .pointerHoverIcon(PointerIcon.Hand)
-                                .clickable(interactionSource = interaction, indication = null) {
-                                    onAlbumClick(albumId.toString())
-                                }
+                            onClick = { onAlbumClick(albumId.toString()) }
                         )
                     } else {
                         Text(
@@ -2423,6 +2745,7 @@ fun TrackTableItem(
                     String.format("%d:%02d", m, s)
                 } ?: ""
             }
+            if (mixMode) MixTrackMeta(badge = mixBadge)
             Text(
                 text = durationStr,
                 style = MaterialTheme.typography.bodyMedium,
@@ -2430,9 +2753,6 @@ fun TrackTableItem(
                 modifier = Modifier.width(60.dp),
                 textAlign = TextAlign.End
             )
-            IconButton(onClick = onOptionClick, modifier = Modifier.size(40.dp)) {
-                Icon(Icons.Default.MoreVert, str("btn_options"), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
         }
     }
 }
@@ -2507,7 +2827,7 @@ fun TrackCompactHeaderRow(
                     )
                 }
             }
-            Box(modifier = Modifier.width(60.dp).padding(end = 16.dp), contentAlignment = Alignment.CenterEnd) {
+            Box(modifier = Modifier.width(60.dp), contentAlignment = Alignment.CenterEnd) {
                 Icon(
                     imageVector = Icons.Rounded.Schedule,
                     contentDescription = null,
@@ -2515,7 +2835,6 @@ fun TrackCompactHeaderRow(
                     modifier = Modifier.size(16.dp)
                 )
             }
-            Spacer(Modifier.width(40.dp))
         }
         HorizontalDivider(
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
@@ -2582,7 +2901,10 @@ fun TrackCompactItem(
     showAlbum: Boolean = true,
     showDate: Boolean = true,
     dragHandleModifier: Modifier = Modifier,
-    isDragging: Boolean = false
+    isDragging: Boolean = false,
+    /** Mix Mode adds a tempo/key column before the duration; [mixBadge] is null until the track is analysed. */
+    mixMode: Boolean = false,
+    mixBadge: MixBadgeUi? = null,
 ) {
     val isCurrent = currentlyPlayingTrack?.id == track.id
     val titleColor = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
@@ -2645,6 +2967,10 @@ fun TrackCompactItem(
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.weight(1f, fill = false)
                     )
+                    if (track.isGoPlus) {
+                        Spacer(Modifier.width(6.dp))
+                        com.alananasss.kittytune.ui.common.GoPlusBadge(compact = true)
+                    }
                     if (isDownloaded && !isDownloading) {
                         Spacer(Modifier.width(6.dp))
                         Icon(Icons.Rounded.DownloadDone, str("btn_downloaded"), modifier = Modifier.size(12.dp), tint = MaterialTheme.colorScheme.primary)
@@ -2663,21 +2989,9 @@ fun TrackCompactItem(
                         val spotifyAlbumId = if (track.source == "spotify") track.publisherMetadata?.albumId?.takeIf { it.isNotBlank() } else null
                         when {
                             spotifyAlbumId != null -> {
-                                val interaction = remember { MutableInteractionSource() }
-                                val hovered by interaction.collectIsHoveredAsState()
-                                Text(
+                                AlbumHoverLink(
                                     text = track.publisherMetadata?.albumTitle ?: str("profile_tab_albums"),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = if (hovered) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    textDecoration = if (hovered) TextDecoration.Underline else null,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier
-                                        .hoverable(interaction)
-                                        .pointerHoverIcon(PointerIcon.Hand)
-                                        .clickable(interactionSource = interaction, indication = null) {
-                                            onAlbumClick("spotify:album:$spotifyAlbumId")
-                                        }
+                                    onClick = { onAlbumClick("spotify:album:$spotifyAlbumId") }
                                 )
                             }
                             else -> {
@@ -2685,21 +2999,9 @@ fun TrackCompactItem(
                         if (resolved != null) {
                             val albumId = resolved.info.playlistId
                             if (albumId != null) {
-                                val interaction = remember { MutableInteractionSource() }
-                                val hovered by interaction.collectIsHoveredAsState()
-                                Text(
+                                AlbumHoverLink(
                                     text = resolved.info.title,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = if (hovered) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    textDecoration = if (hovered) TextDecoration.Underline else null,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier
-                                        .hoverable(interaction)
-                                        .pointerHoverIcon(PointerIcon.Hand)
-                                        .clickable(interactionSource = interaction, indication = null) {
-                                            onAlbumClick(albumId.toString())
-                                        }
+                                    onClick = { onAlbumClick(albumId.toString()) }
                                 )
                             } else {
                                 Text(
@@ -2741,6 +3043,7 @@ fun TrackCompactItem(
                     String.format("%d:%02d", m, s)
                 } ?: ""
             }
+            if (mixMode) MixTrackMeta(badge = mixBadge)
             Text(
                 text = durationStr,
                 style = MaterialTheme.typography.bodyMedium,
@@ -2748,9 +3051,6 @@ fun TrackCompactItem(
                 modifier = Modifier.width(60.dp),
                 textAlign = TextAlign.End
             )
-            IconButton(onClick = onOptionClick, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.MoreVert, str("btn_options"), tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
-            }
         }
     }
 }

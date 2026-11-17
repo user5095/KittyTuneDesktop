@@ -6,6 +6,15 @@
 #include <float.h>
 #include <cstdint>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <signal.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/resource.h>
+#endif
+
 extern "C" {
 #include "ebur128/ebur128.h"
 }
@@ -19,8 +28,12 @@ static const float kLimiterAttackMs = 5.0f;
 static const float kLimiterReleaseMs = 100.0f;
 
 // Dedicated time constants for loudness normalization
-static const float kNormAttackMs = 350.0f;   // 350ms smooth attenuation
-static const float kNormReleaseMs = 3000.0f; // 3000ms pump-free release
+static const float kNormAttackMs = 250.0f;          // coming down: a loud start is tamed almost at once
+static const float kNormFastAttackMs = 50.0f;       // coming down far (a drop after a quiet intro): at once
+static const float kNormFastAttackRatio = 0.708f;   // "far": the gain must fall by more than 3 dB
+static const float kNormReleaseMs = 4000.0f;        // going up while a track is still being learnt
+static const float kNormSettledReleaseMs = 10000.0f; // going up once it is: quiet passages stay quiet
+static const float kNormLearnSeconds = 20.0f;
 
 typedef struct {
     ebur128_state* ebur128;
@@ -33,7 +46,9 @@ typedef struct {
 
     // Normalization gain smoothing coefficients
     float normAttackCoeff;
+    float normFastAttackCoeff;
     float normReleaseCoeff;
+    float normSettledReleaseCoeff;
 
     // Limiter state
     float* delayBuffer;
@@ -93,6 +108,8 @@ static void initLimiter(KittyTuneDSPState* s) {
     float normReleaseTime = kNormReleaseMs / 1000.0f;
     s->normAttackCoeff = expf(-1.0f / ((float)s->sampleRate * normAttackTime));
     s->normReleaseCoeff = expf(-1.0f / ((float)s->sampleRate * normReleaseTime));
+    s->normFastAttackCoeff = expf(-1.0f / ((float)s->sampleRate * (kNormFastAttackMs / 1000.0f)));
+    s->normSettledReleaseCoeff = expf(-1.0f / ((float)s->sampleRate * (kNormSettledReleaseMs / 1000.0f)));
 
     float envRelease = 0.02f; // 20ms release for envelope
     s->envReleaseCoeff = expf(-1.0f / ((float)s->sampleRate * envRelease));
@@ -107,8 +124,16 @@ static void destroyLimiter(KittyTuneDSPState* s) {
 }
 
 static void smoothGain(KittyTuneDSPState* s) {
-    float gainCoeff = (s->targetGainLinear < s->currentGainLinear)
-        ? s->normAttackCoeff : s->normReleaseCoeff;
+    int settled = !s->hasKnownTrackLoudness
+        && s->framesProcessedSinceReset >= (long long)(s->sampleRate * kNormLearnSeconds);
+    float gainCoeff;
+    // The fast fall is for the live estimate meeting a drop; a known loudness that arrives late
+    // glides at the normal pace, so the correction is never heard as a jump.
+    if (!s->hasKnownTrackLoudness && s->targetGainLinear < s->currentGainLinear * kNormFastAttackRatio) {
+        gainCoeff = s->normFastAttackCoeff;
+    }
+    else if (s->targetGainLinear < s->currentGainLinear) gainCoeff = s->normAttackCoeff;
+    else gainCoeff = settled ? s->normSettledReleaseCoeff : s->normReleaseCoeff;
     s->currentGainLinear = gainCoeff * s->currentGainLinear
         + (1.0f - gainCoeff) * s->targetGainLinear;
 }
@@ -186,10 +211,18 @@ static KittyTuneDSPState* createDspState(int channels, int sampleRate, int mode,
 
     s->processBufferCapacity = 16384 * channels;
     s->processBuffer = (float*)malloc(s->processBufferCapacity * sizeof(float));
+    if (!s->processBuffer) {
+        LOGE("Failed to allocate DSP process buffer");
+        s->processBufferCapacity = 0;
+        free(s);
+        return NULL;
+    }
 
     s->ebur128 = ebur128_init((unsigned int)channels, (unsigned long)sampleRate, mode);
     if (!s->ebur128) {
         LOGE("Failed to initialize ebur128 (ch=%d, sr=%d)", channels, sampleRate);
+        free(s->processBuffer);
+        s->processBuffer = NULL;
         free(s);
         return NULL;
     }
@@ -219,8 +252,19 @@ static float computeMaxTruePeakDb(KittyTuneDSPState* s) {
 static void processChunk(KittyTuneDSPState* s, short* in, short* out, int numFrames, float forcedGainDb) {
     int totalSamples = numFrames * s->channels;
 
-    if (totalSamples > s->processBufferCapacity) {
-        float* newBuf = (float*)realloc(s->processBuffer, totalSamples * sizeof(float));
+    // Guard against null/negative frame counts coming from the caller: writing a bogus
+    // count into ebur128 corrupts its internal ring buffer and manifests as heap
+    // corruption crashes on Windows (STATUS_HEAP_CORRUPTION in headless tests).
+    if (numFrames <= 0 || totalSamples <= 0) return;
+
+    // Never trust a zeroed capacity with a live buffer pointer (stale state after an
+    // allocation failure would otherwise make realloc(NULL, ...) leak the old buffer).
+    if (!s->processBuffer || s->processBufferCapacity <= 0) {
+        s->processBufferCapacity = totalSamples;
+        s->processBuffer = (float*)malloc((size_t)totalSamples * sizeof(float));
+        if (!s->processBuffer) { s->processBufferCapacity = 0; return; }
+    } else if (totalSamples > s->processBufferCapacity) {
+        float* newBuf = (float*)realloc(s->processBuffer, (size_t)totalSamples * sizeof(float));
         if (!newBuf) return;
         s->processBuffer = newBuf;
         s->processBufferCapacity = totalSamples;
@@ -284,6 +328,16 @@ static void processChunk(KittyTuneDSPState* s, short* in, short* out, int numFra
             float maxGainForHeadroom = -1.0f - maxTpDb;
             if (gainDb > maxGainForHeadroom) gainDb = maxGainForHeadroom;
         }
+        // Safety net: something heard far louder than the figure on file says (an estimate gone
+        // wrong) is followed down, as if the track were unknown.
+        float heard = -70.0f;
+        if (s->integratedLoudness > -60.0f) heard = s->integratedLoudness;
+        if (currentShortTermLufs > -60.0f && currentShortTermLufs - 1.0f > heard) heard = currentShortTermLufs - 1.0f;
+        if (currentMomentaryLufs > -60.0f && currentMomentaryLufs - 4.0f > heard) heard = currentMomentaryLufs - 4.0f;
+        if (heard > -60.0f) {
+            float heardGainDb = s->targetLUFS - heard;
+            if (heardGainDb < gainDb - 2.0f) gainDb = heardGainDb;
+        }
     } else {
         float effectiveLufs = -70.0f;
         size_t momentaryWindowFrames = (size_t)(s->sampleRate * 0.4);
@@ -294,16 +348,15 @@ static void processChunk(KittyTuneDSPState* s, short* in, short* out, int numFra
         } else if (s->framesProcessedSinceReset < (long long)shortTermWindowFrames) {
             effectiveLufs = (currentShortTermLufs > -60.0f) ? currentShortTermLufs : currentMomentaryLufs;
         } else {
-            if (s->integratedLoudness > -60.0f) {
-                if (s->shortTermLoudness > s->integratedLoudness) {
-                    effectiveLufs = s->shortTermLoudness;
-                } else {
-                    effectiveLufs = s->integratedLoudness;
-                }
-            } else if (s->shortTermLoudness > -60.0f) {
-                effectiveLufs = s->shortTermLoudness;
-            } else {
-                effectiveLufs = currentMomentaryLufs;
+            // The track average alone lags far behind a quiet intro turning into the drop: the
+            // louder of it, the last few seconds and (with more margin) the last instant decides
+            // how far down to go, so the drop is tamed in well under a second.
+            if (s->integratedLoudness > -60.0f) effectiveLufs = s->integratedLoudness;
+            if (s->shortTermLoudness > -60.0f && s->shortTermLoudness - 1.0f > effectiveLufs) {
+                effectiveLufs = s->shortTermLoudness - 1.0f;
+            }
+            if (currentMomentaryLufs > -60.0f && currentMomentaryLufs - 4.0f > effectiveLufs) {
+                effectiveLufs = currentMomentaryLufs - 4.0f;
             }
         }
 
@@ -434,6 +487,31 @@ Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeDestroy(
     LOGI("DSP destroyed");
 }
 
+// Static companion method used by the java.lang.ref.Cleaner for defence-in-depth cleanup of
+// orphaned processors. Same body as nativeDestroy above; the JVM resolves this symbol for the
+// @JvmStatic external fun declared in the companion object. See NormalizationAudioProcessor.kt
+// for the full rationale.
+JNIEXPORT void JNICALL
+Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeDestroyHandle(
+    JNIEnv* env, jclass clazz, jlong handle) {
+
+    KittyTuneDSPState* s = (KittyTuneDSPState*)(intptr_t)handle;
+    if (!s) return;
+
+    if (s->ebur128) {
+        ebur128_destroy(&s->ebur128);
+        s->ebur128 = NULL;
+    }
+
+    destroyLimiter(s);
+    if (s->processBuffer) {
+        free(s->processBuffer);
+        s->processBuffer = NULL;
+    }
+    free(s);
+    LOGI("DSP destroyed (via Cleaner)");
+}
+
 JNIEXPORT void JNICALL
 Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeSetTargetLevel(
     JNIEnv* env, jclass clazz, jlong handle, jfloat targetLUFS) {
@@ -477,6 +555,28 @@ Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeSetTrackLo
     resetDspState(s, trackLufs, maxPeakDb);
 }
 
+/**
+ * A track's loudness arriving while it already plays (its scan finished late). Unlike
+ * nativeSetTrackLoudness, nothing is reset: the gain glides to the track's level over the usual
+ * attack and release instead of jumping mid-song.
+ */
+JNIEXPORT void JNICALL
+Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeUpdateTrackLoudness(
+    JNIEnv* env, jclass clazz, jlong handle, jfloat trackLufs, jfloat maxPeakDb) {
+
+    KittyTuneDSPState* s = (KittyTuneDSPState*)(intptr_t)handle;
+    if (!s) return;
+    if (!(trackLufs > -60.0f && trackLufs < 0.0f)) return;
+    if (s->framesProcessedSinceReset == 0) {
+        // Nothing heard yet: the track can simply start at its level.
+        resetDspState(s, trackLufs, maxPeakDb);
+        return;
+    }
+    s->hasKnownTrackLoudness = 1;
+    s->knownTrackLufs = trackLufs;
+    s->knownTrackPeakDb = maxPeakDb;
+}
+
 JNIEXPORT void JNICALL
 Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeClearTrackLoudness(
     JNIEnv* env, jclass clazz, jlong handle) {
@@ -494,10 +594,24 @@ Java_com_alananasss_kittytune_audio_NormalizationAudioProcessor_nativeProcessSho
     KittyTuneDSPState* s = (KittyTuneDSPState*)(intptr_t)handle;
     if (!s || !s->ebur128) return;
 
-    short* in = (short*)((char*)env->GetDirectBufferAddress(inputBuffer) + inOffset);
+    short* inBase = (short*)env->GetDirectBufferAddress(inputBuffer);
     short* out = (short*)env->GetDirectBufferAddress(outputBuffer);
-    if (!in || !out) return;
+    if (!inBase || !out) return;
 
+    // Validate the frame count against the actual buffer capacities: a caller passing a
+    // numFrames larger than the direct buffers would read/write past their end and
+    // corrupt the process heap (observed as STATUS_HEAP_CORRUPTION on Windows).
+    jlong inCap = env->GetDirectBufferCapacity(inputBuffer);
+    jlong outCap = env->GetDirectBufferCapacity(outputBuffer);
+    if (inCap == JNI_ERR || outCap == JNI_ERR) return;
+    jlong inBytes = (jlong)numFrames * s->channels * (jlong)sizeof(short);
+    if (numFrames <= 0 || inBytes > (inCap - inOffset) || inBytes > outCap) {
+        LOGE("nativeProcessShort rejected bad frame count: frames=%d ch=%d inCap=%lld outCap=%lld offset=%d",
+             numFrames, s->channels, (long long)inCap, (long long)outCap, inOffset);
+        return;
+    }
+
+    short* in = (short*)((char*)inBase + inOffset);
     processChunk(s, in, out, numFrames, NAN);
 }
 
@@ -559,6 +673,11 @@ Java_com_alananasss_kittytune_data_AudioScannerManager_nativeCreateAnalyzer(
     s->channels = channels;
     s->integratedLoudness = -70.0f;
     s->truePeakLinear = 0.0f;
+    // The scanner path reallocs processBuffer on demand; capacity must start at a
+    // consistent zeroed state (calloc already zeroes it, but be explicit so a future
+    // non-zeroing allocator can't leave a dangling pointer/capacity pair).
+    s->processBuffer = NULL;
+    s->processBufferCapacity = 0;
 
     int mode = EBUR128_MODE_I | EBUR128_MODE_TRUE_PEAK | EBUR128_MODE_HISTOGRAM;
     s->ebur128 = ebur128_init((unsigned int)channels, (unsigned long)sampleRate, mode);
@@ -611,8 +730,13 @@ Java_com_alananasss_kittytune_data_AudioScannerManager_nativeAddFramesShort(
     if (!s || !s->ebur128) return;
 
     int totalSamples = numFrames * s->channels;
-    if (totalSamples > s->processBufferCapacity) {
-        float* newBuf = (float*)realloc(s->processBuffer, totalSamples * sizeof(float));
+    if (numFrames <= 0 || totalSamples <= 0) return;
+    if (!s->processBuffer || s->processBufferCapacity <= 0) {
+        s->processBufferCapacity = totalSamples;
+        s->processBuffer = (float*)malloc((size_t)totalSamples * sizeof(float));
+        if (!s->processBuffer) { s->processBufferCapacity = 0; return; }
+    } else if (totalSamples > s->processBufferCapacity) {
+        float* newBuf = (float*)realloc(s->processBuffer, (size_t)totalSamples * sizeof(float));
         if (!newBuf) return;
         s->processBuffer = newBuf;
         s->processBufferCapacity = totalSamples;
@@ -663,6 +787,58 @@ Java_com_alananasss_kittytune_data_AudioScannerManager_nativeGetAnalyzedTruePeak
 
     if (maxTp <= 0.0) return -120.0f;
     return (jfloat)(20.0 * log10(maxTp));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_alananasss_kittytune_audio_ai_karaoke_KaraokeManager_nativePauseProcess(
+    JNIEnv* env, jclass clazz, jlong pid) {
+#if defined(_WIN32)
+    HANDLE h = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, (DWORD)pid);
+    if (!h) return JNI_FALSE;
+    typedef LONG (NTAPI *pfnNtSuspendProcess)(HANDLE);
+    static pfnNtSuspendProcess NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess");
+    jboolean ok = JNI_FALSE;
+    if (NtSuspendProcess) {
+        ok = (NtSuspendProcess(h) >= 0) ? JNI_TRUE : JNI_FALSE;
+    }
+    CloseHandle(h);
+    return ok;
+#else
+    return (kill((pid_t)pid, SIGSTOP) == 0) ? JNI_TRUE : JNI_FALSE;
+#endif
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_alananasss_kittytune_audio_ai_karaoke_KaraokeManager_nativeResumeProcess(
+    JNIEnv* env, jclass clazz, jlong pid) {
+#if defined(_WIN32)
+    HANDLE h = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, (DWORD)pid);
+    if (!h) return JNI_FALSE;
+    typedef LONG (NTAPI *pfnNtResumeProcess)(HANDLE);
+    static pfnNtResumeProcess NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtResumeProcess");
+    jboolean ok = JNI_FALSE;
+    if (NtResumeProcess) {
+        ok = (NtResumeProcess(h) >= 0) ? JNI_TRUE : JNI_FALSE;
+    }
+    CloseHandle(h);
+    return ok;
+#else
+    return (kill((pid_t)pid, SIGCONT) == 0) ? JNI_TRUE : JNI_FALSE;
+#endif
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_alananasss_kittytune_audio_ai_karaoke_KaraokeManager_nativeSetProcessIdlePriority(
+    JNIEnv* env, jclass clazz, jlong pid) {
+#if defined(_WIN32)
+    HANDLE h = OpenProcess(PROCESS_SET_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return JNI_FALSE;
+    BOOL ok = SetPriorityClass(h, IDLE_PRIORITY_CLASS);
+    CloseHandle(h);
+    return ok ? JNI_TRUE : JNI_FALSE;
+#else
+    return (setpriority(PRIO_PROCESS, (id_t)pid, 19) == 0) ? JNI_TRUE : JNI_FALSE;
+#endif
 }
 
 } // extern "C"

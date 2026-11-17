@@ -1,0 +1,100 @@
+# Windows portable build
+
+Extract `KittyTune-<version>-Windows-Portable-x64.zip` into a writable folder and
+open `KittyTune/KittyTune.exe`. Keep `app` and `runtime` beside the executable.
+The Java runtime is included; no installer or system Java is required.
+
+SoundCloud protected playback (`ctr-encrypted-hls` streams) uses a native in-process Widevine CDM loader.
+It loads Chrome's Linux Widevine CDM module directly on Windows without WSL,
+virtual machines, or administrator privileges. Decrypted audio samples flow
+directly into the audio engine as clear PCM, so equalizers, DSP effects,
+and offline caching work seamlessly on protected tracks.
+See [the native CDM sidecar guide](docs/SOUNDCLOUD_CDM_SIDECAR.md).
+
+The portable package uses the normal KittyTune profile in `%APPDATA%\KittyTune`
+and cache in `%LOCALAPPDATA%\KittyTuneCache`. It does not relocate settings into
+the extracted folder. Exit an older running version from its tray menu before
+starting another version, because single-instance handling can reopen the old
+process.
+
+When building inside a Codex workspace, test the portable ZIP after extracting it
+outside the workspace (for example, in Downloads). Workspace executables can inherit
+a Windows Low integrity label and then fail to create SQLite's temporary lock file
+in the normal user profile; jpackage displays the misleading "Failed to launch JVM"
+dialog. ZIP extraction into a normal user directory creates files with that directory's
+normal security metadata. Do not change the workspace's sandbox ACLs to work around it.
+
+## Build
+
+Use Windows x64, JDK 21+ with `jpackage`, a Windows SDK, and either Visual Studio
+C++ Build Tools or MinGW `g++` on PATH. The media bridge also uses the .NET
+Framework C# compiler included with Windows.
+
+```powershell
+.\scripts\build-windows.ps1 -JavaHome 'C:\path\to\jdk-21'
+```
+
+This compiles the current DSP and media-bridge sources, runs `headlessTest`,
+packages the runtime, and writes a SHA-256 checksum beside the ZIP in `release/`.
+It does not install or launch the player. `-SkipTests` skips the regression run.
+`JAVA_HOME` is restored when the script finishes.
+
+The equivalent Gradle tasks, with `JAVA_HOME` pointing to a JDK 21+, are:
+
+```powershell
+.\gradlew.bat headlessTest zipWindowsPortable -PdesktopOnly=true --no-daemon --max-workers=2
+```
+
+`-PdesktopOnly=true` leaves the independent website out of this build; the
+normal project configuration still includes it. Optional Compose compiler
+diagnostics can be enabled with `-PcomposeReports=true`.
+
+The Windows app image is in
+`build/compose/binaries/<version>/main-release/app/KittyTune/`, so packaging a new
+version does not overwrite another version's app image. Native build outputs
+are in `build/generated/native-resources/`; the source tree is not overwritten.
+`packageReleaseMsi` remains available for installer builds with the tools
+required by `jpackage`.
+
+## Prepare the startup cache
+
+On Windows, use PowerShell 7.2+ to build the release app image and prepare its
+Java AOT startup cache.
+
+```powershell
+.\gradlew.bat optimizeWindowsStartup -PdesktopOnly=true
+```
+
+For an existing extracted image, use the Zulu 25 JDK used to build it. If the
+Java launcher cannot find its runtime DLLs under a Unicode path, extract the
+image to an ASCII path such as `C:\Tools\KittyTune` and prepare it there.
+
+```powershell
+.\scripts\optimize-windows-startup.ps1 -AppImage 'C:\path\to\KittyTune' -JavaHome 'C:\path\to\Zulu-25'
+```
+
+The preparation keeps its guest profile and extracted native libraries in a
+short path under the Windows temporary directory. It opens the home screen and
+closes it automatically. Open `KittyTune.exe` as usual afterwards. The cache
+uses about 100 MB on disk. Training can take several minutes on older hardware;
+the default timeout is ten minutes per Java process. Override it with
+`-TrainingTimeoutSeconds` when running the PowerShell script directly. Locked
+temporary files are reported as warnings after preparation. HotSpot checks JAR
+timestamps, so prepare it again
+after updating or re-extracting the app. If the cache is absent or incompatible,
+the launcher starts normally.
+
+## Rendering and checks
+
+App zoom scales controls and text once in both the main window and mini-player,
+while preserving accessibility font scaling. Windows text uses pixel-aligned
+glyph positioning on Compose's grayscale surfaces. System display scaling is
+retained; use Ctrl+0 to restore app zoom to 100%.
+
+`headlessTest` runs a bounded selection of deterministic regressions with a
+profile isolated under `build/test-profile/`, without windows or sound output.
+It exercises the freshly compiled JNI library with in-memory PCM and renders
+the Russian welcome screen at 2560 x 1440 with 125% and 150% display density.
+Reports are in `build/reports/tests/headlessTest/` and previews in
+`build/previews/`. The Windows CI workflow uploads both alongside the package.
+Offscreen rendering does not replace interactive monitor and audio checks.

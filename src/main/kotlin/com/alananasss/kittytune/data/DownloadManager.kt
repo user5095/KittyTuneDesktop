@@ -1,5 +1,6 @@
 package com.alananasss.kittytune.data
 
+import com.alananasss.kittytune.audio.DrmStreamDownloader
 import com.alananasss.kittytune.core.AppDirs
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.data.local.*
@@ -37,6 +38,13 @@ object DownloadManager {
 
     private const val CONCURRENT_DOWNLOAD_LIMIT = 4
     private val downloadSemaphore = Semaphore(CONCURRENT_DOWNLOAD_LIMIT)
+
+    // Deliberately never purged: downloadBatch starts jobs without the activeJobs guard, so this map
+    // is what actually serializes two downloads of the same track (they would otherwise interleave
+    // writes into the same temp file). Entries are ~100 bytes per unique track id downloaded this
+    // session — bounded by the library, not by time. Removing entries on completion has a race with
+    // a queued waiter that makes parallel same-track downloads possible again, which is a worse
+    // trade than a fixed few-KB map.
     private val trackMutexes = ConcurrentHashMap<Long, Mutex>()
 
     private val dao get() = AppDatabase.downloadDao
@@ -44,7 +52,9 @@ object DownloadManager {
     private val tokenManager = TokenManager
 
     private val api: SoundCloudApi by lazy { RetrofitClient.create() }
-    private val scope = CoroutineScope(Dispatchers.IO)
+    // Supervised: one failed launch used to cancel the scope's plain Job, and every download after
+    // that silently did nothing for the rest of the session (no error, no queue movement).
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val client: OkHttpClient
         get() = com.alananasss.kittytune.data.network.ProxyManager.getOkHttpClient()
 
@@ -83,18 +93,12 @@ object DownloadManager {
     )
 
     private suspend fun updateRemotePlaylist(playlistId: Long, request: PlaylistUpdateRequest) {
-        var response = api.updatePlaylist(playlistId, request)
+        val response = api.updatePlaylist(playlistId, request)
         if (!response.isSuccessful) {
-            var errorBody = runCatching { response.errorBody()?.string() }.getOrNull()
-            val captchaUrl = SessionManager.extractDataDomeCaptchaUrl(errorBody)
-            if (response.code() == 403 && captchaUrl != null) {
-                val solved = SessionManager.awaitDataDomeChallenge(captchaUrl)
-                if (solved) {
-                    response = api.updatePlaylist(playlistId, request)
-                    if (response.isSuccessful) return
-                    errorBody = runCatching { response.errorBody()?.string() }.getOrNull()
-                }
-            }
+            // DataDome captcha handling was dropped with the PKCE auth migration (same call
+            // as Android): OAuth tokens no longer trip the bot detection, and the desktop
+            // port never had the captcha browser anyway — fail fast with the server's body.
+            val errorBody = runCatching { response.errorBody()?.string() }.getOrNull()
             throw Exception("SoundCloud playlist update failed (${response.code()}): ${errorBody ?: response.message()}")
         }
     }
@@ -166,7 +170,7 @@ object DownloadManager {
 
     lateinit var downloadedIds: StateFlow<Set<Long>>
 
-    private val activeJobs = ConcurrentHashMap<Long, Job>()
+    private val activeJobs = DownloadJobs(scope)
     private val activePlaylistJobs = ConcurrentHashMap<Long, Job>()
     private val batchTrackIds = ConcurrentHashMap<Long, Set<Long>>()
 
@@ -217,9 +221,9 @@ object DownloadManager {
                 val allPlaylists = dao.getAllPlaylists().first()
                 val currentLiked = LikeRepository.likedPlaylists.value
                 allPlaylists.forEach { localPlaylist ->
-                    val isSpotify = localPlaylist.permalinkUrl?.contains("spotify") == true
+                    val isExternal = ExternalPlaylists.isExternalPermalink(localPlaylist.permalinkUrl)
                     val isLiked = currentLiked.contains(localPlaylist.id)
-                    if (!localPlaylist.isUserCreated && localPlaylist.id > 0 && !isSpotify && !isLiked) {
+                    if (!localPlaylist.isUserCreated && localPlaylist.id > 0 && !isExternal && !isLiked) {
                         val tracks = dao.getTracksForPlaylistSync(localPlaylist.id)
                         val hasDownloadedTracks = tracks.any { it.localAudioPath.isNotEmpty() }
                         if (!hasDownloadedTracks) {
@@ -269,13 +273,6 @@ object DownloadManager {
         val dir = if (subDir != null) File(root, sanitizeFilename(subDir)) else root
         if (!dir.exists()) dir.mkdirs()
         return dir
-    }
-
-    private fun getOutputStreamForFile(fileName: String, subDir: String?): Pair<OutputStream, String> {
-        val dir = outputDirFor(subDir)
-        val file = File(dir, fileName)
-        if (file.exists()) file.delete()
-        return Pair(FileOutputStream(file), file.absolutePath)
     }
 
     private fun deleteFileByPath(path: String) {
@@ -361,7 +358,9 @@ object DownloadManager {
                     artworkUrl = track.fullResArtwork,
                     duration = track.durationMs ?: 0L,
                     localAudioPath = "",
-                    localArtworkPath = ""
+                    localArtworkPath = "",
+                    source = track.source?.takeIf { it != "soundcloud" },
+                    permalinkUrl = track.permalinkUrl.takeIf { track.source != null && track.source != "soundcloud" },
                 )
                 dao.insertTrack(localTrack)
             }
@@ -509,40 +508,46 @@ object DownloadManager {
         likePlaylist: Boolean = true
     ) {
         scope.launch {
-            if (likePlaylist && playlist.id != 0L) {
+            // A radio is saved under its seed route, not under a transient
+            // remote playlist id. This is what lets the library reopen the
+            // exact snapshot the detail page liked.
+            val libraryId = ExternalPlaylists.libraryIdFor(playlist.permalinkUrl, playlist.id)
+            val targetPlaylist = if (libraryId != playlist.id) playlist.copy(id = libraryId) else playlist
+
+            if (likePlaylist && targetPlaylist.id != 0L) {
                 LikeRepository.togglePlaylistLike(
-                    playlistId = playlist.id,
+                    playlistId = targetPlaylist.id,
                     isLiked = true,
-                    permalink = playlist.permalinkUrl,
-                    urn = playlist.urn
+                    permalink = targetPlaylist.permalinkUrl,
+                    urn = targetPlaylist.urn
                 )
             }
 
-            val existing = dao.getPlaylist(playlist.id)
-            val isUserCreatedFinal = playlist.id < 0 || (existing?.isUserCreated == true)
-            val localCover = existing?.localCoverPath ?: (if (playlist.id < 0) playlist.calculatedArtworkUrl ?: playlist.artworkUrl else null)
+            val existing = dao.getPlaylist(targetPlaylist.id)
+            val isUserCreatedFinal = targetPlaylist.id < 0 || (existing?.isUserCreated == true)
+            val localCover = existing?.localCoverPath ?: (if (targetPlaylist.id < 0) targetPlaylist.calculatedArtworkUrl ?: targetPlaylist.artworkUrl else null)
             val isDownloadedFinal = isDownloaded ?: (existing?.isDownloaded ?: false)
             val baseTime = System.currentTimeMillis()
 
             val firstTrackArt = tracks.firstOrNull { it.fullResArtwork.isNotBlank() && !it.fullResArtwork.contains("picsum") && !it.fullResArtwork.contains("avatars") }?.fullResArtwork ?: ""
-            val rawArt = if (!playlist.artworkUrl.isNullOrEmpty() && !playlist.artworkUrl.contains("avatars")) {
-                playlist.artworkUrl.replace("large", "t500x500")
-            } else if (!playlist.calculatedArtworkUrl.isNullOrEmpty() && !playlist.calculatedArtworkUrl.contains("avatars")) {
-                playlist.calculatedArtworkUrl.replace("large", "t500x500")
+            val rawArt = if (!targetPlaylist.artworkUrl.isNullOrEmpty() && !targetPlaylist.artworkUrl.contains("avatars")) {
+                targetPlaylist.artworkUrl.replace("large", "t500x500")
+            } else if (!targetPlaylist.calculatedArtworkUrl.isNullOrEmpty() && !targetPlaylist.calculatedArtworkUrl.contains("avatars")) {
+                targetPlaylist.calculatedArtworkUrl.replace("large", "t500x500")
             } else {
                 firstTrackArt
             }
 
             val localPlaylist = LocalPlaylist(
-                id = playlist.id,
-                title = playlist.title ?: str("untitled_track"),
-                artist = playlist.user?.username ?: str("unknown_artist"),
+                id = targetPlaylist.id,
+                title = targetPlaylist.title ?: str("untitled_track"),
+                artist = targetPlaylist.user?.username ?: str("unknown_artist"),
                 artworkUrl = rawArt,
                 localCoverPath = localCover,
                 trackCount = tracks.size,
                 isUserCreated = isUserCreatedFinal,
-                permalinkUrl = playlist.permalinkUrl,
-                isAlbum = playlist.isRealAlbum,
+                permalinkUrl = targetPlaylist.permalinkUrl,
+                isAlbum = targetPlaylist.isRealAlbum,
                 addedAt = existing?.addedAt ?: baseTime,
                 isDownloaded = isDownloadedFinal
             )
@@ -558,11 +563,13 @@ object DownloadManager {
                         artworkUrl = track.fullResArtwork,
                         duration = track.durationMs ?: 0L,
                         localAudioPath = "",
-                        localArtworkPath = ""
+                        localArtworkPath = "",
+                        source = track.source?.takeIf { it != "soundcloud" },
+                        permalinkUrl = track.permalinkUrl.takeIf { track.source != null && track.source != "soundcloud" },
                     )
                     dao.insertTrack(localTrack)
                 }
-                dao.insertPlaylistTrackRef(PlaylistTrackCrossRef(playlist.id, track.id, baseTime + index))
+                dao.insertPlaylistTrackRef(PlaylistTrackCrossRef(targetPlaylist.id, track.id, baseTime + index))
             }
             _libraryUpdated.tryEmit(Unit)
         }
@@ -571,8 +578,11 @@ object DownloadManager {
     fun deletePlaylist(playlistId: Long, syncToCloud: Boolean = true, forceUserCreated: Boolean? = null, forcePermalink: String? = null) {
         scope.launch {
             val playlistToDelete = dao.getPlaylist(playlistId)
+            val externalPermalink = forcePermalink ?: playlistToDelete?.permalinkUrl
 
-            if (syncToCloud && playlistId > 0 && !tokenManager.isGuestMode()) {
+            // Radios and provider lists only exist in the local library; they
+            // must never be unliked/deleted on SoundCloud.
+            if (syncToCloud && playlistId > 0 && !ExternalPlaylists.isExternalPermalink(externalPermalink) && !tokenManager.isGuestMode()) {
                 val token = tokenManager.getAccessToken()
                 if (!token.isNullOrEmpty()) {
                     try {
@@ -877,6 +887,10 @@ object DownloadManager {
                 _playlistDownloadProgress.update { it + (batchId to 1f) }
                 delay(500)
                 _storageTrigger.update { it + 1 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // cancelBatch() cancels the batch job; swallowing it here made the batch finish
+                // "normally" with half the tracks missing. Rethrown so cancellation is honoured.
+                throw e
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -891,7 +905,7 @@ object DownloadManager {
     }
 
     fun downloadTrack(track: Track) {
-        if (activeJobs.containsKey(track.id)) return
+        if (activeJobs.contains(track.id)) return
         scope.launch {
             val existing = dao.getTrack(track.id)
             if (existing != null && existing.localAudioPath.isNotEmpty()) return@launch
@@ -900,7 +914,7 @@ object DownloadManager {
     }
 
     private fun startDownloadJob(track: Track, subFolderName: String? = null): Job {
-        val job = scope.launch {
+        val job = activeJobs.launch(track.id) {
             if (!hasEnoughFreeStorage()) {
                 Logger.e("DownloadManager", "Not enough storage space to download track: ${track.title}")
                 withContext(Dispatchers.Main) {
@@ -920,7 +934,14 @@ object DownloadManager {
                     _downloadProgress.update { it + (track.id to 0) }
 
                 val resolvedStream = StreamResolver.resolveStreamWithDrm(track, forDownload = true)
-                val streamUrl = resolvedStream?.url ?: throw Exception("Cannot resolve stream URL for download")
+                if (resolvedStream == null) {
+                    withContext(Dispatchers.Main) {
+                        com.alananasss.kittytune.core.Toaster.show(str("download_offline_source_unavailable"))
+                    }
+                    throw java.io.IOException("No source available for offline download")
+                }
+                val streamUrl = resolvedStream.url
+                val licenseToken = resolvedStream.licenseAuthToken
 
                 val isHlsStream = streamUrl.contains(".m3u8") || streamUrl.contains("hls")
 
@@ -933,7 +954,38 @@ object DownloadManager {
                 taggedAudioFile = File(AppDirs.audioCacheDir, "tagged_${track.id}.$ext")
                 val internalArtFile = File(AppDirs.imageCacheDir, "art_${track.id}.jpg")
 
-                if (isHlsStream) {
+                if (!licenseToken.isNullOrBlank()) {
+                    // Protected HLS: FFmpeg cannot fetch it — every fragment is CENC-encrypted and has
+                    // to go through the CDM — so the stream is read decrypted into a clear fragment
+                    // sequence first, and remuxed like any other HLS. What lands on disk is a normal
+                    // file that plays later without a CDM.
+                    val decrypted = File(AppDirs.audioCacheDir, "temp_drm_${track.id}.mp4")
+                    try {
+                        DrmStreamDownloader.download(streamUrl, licenseToken, decrypted) { p ->
+                            if (isActive) _downloadProgress.update { c -> c + (track.id to p) }
+                        }
+                        val remuxed = runCatching {
+                            remuxHls(decrypted.absolutePath, tempAudioFile) { }
+                        }.isSuccess && tempAudioFile.exists() && tempAudioFile.length() > 0L
+                        if (!remuxed) {
+                            Logger.w("DownloadManager", "Remux of the decrypted stream failed; keeping the fragments")
+                            tempAudioFile.delete()
+                            decrypted.copyTo(tempAudioFile, overwrite = true)
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // A protected download can fail on the licence rather than on the network, and
+                        // that would otherwise look like a click that did nothing at all.
+                        Logger.e("DownloadManager", "Protected download failed for ${track.id}: ${e.message}")
+                        withContext(Dispatchers.Main) {
+                            com.alananasss.kittytune.core.Toaster.show(str("drm_download_failed"))
+                        }
+                        throw e
+                    } finally {
+                        decrypted.delete()
+                    }
+                } else if (isHlsStream) {
                     // Plain HLS: remux to .m4a with FFmpeg (no re-encode). DRM HLS was filtered out.
                     remuxHls(streamUrl, tempAudioFile) { p ->
                         if (isActive) _downloadProgress.update { c -> c + (track.id to p) }
@@ -945,12 +997,23 @@ object DownloadManager {
                         }
                     }
                 }
-                FileOutputStream(tempImageFile).use { fos ->
-                    downloadFileToStream(track.fullResArtwork, fos) { _ -> }
+                // The artwork is metadata, not the download: a dead artwork URL (or a placeholder the
+                // API filled in — picsum/avatars, the same heuristic the playlist cover uses) used to
+                // abort the whole track even though the audio was already on disk. Best-effort
+                // download, and the tag simply ships without an embedded image when it is missing.
+                val artworkUrl = track.fullResArtwork
+                val isRealArtwork = artworkUrl.isNotBlank() &&
+                    !artworkUrl.contains("picsum") && !artworkUrl.contains("avatars")
+                if (isRealArtwork) {
+                    runCatching {
+                        FileOutputStream(tempImageFile).use { fos ->
+                            downloadFileToStream(artworkUrl, fos) { _ -> }
+                        }
+                    }
+                    if (tempImageFile.exists() && tempImageFile.length() > 0L) {
+                        tempImageFile.copyTo(internalArtFile, overwrite = true)
+                    }
                 }
-
-                if (tempImageFile.exists()) tempImageFile.copyTo(internalArtFile, overwrite = true)
-
                 if (ext == "mp3") {
                     try {
                         val mp3file = Mp3File(tempAudioFile)
@@ -960,8 +1023,10 @@ object DownloadManager {
                         id3v2Tag.artist = track.displayArtist.ifBlank { track.user?.username ?: str("unknown_artist") }
                         id3v2Tag.album = subFolderName ?: str("app_name")
                         id3v2Tag.comment = str("download_comment")
-                        val imageBytes = tempImageFile.readBytes()
-                        id3v2Tag.setAlbumImage(imageBytes, "image/jpeg")
+                        if (tempImageFile.exists() && tempImageFile.length() > 0L) {
+                            val imageBytes = tempImageFile.readBytes()
+                            id3v2Tag.setAlbumImage(imageBytes, "image/jpeg")
+                        }
                         mp3file.save(taggedAudioFile.absolutePath)
                     } catch (e: Exception) {
                         tempAudioFile.copyTo(taggedAudioFile, overwrite = true)
@@ -970,14 +1035,9 @@ object DownloadManager {
                     tempAudioFile.copyTo(taggedAudioFile, overwrite = true)
                 }
 
-                val cleanArtist = sanitizeFilename(track.displayArtist.ifBlank { track.user?.username ?: str("generic_artist") })
-                val cleanTitle = sanitizeFilename(track.title ?: str("generic_title"))
-                val finalFileName = "$cleanArtist - $cleanTitle.$ext"
-
-                val (audioStream, audioPath) = getOutputStreamForFile(finalFileName, subFolderName)
-                FileInputStream(taggedAudioFile).use { input ->
-                    audioStream.use { output -> input.copyTo(output) }
-                }
+                val audioPath = DownloadFiles.store(taggedAudioFile, outputDirFor(subFolderName), track.id,
+                    track.displayArtist.ifBlank { track.user?.username ?: str("generic_artist") },
+                    track.title ?: str("generic_title"), ext).absolutePath
 
                 val existingTrack = dao.getTrack(track.id)
                 val creationTimestamp = existingTrack?.downloadedAt ?: System.currentTimeMillis()
@@ -996,6 +1056,11 @@ object DownloadManager {
 
                 _storageTrigger.update { it + 1 }
                 _libraryUpdated.tryEmit(Unit)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Cancellation must not be swallowed: cancelDownload()/cancelBatch() cancel this
+                // job, and a caught-and-ignored CancellationException makes the coroutine finish
+                // "normally" instead of cancelled — structured concurrency stops seeing it.
+                throw e
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -1005,31 +1070,79 @@ object DownloadManager {
                     taggedAudioFile?.let { if (it.exists()) it.delete() }
                 } catch (e: Exception) {}
                 _downloadProgress.update { it - track.id }
-                activeJobs.remove(track.id)
             }
         }
     }
-        activeJobs[track.id] = job
         return job
     }
 
     /** Remux a plain HLS stream to a local m4a container with FFmpeg (stream copy, no re-encode). */
     internal fun remuxHls(m3u8Url: String, outFile: File, onProgress: (Int) -> Unit) {
-        // `use` on both: their contexts are native, and an exception mid-copy must not strand them.
-        org.bytedeco.javacv.FFmpegFrameGrabber(m3u8Url).use { grabber ->
-            grabber.start()
-            org.bytedeco.javacv.FFmpegFrameRecorder(outFile.absolutePath, grabber.audioChannels).use { recorder ->
-                recorder.format = "mp4"
-                recorder.sampleRate = grabber.sampleRate
-                recorder.audioChannels = grabber.audioChannels
-                recorder.audioCodec = org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_AAC
-                recorder.start()
-                val total = grabber.lengthInTime.coerceAtLeast(1)
-                var frame = grabber.grabSamples()
-                while (frame != null) {
-                    recorder.recordSamples(frame.sampleRate, frame.audioChannels, *frame.samples)
-                    onProgress(((grabber.timestamp * 100) / total).toInt().coerceIn(0, 100))
-                    frame = grabber.grabSamples()
+        val headerBlob = buildString {
+            append("User-Agent: ${com.alananasss.kittytune.utils.Config.USER_AGENT}\r\n")
+            append("Origin: https://soundcloud.com\r\n")
+            append("Referer: https://soundcloud.com/\r\n")
+        }
+
+        fun configureGrabber(grabber: org.bytedeco.javacv.FFmpegFrameGrabber) {
+            if (m3u8Url.startsWith("http://") || m3u8Url.startsWith("https://")) {
+                grabber.setOption("headers", headerBlob)
+                grabber.setOption("reconnect", "1")
+                grabber.setOption("reconnect_streamed", "1")
+                grabber.setOption("reconnect_on_network_error", "1")
+            }
+        }
+
+        // Primary path: true lossless stream copy (packets copied as-is without decoding or re-encoding).
+        // Calling grabSamples() + recordSamples() without setting audioBitrate previously decoded the
+        // 160 kbps AAC stream and re-encoded it at FFmpegFrameRecorder's default 64 kbps (32 kbps/ch).
+        val streamCopied = runCatching {
+            org.bytedeco.javacv.FFmpegFrameGrabber(m3u8Url).use { grabber ->
+                configureGrabber(grabber)
+                grabber.start()
+                org.bytedeco.javacv.FFmpegFrameRecorder(outFile.absolutePath, grabber.audioChannels).use { recorder ->
+                    recorder.format = "mp4"
+                    recorder.sampleRate = grabber.sampleRate
+                    recorder.audioChannels = grabber.audioChannels
+                    recorder.audioCodec = grabber.audioCodec
+                    recorder.start(grabber.formatContext)
+                    val total = grabber.lengthInTime.coerceAtLeast(1)
+                    var copiedPackets = 0
+                    var pkt = grabber.grabPacket()
+                    while (pkt != null) {
+                        if (pkt.size() > 0) {
+                            recorder.recordPacket(pkt)
+                            copiedPackets++
+                            onProgress(((grabber.timestamp * 100) / total).toInt().coerceIn(0, 100))
+                        }
+                        pkt = grabber.grabPacket()
+                    }
+                    copiedPackets > 0
+                }
+            }
+        }.getOrDefault(false)
+
+        if (!streamCopied || !outFile.exists() || outFile.length() == 0L) {
+            outFile.delete()
+            // Fallback when stream copy into MP4 is rejected: transcode at high bitrate (never 64 kbps default).
+            org.bytedeco.javacv.FFmpegFrameGrabber(m3u8Url).use { grabber ->
+                configureGrabber(grabber)
+                grabber.start()
+                val targetBitrate = grabber.audioBitrate.takeIf { it >= 160_000 } ?: 256_000
+                org.bytedeco.javacv.FFmpegFrameRecorder(outFile.absolutePath, grabber.audioChannels).use { recorder ->
+                    recorder.format = "mp4"
+                    recorder.sampleRate = grabber.sampleRate
+                    recorder.audioChannels = grabber.audioChannels
+                    recorder.audioCodec = org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_AAC
+                    recorder.audioBitrate = targetBitrate
+                    recorder.start()
+                    val total = grabber.lengthInTime.coerceAtLeast(1)
+                    var frame = grabber.grabSamples()
+                    while (frame != null) {
+                        recorder.recordSamples(frame.sampleRate, frame.audioChannels, *frame.samples)
+                        onProgress(((grabber.timestamp * 100) / total).toInt().coerceIn(0, 100))
+                        frame = grabber.grabSamples()
+                    }
                 }
             }
         }
@@ -1092,16 +1205,21 @@ object DownloadManager {
     }
 
     fun cancelDownload(trackId: Long) {
-        activeJobs[trackId]?.cancel()
-        activeJobs.remove(trackId)
+        activeJobs.cancel(trackId)
         _downloadProgress.update { it - trackId }
-        try { File(AppDirs.audioCacheDir, "temp_$trackId.mp3").delete() } catch (e: Exception) {}
+        // Both extensions: YouTube/HLS tracks download as temp_<id>.m4a, everything else as .mp3 —
+        // the hardcoded .mp3 below is why cancelled m4a downloads left their temp file behind.
+        try {
+            File(AppDirs.audioCacheDir, "temp_$trackId.mp3").delete()
+            File(AppDirs.audioCacheDir, "temp_$trackId.m4a").delete()
+            File(AppDirs.audioCacheDir, "temp_art_$trackId.jpg").delete()
+        } catch (e: Exception) {}
         _storageTrigger.update { it + 1 }
         _libraryUpdated.tryEmit(Unit)
     }
 
     fun isPlaylistDownloading(playlistId: Long): Boolean = activePlaylistJobs.containsKey(playlistId)
-    fun isTrackDownloading(trackId: Long): Boolean = activeJobs.containsKey(trackId)
+    fun isTrackDownloading(trackId: Long): Boolean = activeJobs.contains(trackId)
     suspend fun getLocalTrack(id: Long): LocalTrack? = dao.getTrack(id)
 
     fun addTracksToPlaylistBulk(playlistId: Long, tracks: List<Track>) {

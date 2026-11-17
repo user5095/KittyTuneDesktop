@@ -39,6 +39,9 @@ object SyncService {
     /** Where the secret goes. Bearer-style, because that is what it is. */
     const val PAIRING_HEADER = "Authorization"
 
+    /** An honest exchange is a few kilobytes; this is orders of magnitude of headroom, not a target. */
+    private const val MAX_BODY_BYTES = 16L * 1024 * 1024
+
     private const val KEY_SECRET = "pairing_secret"
     private const val KEY_ENABLED = "listener_enabled"
     private const val KEY_PORT = "listener_port"
@@ -87,6 +90,7 @@ object SyncService {
         deviceId = SyncLog.deviceId,
         deviceName = SyncLog.deviceName,
         platform = PLATFORM,
+        addresses = rankedCandidateAddresses(),
     )
 
     /**
@@ -101,8 +105,12 @@ object SyncService {
     /** @return the pairing details in [code], or null when it is not one of ours. */
     fun parsePairingCode(code: String): PairingPayload? = runCatching {
         val json = String(Base64.getUrlDecoder().decode(code.trim()))
-        gson.fromJson(json, PairingPayload::class.java)
-            ?.takeIf { it.host.isNotBlank() && it.secret.isNotBlank() && it.port in 1..65535 }
+        gson.fromJson(json, PairingPayload::class.java)?.let { payload ->
+            val host = payload.host.ifBlank { payload.addresses.firstOrNull().orEmpty() }
+            if (host.isNotBlank() && payload.secret.isNotBlank() && payload.port in 1..65535) {
+                if (payload.host.isBlank()) payload.copy(host = host) else payload
+            } else null
+        }
     }.getOrNull()
 
     @Synchronized
@@ -114,6 +122,7 @@ object SyncService {
             created.executor = null
             created.start()
             server = created
+            ConnectLanServer.start()
             // Findable for exactly as long as it is reachable. Announcing an address that nothing
             // answers on is the failure mode this whole beacon exists to remove (issue #33).
             SyncDiscovery.startResponder()
@@ -122,6 +131,7 @@ object SyncService {
 
     @Synchronized
     fun stop() {
+        ConnectLanServer.stop()
         server?.stop(0)
         server = null
         SyncDiscovery.stopResponder()
@@ -153,7 +163,13 @@ object SyncService {
                 return
             }
 
-            val body = exchange.requestBody.readBytes().decodeToString()
+            // Bounded: readBytes() with no cap let a peer (buggy or hostile) push the heap around
+            // just by sending a large body. A real exchange is a few kilobytes; anything past
+            // 16 MB is not one, and it is refused before a single byte is parsed.
+            val body = readBounded(exchange, MAX_BODY_BYTES)?.decodeToString() ?: run {
+                exchange.sendResponseHeaders(413, -1)
+                return
+            }
             val request = runCatching { gson.fromJson(body, SyncExchange::class.java) }.getOrNull()
             if (request == null) {
                 exchange.sendResponseHeaders(400, -1)
@@ -174,6 +190,22 @@ object SyncService {
         }
     }
 
+    /** Reads at most [limit] bytes, or null when the peer sent more than that. */
+    private fun readBounded(exchange: HttpExchange, limit: Long): ByteArray? {
+        val input = exchange.requestBody
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > limit) return null
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+
     /**
      * The exchange itself, either side of the wire.
      *
@@ -188,6 +220,8 @@ object SyncService {
         val applied = SyncLog.merge(request.events)
         // Awaited, so the marks and the count we report describe work that has actually happened.
         SyncApply.applyNow(applied)
+        SyncPlayback.accept(request.playback)
+        ConnectManager.importRelayUrl(request.relayUrl)
         SyncLog.setPeerMarks(request.deviceId, request.marks)
 
         // The caller hands over how to call it back, which is what makes the pairing mutual: after one
@@ -211,6 +245,8 @@ object SyncService {
             marks = SyncLog.marks(),
             events = SyncMerge.eventsToSend(SyncLog.all(), request.marks, request.deviceId),
             callback = selfPairing().takeIf { isRunning },
+            playback = SyncPlayback.current(),
+            relayUrl = ConnectManager.relayUrl.ifBlank { null },
         )
     }
 
@@ -230,6 +266,63 @@ object SyncService {
         return diff == 0
     }
 
+    private data class ScoredAddress(val score: Int, val address: String)
+
+    /**
+     * All IPv4 addresses on this machine, ranked by likelihood of being the real LAN interface.
+     *
+     * Virtual/container interfaces (docker, veth, virbr, tun, tap, wg, etc.) are heavily penalised
+     * so that real Wi-Fi and Ethernet LAN interfaces (192.168.x.x, 10.x.x.x, etc.) are placed first.
+     */
+    fun rankedCandidateAddresses(): List<String> = runCatching {
+        val candidates = mutableListOf<ScoredAddress>()
+        val interfaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return emptyList()
+
+        for (ni in interfaces.asSequence()) {
+            if (!ni.isUp || ni.isLoopback) continue
+            val name = ni.name.lowercase()
+            val display = ni.displayName.lowercase()
+
+            val isVirtual = ni.isVirtual ||
+                name.contains("docker") || name.startsWith("veth") ||
+                name.contains("virbr") || name.contains("lxc") ||
+                name.contains("cni") || name.contains("flannel") ||
+                name.contains("calico") || name.contains("tailscale") ||
+                name.startsWith("tun") || name.startsWith("tap") ||
+                name.startsWith("wg") || name.contains("hamachi") ||
+                name.contains("zerotier") || name.contains("vmnet") ||
+                name.contains("vbox") || name.contains("dummy") ||
+                display.contains("docker") || display.contains("virtual") ||
+                display.contains("wsl") || display.contains("hyper-v")
+
+            val isPhysicalLan = name.startsWith("wl") || name.startsWith("wi") ||
+                name.startsWith("en") || name.startsWith("eth") || name.startsWith("lan")
+
+            for (addr in ni.inetAddresses.asSequence()) {
+                if (addr !is java.net.Inet4Address || addr.isLoopbackAddress || addr.isLinkLocalAddress || addr.isAnyLocalAddress) {
+                    continue
+                }
+                val ip = addr.hostAddress ?: continue
+                val score = when {
+                    isVirtual -> 10
+                    isPhysicalLan && ip.startsWith("192.168.") -> 100
+                    isPhysicalLan && ip.startsWith("10.") -> 90
+                    isPhysicalLan && ip.matches(Regex("^172\\.(1[6-9]|2[0-9]|3[0-1])\\..*")) -> 70
+                    isPhysicalLan -> 60
+                    ip.startsWith("192.168.") -> 50
+                    ip.startsWith("10.") -> 40
+                    ip.matches(Regex("^172\\.(1[6-9]|2[0-9]|3[0-1])\\..*")) -> 30
+                    else -> 20
+                }
+                candidates.add(ScoredAddress(score, ip))
+            }
+        }
+
+        candidates.sortedByDescending { it.score }
+            .map { it.address }
+            .distinct()
+    }.getOrDefault(emptyList())
+
     /**
      * This machine's address on the local network, for the pairing code.
      *
@@ -237,15 +330,7 @@ object SyncService {
      * and loopback is only the last resort — which at least fails visibly rather than silently
      * handing out an address that cannot work.
      */
-    fun localAddress(): String = runCatching {
-        java.net.NetworkInterface.getNetworkInterfaces().asSequence()
-            .filter { it.isUp && !it.isLoopback }
-            .flatMap { it.inetAddresses.asSequence() }
-            .filterIsInstance<java.net.Inet4Address>()
-            .firstOrNull { !it.isLoopbackAddress }
-            ?.hostAddress
-            ?: "127.0.0.1"
-    }.getOrDefault("127.0.0.1")
+    fun localAddress(): String = rankedCandidateAddresses().firstOrNull() ?: "127.0.0.1"
 }
 
 /**
@@ -262,6 +347,7 @@ data class PairingPayload(
     val deviceName: String,
     /** "desktop" or "android", for a screen that wants to draw the right icon. Absent in old codes. */
     val platform: String = "",
+    val addresses: List<String> = emptyList(),
 )
 
 /**
@@ -282,4 +368,7 @@ data class SyncExchange(
      * pairing — both of which leave the pairing one-directional rather than breaking it.
      */
     val callback: PairingPayload? = null,
+    /** Latest queue/playhead, absent when talking to an older client. */
+    val playback: PlaybackSnapshot? = null,
+    val relayUrl: String? = null,
 )

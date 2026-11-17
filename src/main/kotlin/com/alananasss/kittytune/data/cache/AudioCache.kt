@@ -24,6 +24,8 @@ import java.io.FileOutputStream
 object AudioCache {
     private const val KEY_ENABLED = "audio_cache_enabled"
     private const val KEY_MAX_MB = "audio_cache_max_mb"
+    internal const val KEY_REMUX_VERSION = "audio_cache_remux_version"
+    internal const val CURRENT_REMUX_VERSION = 2
     const val DEFAULT_MAX_MB = 1024
 
     val dir: File get() = File(AppDirs.audioCacheDir, "tracks").apply { mkdirs() }
@@ -32,9 +34,38 @@ object AudioCache {
     /** Bounded and dropping: a burst of skips should not queue up hours of downloading. */
     private val queue = Channel<Track>(capacity = 8, onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST)
 
+    @Volatile
+    private var migrated = false
+
     init {
+        // Crash leftovers: a download killed mid-store leaves its .part behind, and trim()
+        // ignores those by design. Nothing can be in flight this early, so drop them all.
+        scope.launch {
+            ensureMigrated()
+            dir.listFiles { f -> f.isFile && f.extension == "part" }
+                ?.forEach { runCatching { it.delete() } }
+        }
         scope.launch {
             for (track in queue) runCatching { store(track) }.onFailure { Logger.w("AudioCache", "Could not cache ${track.id}: ${it.message}") }
+        }
+    }
+
+    /**
+     * Evicts legacy .m4a cache files written before v2, when DownloadManager.remuxHls
+     * decoded and re-encoded HLS streams at FFmpegFrameRecorder's default 64 kbps (32 kbps/ch).
+     */
+    @Synchronized
+    internal fun ensureMigrated(targetDir: File = dir) {
+        if (migrated && targetDir == dir) return
+        if (Prefs.getInt(KEY_REMUX_VERSION, 0) < CURRENT_REMUX_VERSION) {
+            targetDir.listFiles { f -> f.isFile && f.extension.equals("m4a", ignoreCase = true) }
+                ?.forEach { runCatching { it.delete() } }
+            if (targetDir == dir) {
+                Prefs.putInt(KEY_REMUX_VERSION, CURRENT_REMUX_VERSION)
+            }
+        }
+        if (targetDir == dir) {
+            migrated = true
         }
     }
 
@@ -54,7 +85,9 @@ object AudioCache {
     /** The cached file for [trackId], marked as just used; null when it is not cached or caching is off. */
     fun lookup(trackId: Long): File? {
         if (!isEnabled) return null
-        val file = dir.listFiles { f -> f.nameWithoutExtension == trackId.toString() }?.firstOrNull() ?: return null
+        ensureMigrated()
+        val file = dir.listFiles { f -> f.nameWithoutExtension == trackId.toString() && isCompleteCacheFile(f) }
+            ?.firstOrNull() ?: return null
         file.setLastModified(System.currentTimeMillis())
         return file
     }
@@ -71,32 +104,59 @@ object AudioCache {
         dir.listFiles()?.forEach { it.delete() }
     }
 
+    fun evict(trackId: Long) {
+        dir.listFiles { f -> f.nameWithoutExtension == trackId.toString() }?.forEach {
+            runCatching { it.delete() }
+        }
+    }
+
     private suspend fun store(track: Track) {
         if (lookup(track.id) != null) return
         if (DownloadManager.getLocalTrack(track.id)?.localAudioPath?.let { File(it).exists() } == true) return
         if (!DownloadManager.hasEnoughFreeStorage(512L * 1024 * 1024)) return
 
         val stream = StreamResolver.resolveStreamWithDrm(track, forDownload = true) ?: return
-        // Encrypted streams cannot be kept; a local path is already on disk.
-        if (stream.isDrmProtected || !stream.url.startsWith("http")) return
+        if (!stream.url.startsWith("http")) return
+        val licenseToken = stream.licenseAuthToken
+        if (StreamResolver.isRestricted(track) && (stream.source == "soundcloud" || stream.source.isNullOrEmpty())) {
+            Logger.w("AudioCache", "Refusing to store SoundCloud snippet in audio cache for restricted track ${track.id}")
+            return
+        }
 
         val isHls = stream.url.contains(".m3u8") || stream.url.contains("hls")
         val ext = if (isHls || stream.url.contains("googlevideo.com")) "m4a" else "mp3"
         val partial = File(dir, "${track.id}.part")
         try {
             if (isHls) {
-                DownloadManager.remuxHls(stream.url, partial) {}
+                if (!licenseToken.isNullOrBlank()) {
+                    // A protected stream is cached decrypted: the licence is paid for once here, and
+                    // the file on disk is clear, so playing it back later needs no CDM at all.
+                    com.alananasss.kittytune.audio.DrmStreamDownloader.download(stream.url, licenseToken, partial) {}
+                } else {
+                    DownloadManager.remuxHls(stream.url, partial) {}
+                }
             } else {
                 FileOutputStream(partial).use { out -> DownloadManager.downloadFileToStream(stream.url, out) {} }
             }
-            if (partial.length() > 0 && partial.renameTo(File(dir, "${track.id}.$ext"))) trim()
+            if (partial.length() > 0) {
+                // renameTo returns false on Windows when the target exists, which skipped trim()
+                // and left the track forever uncached; the atomic replace works in both cases.
+                com.alananasss.kittytune.core.AtomicFiles.replace(partial, File(dir, "${track.id}.$ext"))
+                trim()
+            }
         } finally {
             partial.delete()
         }
     }
 
-    /** Drops the least recently played tracks until the cache fits in [maxBytes]. */
-    private fun trim() {
+    /**
+     * Drops the least recently played tracks until the cache fits in [maxBytes].
+     *
+     * Internal so the bootstrap's startup sweep can call it after wiping leftovers — the
+     * cache can have drifted over its bound while the app was closed and a fresh launch is
+     * the cheapest moment to pull it back (issue #5-DB).
+     */
+    internal fun trim() {
         val files = dir.listFiles { f -> f.isFile && f.extension != "part" }?.sortedBy { it.lastModified() } ?: return
         var total = files.sumOf { it.length() }
         for (file in files) {
@@ -106,3 +166,11 @@ object AudioCache {
         }
     }
 }
+
+/**
+ * Only finished downloads are servable: store() writes to `<id>.part` and renames on
+ * success, so a `.part` (or an empty file) handed to the decoder is an instant
+ * avformat_open_input failure — and the error path retried that same file forever.
+ */
+internal fun isCompleteCacheFile(file: java.io.File): Boolean =
+    file.isFile && file.extension != "part" && file.length() > 0

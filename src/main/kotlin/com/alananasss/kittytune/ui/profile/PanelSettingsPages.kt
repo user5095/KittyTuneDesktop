@@ -2,6 +2,7 @@ package com.alananasss.kittytune.ui.profile
 
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -16,12 +17,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.Prefs
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.data.local.InfoPanelHalf
 import com.alananasss.kittytune.data.local.LibraryTileIcons
+import com.alananasss.kittytune.data.local.MiniPlayerContentMode
 import com.alananasss.kittytune.data.local.MiniPlayerStyle
 import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.data.local.SidebarNavEntry
@@ -32,6 +35,7 @@ import com.alananasss.kittytune.ui.common.SettingsSwitch
 import com.alananasss.kittytune.ui.common.getSettingsShape
 import com.alananasss.kittytune.ui.main.SidebarDestinations
 import sh.calvin.reorderable.ReorderableColumn
+import androidx.compose.material3.IconButtonDefaults
 
 /**
  * Interface → Left panel: how it behaves, which destinations it lists and in what order, and the
@@ -126,7 +130,7 @@ private fun SidebarLayoutEditor(prefs: PlayerPreferences) {
                             Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(start = 4.dp, end = 16.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            IconButton(onClick = {}, modifier = Modifier.draggableHandle()) {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = {}, modifier = Modifier.draggableHandle()) {
                                 Icon(Icons.Rounded.DragIndicator, contentDescription = str("action_reorder"))
                             }
                             if (destination != null) {
@@ -198,7 +202,7 @@ private fun LibraryTilesEditor(prefs: PlayerPreferences) {
                         )
                         Spacer(Modifier.width(16.dp))
                         Text(str(look.labelKey), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                        IconButton(onClick = {
+                        IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
                             val picked = pickImageFile(str("lib_tile_choose_icon")) ?: return@IconButton
                             val stored = LibraryTileIcons.import(look.key, picked)
                             rejectedFile = stored == null
@@ -210,7 +214,7 @@ private fun LibraryTilesEditor(prefs: PlayerPreferences) {
                             Icon(Icons.Outlined.Image, contentDescription = str("lib_tile_choose_icon"), modifier = Modifier.size(20.dp))
                         }
                         if (icons[look.key] != null) {
-                            IconButton(onClick = {
+                            IconButton(shapes = IconButtonDefaults.shapes(), onClick = {
                                 LibraryTileIcons.clear(look.key)
                                 prefs.setLibraryTileIcon(look.key, null)
                                 icons = icons + (look.key to null)
@@ -284,6 +288,7 @@ private fun pickImageFile(title: String): java.io.File? =
 fun RightPanelSettingsPage() {
     val prefs = remember { PlayerPreferences() }
     var hiddenTabs by remember { mutableStateOf(prefs.getHiddenPanelTabs()) }
+    var hiddenTrackStats by remember { mutableStateOf(prefs.getHiddenPanelTrackStats()) }
     var infoPanelHalf by remember { mutableStateOf(prefs.getInfoPanelHalf()) }
     var showInfoHalfDialog by remember { mutableStateOf(false) }
 
@@ -305,18 +310,21 @@ fun RightPanelSettingsPage() {
         )
     }
 
+    val allTabs = listOf(
+        Triple(PlayerPreferences.PANEL_TAB_TRACK, "detail_track_title", Icons.Rounded.Info),
+        Triple(PlayerPreferences.PANEL_TAB_QUEUE, "player_queue", Icons.Rounded.QueueMusic),
+        Triple(PlayerPreferences.PANEL_TAB_LYRICS, "player_lyrics", Icons.Rounded.Lyrics),
+        Triple(PlayerPreferences.PANEL_TAB_EFFECTS, "player_effects", Icons.Rounded.Tune),
+        Triple(PlayerPreferences.PANEL_TAB_DEVICES, "connect_devices", Icons.Rounded.Devices),
+    )
+
     SettingsGroup(
         title = str("panel_tabs_title"),
-        items = listOf(
-            Triple(PlayerPreferences.PANEL_TAB_TRACK, "detail_track_title", Icons.Rounded.Info),
-            Triple(PlayerPreferences.PANEL_TAB_QUEUE, "player_queue", Icons.Rounded.QueueMusic),
-            Triple(PlayerPreferences.PANEL_TAB_LYRICS, "player_lyrics", Icons.Rounded.Lyrics),
-            Triple(PlayerPreferences.PANEL_TAB_EFFECTS, "player_effects", Icons.Rounded.Tune),
-        ).map { (key, labelKey, icon) ->
+        items = allTabs.map { (key, labelKey, icon) ->
             { shape ->
                 val shown = key !in hiddenTabs
                 // Never the last one: a panel with no tabs has nothing to show and no way back.
-                val isLastShown = shown && hiddenTabs.size == 3
+                val isLastShown = shown && hiddenTabs.size >= allTabs.size - 1
                 SettingsItem(
                     shape = shape,
                     title = str(labelKey),
@@ -326,6 +334,32 @@ fun RightPanelSettingsPage() {
                     onSwitchChange = if (isLastShown) null else { value ->
                         hiddenTabs = if (value) hiddenTabs - key else hiddenTabs + key
                         prefs.setHiddenPanelTabs(hiddenTabs)
+                    },
+                )
+            }
+        },
+    )
+
+    SettingsGroup(
+        title = str("panel_track_stats_title"),
+        items = listOf(
+            Triple(PlayerPreferences.PANEL_STAT_PLAYS, "detail_stats_plays", Icons.Rounded.PlayArrow),
+            Triple(PlayerPreferences.PANEL_STAT_LIKES, "detail_stats_likes", Icons.Rounded.Favorite),
+            Triple(PlayerPreferences.PANEL_STAT_REPOSTS, "detail_stats_reposts", Icons.Rounded.Repeat),
+            Triple(PlayerPreferences.PANEL_STAT_COMMENTS, "menu_comments", Icons.Rounded.Comment),
+            Triple(PlayerPreferences.PANEL_STAT_INFO, "detail_track_title", Icons.Rounded.Info),
+        ).map { (key, labelKey, icon) ->
+            { shape ->
+                val shown = key !in hiddenTrackStats
+                SettingsItem(
+                    shape = shape,
+                    title = str(labelKey),
+                    icon = icon,
+                    hasSwitch = true,
+                    switchState = shown,
+                    onSwitchChange = { value ->
+                        hiddenTrackStats = if (value) hiddenTrackStats - key else hiddenTrackStats + key
+                        prefs.setHiddenPanelTrackStats(hiddenTrackStats)
                     },
                 )
             }
@@ -344,14 +378,37 @@ fun RightPanelSettingsPage() {
     )
 }
 
+private fun miniPlayerContentModeOptions(): List<Pair<MiniPlayerContentMode, String>> = listOf(
+    MiniPlayerContentMode.AUTO to str("mini_player_content_auto"),
+    MiniPlayerContentMode.TITLE_AND_ARTIST to str("mini_player_content_title"),
+    MiniPlayerContentMode.LYRICS to str("mini_player_content_lyrics"),
+    MiniPlayerContentMode.BOTH to str("mini_player_content_both"),
+)
+
+private fun miniPlayerContentModeLabel(mode: MiniPlayerContentMode): String =
+    miniPlayerContentModeOptions().first { it.first == mode }.second
+
 /** Interface → Mini player: the same grouped cards as every other settings page. */
 @Composable
 fun MiniPlayerSettingsPage() {
     val prefs = remember { PlayerPreferences() }
     val snapshot by Prefs.flow.collectAsState()
+    var showContentModeDialog by remember { mutableStateOf(false) }
+    val contentMode = remember(snapshot) { prefs.getMiniPlayerContentMode() }
     fun toggle(title: String, subtitle: String, checked: Boolean, set: (Boolean) -> Unit): @Composable (androidx.compose.ui.graphics.Shape) -> Unit = { shape ->
         SettingsItem(shape = shape, title = title, subtitle = subtitle, hasSwitch = true, switchState = checked, onSwitchChange = set)
     }
+
+    if (showContentModeDialog) {
+        ChoiceDialog(
+            title = str("mini_player_content_mode"),
+            options = miniPlayerContentModeOptions(),
+            selected = contentMode,
+            onSelect = { prefs.setMiniPlayerContentMode(it) },
+            onDismiss = { showContentModeDialog = false },
+        )
+    }
+
     val style = remember(snapshot) { prefs.getMiniPlayerStyle() }
     SettingsGroup(
         title = str("mini_player_section_look"),
@@ -366,6 +423,14 @@ fun MiniPlayerSettingsPage() {
     SettingsGroup(
         title = str("mini_player_section_content"),
         items = listOf(
+            { shape ->
+                SettingsItem(
+                    shape = shape,
+                    title = str("mini_player_content_mode"),
+                    subtitle = miniPlayerContentModeLabel(contentMode),
+                    onClick = { showContentModeDialog = true },
+                )
+            },
             toggle(str("mini_player_show_cover"), str("mini_player_show_cover_desc"), remember(snapshot) { prefs.getMiniPlayerShowCover() }) { prefs.setMiniPlayerShowCover(it) },
             toggle(str("mini_player_show_playback_controls"), str("mini_player_show_playback_controls_desc"), remember(snapshot) { prefs.getMiniPlayerShowPlaybackControls() }) { prefs.setMiniPlayerShowPlaybackControls(it) },
             toggle(str("mini_player_show_additional_controls"), str("mini_player_show_additional_controls_desc"), remember(snapshot) { prefs.getMiniPlayerShowAdditionalControls() }) { prefs.setMiniPlayerShowAdditionalControls(it) },
@@ -408,6 +473,18 @@ private fun MiniPlayerSettingsItems(prefs: PlayerPreferences) {
     val hoverEffect = remember(prefsSnapshot) { prefs.getMiniPlayerHoverEffect() }
     val hoverIllumination = remember(prefsSnapshot) { prefs.getMiniPlayerHoverIllumination() }
     val showProgress = remember(prefsSnapshot) { prefs.getMiniPlayerShowProgress() }
+    val contentMode = remember(prefsSnapshot) { prefs.getMiniPlayerContentMode() }
+    var showContentModeDialog by remember { mutableStateOf(false) }
+
+    if (showContentModeDialog) {
+        ChoiceDialog(
+            title = str("mini_player_content_mode"),
+            options = miniPlayerContentModeOptions(),
+            selected = contentMode,
+            onSelect = { prefs.setMiniPlayerContentMode(it) },
+            onDismiss = { showContentModeDialog = false },
+        )
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         MiniPlayerSectionTitle(str("mini_player_section_look"))
@@ -426,6 +503,11 @@ private fun MiniPlayerSettingsItems(prefs: PlayerPreferences) {
         }
 
         MiniPlayerSectionTitle(str("mini_player_section_content"))
+        ChoiceRow(
+            title = str("mini_player_content_mode"),
+            subtitle = miniPlayerContentModeLabel(contentMode),
+            onClick = { showContentModeDialog = true },
+        )
         SwitchRow(str("mini_player_show_cover"), showCover, str("mini_player_show_cover_desc")) {
             prefs.setMiniPlayerShowCover(!showCover)
         }
@@ -446,6 +528,26 @@ private fun MiniPlayerSettingsItems(prefs: PlayerPreferences) {
         SwitchRow(str("mini_player_hover_effect"), hoverEffect, str("mini_player_hover_effect_desc")) {
             prefs.setMiniPlayerHoverEffect(!hoverEffect)
         }
+
+        // Windows only: opaque floating windows, for setups (RTSS) where a transparent one froze the app.
+        val compat = com.alananasss.kittytune.core.FloatingWindowCompat
+        if (compat.isAvailable) {
+            val compatOn = compat.opaque
+            val autoKey = compat.autoReasonKey
+            val subtitle = if (compatOn && compat.mode == com.alananasss.kittytune.core.FloatingWindowCompat.Mode.AUTO && autoKey != null) {
+                str(autoKey)
+            } else {
+                str("floating_compat_desc")
+            }
+            SwitchRow(str("floating_compat_title"), compatOn, subtitle) {
+                if (!compat.isForced) {
+                    compat.changeMode(
+                        if (compatOn) com.alananasss.kittytune.core.FloatingWindowCompat.Mode.OFF
+                        else com.alananasss.kittytune.core.FloatingWindowCompat.Mode.ON
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -457,4 +559,37 @@ private fun MiniPlayerSectionTitle(text: String) {
         color = MaterialTheme.colorScheme.primary,
         modifier = Modifier.padding(start = 12.dp, top = 12.dp, bottom = 4.dp),
     )
+}
+
+/** A row that opens a single-choice dialog, styled like the switch rows around it. */
+@Composable
+private fun ChoiceRow(title: String, subtitle: String?, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Icon(
+            Icons.Rounded.ChevronRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(20.dp),
+        )
+    }
 }

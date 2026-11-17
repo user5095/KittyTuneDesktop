@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.dp
 import com.alananasss.kittytune.core.EscapableAlertDialog
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.data.GuestDataSummary
+import androidx.compose.material3.ButtonDefaults
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -73,7 +74,7 @@ fun TransferGuestDataDialog(
                 )
             },
             confirmButton = {
-                Button(
+                Button(shapes = ButtonDefaults.shapes(),
                     onClick = {
                         showWarningDialog1 = false
                         showWarningDialog2 = true
@@ -84,7 +85,7 @@ fun TransferGuestDataDialog(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showWarningDialog1 = false }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { showWarningDialog1 = false }) {
                     Text(str("transfer_guest_warn_btn_back"))
                 }
             }
@@ -125,7 +126,7 @@ fun TransferGuestDataDialog(
                 )
             },
             confirmButton = {
-                Button(
+                Button(shapes = ButtonDefaults.shapes(),
                     onClick = {
                         showWarningDialog2 = false
                         onDismiss()
@@ -136,7 +137,7 @@ fun TransferGuestDataDialog(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showWarningDialog2 = false }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { showWarningDialog2 = false }) {
                     Text(str("transfer_guest_warn_btn_cancel"))
                 }
             }
@@ -317,7 +318,7 @@ fun TransferGuestDataDialog(
             }
         },
         confirmButton = {
-            Button(
+            Button(shapes = ButtonDefaults.shapes(),
                 onClick = {
                     onTransfer(transferLikes, transferPlaylists, transferLikedPlaylists)
                 },
@@ -328,7 +329,7 @@ fun TransferGuestDataDialog(
         },
         dismissButton = {
             if (!isTransferring) {
-                TextButton(onClick = { showWarningDialog1 = true }) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { showWarningDialog1 = true }) {
                     Text(str("transfer_guest_btn_skip"))
                 }
             }

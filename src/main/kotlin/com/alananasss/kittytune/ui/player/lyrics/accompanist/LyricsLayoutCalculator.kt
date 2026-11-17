@@ -128,6 +128,7 @@ fun measureSyllablesAndDetermineAnimation(
     spaceWidth: Float
 ): List<SyllableLayout> {
     val words = groupIntoWords(syllables)
+    val isUntimedLine = syllables.size > 1 && syllables.all { it.start == syllables.first().start }
     val fastCharAnimationThresholdMs = 200f
 
     return words.flatMapIndexed { wordIndex, word ->
@@ -140,7 +141,8 @@ fun measureSyllablesAndDetermineAnimation(
         }
 
         val useAwesomeAnimation =
-            perCharDuration > fastCharAnimationThresholdMs && wordDuration >= 1000
+            !isUntimedLine
+                    && perCharDuration > fastCharAnimationThresholdMs && wordDuration >= 1000
                     && !wordContent.shouldUseSimpleAnimation()
                     && !isAccompanimentLine
 
@@ -346,7 +348,9 @@ fun calculateStaticLineLayout(
 
         // 核心逻辑：如果是右对齐，起始点 = 画布宽 - 行宽。如果是居中，起始点 = (画布宽 - 行宽) / 2。否则为 0。
         val startX = when {
-            isLineRightAligned -> canvasWidth - wrappedLine.totalWidth
+            // Never left of the canvas: a word too long to break still starts on screen and runs off the
+            // right, instead of losing its beginning to the left edge (issue #66).
+            isLineRightAligned -> (canvasWidth - wrappedLine.totalWidth).coerceAtLeast(0f)
             isLineCenterAligned -> ((canvasWidth - wrappedLine.totalWidth) / 2f).coerceAtLeast(0f)
             else -> 0f
         }

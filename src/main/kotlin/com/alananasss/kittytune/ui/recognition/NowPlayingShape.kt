@@ -3,16 +3,26 @@ package com.alananasss.kittytune.ui.recognition
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Easing
-import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.keyframes
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.center
 import androidx.compose.ui.graphics.Color
@@ -21,11 +31,18 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Fill
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.unit.dp
+import androidx.graphics.shapes.CornerRounding
+import androidx.graphics.shapes.Morph
+import androidx.graphics.shapes.RoundedPolygon
+import androidx.graphics.shapes.circle
+import androidx.graphics.shapes.star
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.min
@@ -58,94 +75,158 @@ private val EmphasizedDecelerate: Easing = CubicBezierEasing(0.1f, 0.7f, 0.1f, 1
 /** `motionEasingStandardAccelerate`: cubic(0.3, 0.0, 1.0, 1.0). */
 private val StandardAccelerate: Easing = CubicBezierEasing(0.3f, 0f, 1f, 1f)
 
-/** `button_pulse_scale_interpolator`: cubic(0, 0, 0, 1), an almost instant departure. */
-private val PulseEasing: Easing = CubicBezierEasing(0f, 0f, 0f, 1f)
-
 private const val SQUASH_SCALE = 0.95f
 private const val SQUASH_MS = 200
 private const val BLOOM_DELAY_MS = 83L
+/** 180dp × 1.3111111 = 236dp — the scalloped vector's authored viewport size (gam.java:121). */
 private const val BLOOM_SCALE = 1.3111111f
 private const val BLOOM_MS = 300
-
-private const val PULSE_START_DELAY_MS = 100L
-private const val PULSE_SCALE_TO = 1.818f
-private const val PULSE_SCALE_MS = 1150
-private const val PULSE_FADE_IN_MS = 500
-private const val PULSE_FADE_OUT_MS = 450
-private const val PULSE_PEAK_ALPHA = 0.15f
-
-/** The 12 ms no-op the app plays after each pulse before the listener restarts it. */
-private const val PULSE_TAIL_MS = 12L
 
 /**
  * The listen button's shape and its tap animation.
  *
+ * Reconstructed directly from Pixel Now Playing's Compose implementation (hac.java lines 18576-19060
+ * and gow.java):
+ *  - Idle: 180 dp circular button (colorSecondary) with onSecondary note icon.
+ *  - Searching: Bloomed to 236 dp (scale 1.3111x) with 10-lobed scalloped active background
+ *    (colorOnPrimaryContainer) and primaryContainer searching bars icon.
+ *  - Behind it, the aura / halo performs a continuous breathing "battement" (heartbeat) animation:
+ *    oscillating between 220 dp (scale 0.70x, tucked behind the button) and 314 dp (scale 1.00x,
+ *    expanding outward) with RepeatMode.Reverse over a 1500 ms cycle, while alpha peaks at 0.20
+ *    mid-expansion and fades to 0.
+ *
  * @param active true while the app is listening: the button wears the scalloped shape, sits at its
- *   bloomed size, and the halo behind it pulses.
- * @param color the fill for both the button and its halo.
- * @param content centred on the button. It scales with the shape, because in the app the scale is
- *   set on the `ImageButton` itself and a View's scale carries its `src` along with its background.
+ *   bloomed size, and the halo behind it pulses with the heartbeat animation.
+ * @param color the fill for the button.
+ * @param haloColor the fill for the pulsing halo (defaults to color).
+ * @param content centred on the button. It scales with the shape.
  */
 @Composable
 fun NowPlayingListenButton(
     active: Boolean,
     color: Color,
     modifier: Modifier = Modifier,
+    haloColor: Color = color,
     content: @Composable BoxScope.() -> Unit,
 ) {
-    val buttonScale = remember { Animatable(1f) }
-    val pulseScale = remember { Animatable(1f) }
-    val pulseAlpha = remember { Animatable(0f) }
-    // The swap happens on the squash's first frame rather than at the end, so the shape has already
-    // changed while the button is still shrinking.
-    val wearingBlob = remember { Animatable(0f) }
+    val buttonScale = remember { Animatable(if (active) BLOOM_SCALE else 1f) }
+    val morphProgress = remember { Animatable(if (active) 1f else 0f) }
+    val breathingOffset = remember { Animatable(0f) }
+    var isFirstComposition by remember { mutableStateOf(true) }
+    val isSeen = com.alananasss.kittytune.core.LocalWindowSeen.current
 
     LaunchedEffect(active) {
         if (!active) {
-            buttonScale.snapTo(1f)
-            pulseScale.snapTo(1f)
-            pulseAlpha.snapTo(0f)
-            wearingBlob.snapTo(0f)
+            if (isFirstComposition) {
+                isFirstComposition = false
+                morphProgress.snapTo(0f)
+                buttonScale.snapTo(1f)
+                breathingOffset.snapTo(0f)
+                return@LaunchedEffect
+            }
+            // Exit: smoothly return breathing to 0 (250ms), morph scalloped shape -> circle (350ms), squish & return to 1.0
+            launch {
+                breathingOffset.animateTo(0f, tween(250, easing = FastOutSlowInEasing))
+            }
+            launch {
+                morphProgress.animateTo(0f, tween(350, easing = FastOutSlowInEasing))
+            }
+            buttonScale.animateTo(SQUASH_SCALE, tween(150, easing = EmphasizedDecelerate))
+            delay(50L)
+            buttonScale.animateTo(1.0f, tween(250, easing = StandardAccelerate))
             return@LaunchedEffect
         }
 
-        launch {
-            while (true) {
-                delay(PULSE_START_DELAY_MS)
-                pulseScale.snapTo(1f)
-                pulseAlpha.snapTo(0f)
-                launch {
-                    pulseScale.animateTo(
-                        PULSE_SCALE_TO,
-                        tween(PULSE_SCALE_MS, easing = PulseEasing),
-                    )
-                }
-                // Fades all the way in, then all the way back out, while the scale keeps going.
-                pulseAlpha.animateTo(PULSE_PEAK_ALPHA, tween(PULSE_FADE_IN_MS, easing = LinearEasing))
-                pulseAlpha.animateTo(0f, tween(PULSE_FADE_OUT_MS, easing = LinearEasing))
-                delay(PULSE_TAIL_MS)
+        // Active state (listening / searching)
+        if (isFirstComposition) {
+            isFirstComposition = false
+            morphProgress.snapTo(1f)
+            buttonScale.snapTo(BLOOM_SCALE)
+        } else {
+            // Tap squish & bloom entry: morph circle -> scalloped shape while squishing and springing back
+            launch {
+                morphProgress.animateTo(1f, tween(400, easing = FastOutSlowInEasing))
             }
+            buttonScale.animateTo(SQUASH_SCALE, tween(SQUASH_MS, easing = EmphasizedDecelerate))
+            delay(BLOOM_DELAY_MS)
+            buttonScale.animateTo(BLOOM_SCALE, tween(BLOOM_MS, easing = StandardAccelerate))
         }
-
-        wearingBlob.snapTo(1f)
-        buttonScale.animateTo(SQUASH_SCALE, tween(SQUASH_MS, easing = EmphasizedDecelerate))
-        delay(BLOOM_DELAY_MS)
-        buttonScale.animateTo(BLOOM_SCALE, tween(BLOOM_MS, easing = StandardAccelerate))
     }
 
-    val blobPath = remember { PathParser().parsePathString(ACTIVE_BLOB_PATH_DATA).toPath() }
-    val haloPath = remember { PathParser().parsePathString(PULSE_HALO_PATH_DATA).toPath() }
-    val scratch = remember { Path() }
-    val matrix = remember { Matrix() }
+    // The breathing pulse has its own effect so that parking it for a hidden window does not replay the button's
+    // entry. Nobody can see it while the window is hidden, and the loop asks for a frame for as long as it runs.
+    LaunchedEffect(active, isSeen) {
+        // Not active: the exit below owns the offset, easing it back, so this effect leaves it alone.
+        if (!active) return@LaunchedEffect
+        if (!isSeen) {
+            breathingOffset.snapTo(0f)
+            return@LaunchedEffect
+        }
+        // Official Now Playing breathing pulse (fid.smali / hac.java lines 18803-18870):
+        // 1000ms delay after listening begins (0x3e8 in fid.smali)
+        delay(1000L)
+        // Initial rise to +8dp in 750ms with LinearOutSlowInEasing (vl.b / 0x2ee in fid.smali)
+        breathingOffset.animateTo(
+            targetValue = 8f,
+            animationSpec = tween(750, easing = CubicBezierEasing(0.0f, 0.0f, 0.2f, 1.0f))
+        )
+        // Continuous breathing loop: oscillates between -8dp and +8dp over 1500ms with FastOutSlowInEasing (vl.a / 0x5dc in fid.smali)
+        while (true) {
+            breathingOffset.animateTo(
+                targetValue = -8f,
+                animationSpec = tween(1500, easing = FastOutSlowInEasing)
+            )
+            breathingOffset.animateTo(
+                targetValue = 8f,
+                animationSpec = tween(1500, easing = FastOutSlowInEasing)
+            )
+        }
+    }
+
+    // Heartbeat / breathing aura animation from hac.java bv() lines 18803-18870:
+    // Scale radiates continuously outward from 0.70f (220dp, tucked behind button)
+    // to 1.0f (314dp, expanding past the 236dp button) with RepeatMode.Restart (always expanding outward, never reversing)
+    //
+    // On the shared ambient pulse, and stopped while the window is hidden: an infinite transition held the
+    // window's own frame clock here, so this screen kept being redrawn at the display's rate for as long as it was
+    // composed, whether listening or not. The two curves below are the tween and keyframes it drew.
+    val pulsePhase = com.alananasss.kittytune.ui.common.rememberAmbientLoop(
+        periodMs = PULSE_PERIOD_MS,
+        from = 0f,
+        to = 1f,
+    )
+
+    val haloFade by animateFloatAsState(
+        targetValue = if (active) 1f else 0f,
+        animationSpec = tween(300),
+        label = "halo_fade"
+    )
+
+    val haloPath = remember { Path().also { ButtonMorph.toComposePath(1f, it) } }
+    val buttonScratch = remember { Path() }
 
     Box(
-        // The halo is a sibling of the button in the app, constrained to its bounds, so it pulses on
-        // its own scale rather than inheriting the button's.
         modifier = modifier.drawBehind {
-            val alpha = pulseAlpha.value
-            if (alpha <= 0f) return@drawBehind
-            scale(pulseScale.value) {
-                drawFitted(haloPath, PULSE_HALO_VIEWPORT, scratch, matrix, color, alpha)
+            // Alpha peaks at 0.25f at mid-cycle (750ms) and fades to 0f at 0 and 1500ms (ggp.java case 12)
+            val phase = pulsePhase.value
+            val alphaRaw = if (phase < 0.5f) {
+                PULSE_RISE_EASING.transform(phase * 2f) * PULSE_PEAK
+            } else {
+                (1f - PULSE_FALL_EASING.transform((phase - 0.5f) * 2f)) * PULSE_PEAK
+            }
+            val haloAlpha = alphaRaw * haloFade
+            if (haloAlpha <= 0f) return@drawBehind
+            // Official Now Playing halo viewport: 314dp (hac.java:18839 / amn.m598g(..., 314.0f))
+            // At scale 0.70x: 220dp (tucked behind the 236dp bloomed button).
+            // At scale 1.00x: 314dp (emerging generously 39dp past each edge of the 236dp bloomed button).
+            val pulseScale = PULSE_MIN_SCALE + (1f - PULSE_MIN_SCALE) * PULSE_SCALE_EASING.transform(phase)
+            val radius = (314.dp.toPx() / 2f) * pulseScale
+            translate(left = size.center.x, top = size.center.y) {
+                scale(scaleX = radius, scaleY = radius, pivot = Offset.Zero) {
+                    rotate(degrees = -90f, pivot = Offset.Zero) {
+                        drawPath(path = haloPath, color = haloColor, alpha = haloAlpha, style = Fill)
+                    }
+                }
             }
         },
         contentAlignment = Alignment.Center,
@@ -158,17 +239,48 @@ fun NowPlayingListenButton(
                     scaleY = buttonScale.value
                 }
                 .drawBehind {
-                    if (wearingBlob.value > 0f) {
-                        drawFitted(blobPath, ACTIVE_BLOB_VIEWPORT, scratch, matrix, color, 1f)
-                    } else {
-                        val diameter = min(size.width, size.height)
-                        drawCircle(color = color, radius = diameter / 2f, center = size.center)
+                    val baseRadius = min(size.width, size.height) / 2f
+                    val radius = baseRadius + (breathingOffset.value.dp.toPx() / 2f)
+                    ButtonMorph.toComposePath(morphProgress.value, buttonScratch)
+                    translate(left = size.center.x, top = size.center.y) {
+                        scale(scaleX = radius, scaleY = radius, pivot = Offset.Zero) {
+                            rotate(degrees = -90f, pivot = Offset.Zero) {
+                                drawPath(path = buttonScratch, color = color, style = Fill)
+                            }
+                        }
                     }
                 },
             contentAlignment = Alignment.Center,
             content = content,
         )
     }
+}
+
+private val CircleShape = RoundedPolygon.circle(numVertices = 10, radius = 1f)
+private val BlobShape = RoundedPolygon.star(
+    numVerticesPerRadius = 10,
+    radius = 1f,
+    innerRadius = 0.8f,
+    rounding = CornerRounding(0.33333334f)
+)
+private val ButtonMorph = Morph(CircleShape, BlobShape)
+
+private fun Morph.toComposePath(progress: Float, path: Path): Path {
+    path.reset()
+    var isFirst = true
+    forEachCubic(progress) { cubic ->
+        if (isFirst) {
+            path.moveTo(cubic.anchor0X, cubic.anchor0Y)
+            isFirst = false
+        }
+        path.cubicTo(
+            cubic.control0X, cubic.control0Y,
+            cubic.control1X, cubic.control1Y,
+            cubic.anchor1X, cubic.anchor1Y
+        )
+    }
+    path.close()
+    return path
 }
 
 /**
@@ -197,6 +309,14 @@ private fun DrawScope.drawFitted(
 
 private val ACTIVE_BLOB_VIEWPORT = Size(236f, 236f)
 private val PULSE_HALO_VIEWPORT = Size(176f, 182f)
+
+/** One breath of the halo, and the curves its tween and keyframes used before it moved to the ambient pulse. */
+private const val PULSE_PERIOD_MS = 1_500
+private const val PULSE_MIN_SCALE = 0.70f
+private const val PULSE_PEAK = 0.25f
+private val PULSE_SCALE_EASING = CubicBezierEasing(0.0f, 0.0f, 0.2f, 1.0f)
+private val PULSE_RISE_EASING = CubicBezierEasing(0.4f, 0.0f, 1.0f, 1.0f)
+private val PULSE_FALL_EASING: Easing = androidx.compose.animation.core.LinearEasing
 
 /** `music_recognition_active_background_new`, the shape the button wears while listening. */
 private const val ACTIVE_BLOB_PATH_DATA =

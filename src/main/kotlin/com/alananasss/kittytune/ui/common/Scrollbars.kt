@@ -38,6 +38,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
+import com.alananasss.kittytune.ui.utils.fadedVerticalEdges
+import com.alananasss.kittytune.ui.utils.fadedHorizontalEdges
+
 @Composable
 fun ScrollableLazyColumn(
     modifier: Modifier = Modifier,
@@ -48,13 +51,17 @@ fun ScrollableLazyColumn(
     horizontalAlignment: Alignment.Horizontal = Alignment.Start,
     flingBehavior: FlingBehavior = ScrollableDefaults.flingBehavior(),
     userScrollEnabled: Boolean = true,
+    fadeEdges: Boolean = true,
+    fadeLength: androidx.compose.ui.unit.Dp = 28.dp,
     content: LazyListScope.() -> Unit
 ) {
     val barOverlap = rememberPlayerBarOverlap()
     val clearance = barOverlap.clearance()
     Box(modifier = modifier.then(barOverlap.modifier)) {
         androidx.compose.foundation.lazy.LazyColumn(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .fadedVerticalEdges(state, fadeLength = fadeLength, enabled = fadeEdges),
             state = state,
             contentPadding = contentPadding.plusBottom(clearance),
             reverseLayout = reverseLayout,
@@ -79,6 +86,8 @@ fun ScrollableLazyVerticalGrid(
     contentPadding: PaddingValues = PaddingValues(0.dp),
     verticalArrangement: Arrangement.Vertical = Arrangement.Top,
     horizontalArrangement: Arrangement.Horizontal = Arrangement.Start,
+    fadeEdges: Boolean = true,
+    fadeLength: androidx.compose.ui.unit.Dp = 28.dp,
     content: androidx.compose.foundation.lazy.grid.LazyGridScope.() -> Unit
 ) {
     val barOverlap = rememberPlayerBarOverlap()
@@ -86,7 +95,9 @@ fun ScrollableLazyVerticalGrid(
     Box(modifier = modifier.then(barOverlap.modifier)) {
         androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
             columns = columns,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .fadedVerticalEdges(state, fadeLength = fadeLength, enabled = fadeEdges),
             state = state,
             contentPadding = contentPadding.plusBottom(clearance),
             verticalArrangement = verticalArrangement,
@@ -108,13 +119,19 @@ fun ScrollableColumn(
     horizontalAlignment: Alignment.Horizontal = Alignment.Start,
     hideScrollbar: Boolean = false,
     contentPadding: PaddingValues = PaddingValues(0.dp),
+    fadeEdges: Boolean = true,
+    fadeLength: androidx.compose.ui.unit.Dp = 28.dp,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val barOverlap = rememberPlayerBarOverlap()
     val clearance = barOverlap.clearance()
     Box(modifier = modifier.then(barOverlap.modifier)) {
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(state).padding(contentPadding.plusBottom(clearance)),
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(state)
+                .fadedVerticalEdges(state, fadeLength = fadeLength, enabled = fadeEdges)
+                .padding(contentPadding.plusBottom(clearance)),
             verticalArrangement = verticalArrangement,
             horizontalAlignment = horizontalAlignment,
             content = content
@@ -127,6 +144,10 @@ fun ScrollableColumn(
         }
     }
 }
+
+
+/** How long the pointer has to have been still before release for a drag to end without coasting on. */
+private const val FLING_REST_MS = 60L
 
 /**
  * Enables smooth horizontal mouse swipe / drag scrolling across horizontal containers (issue #56).
@@ -143,16 +164,22 @@ fun Modifier.horizontalMouseSwipe(
     val scope = rememberCoroutineScope()
     val velocityTracker = remember { VelocityTracker() }
     var flingJob by remember { mutableStateOf<Job?>(null) }
+    var lastMoveMs by remember { mutableStateOf(0L) }
 
     this.pointerInput(state) {
         detectHorizontalDragGestures(
-            onDragStart = { offset ->
+            onDragStart = {
                 flingJob?.cancel()
+                // Every sample on the pointer's own clock. The first one used to be wall-clock time and the
+                // rest event time, two clocks hours apart, which made the velocity whatever it liked.
                 velocityTracker.resetTracking()
-                velocityTracker.addPosition(System.currentTimeMillis(), offset)
             },
             onDragEnd = {
-                val velocity = velocityTracker.calculateVelocity().x
+                // A drag that came to rest before the button was let go stays where it was put. The tracker
+                // only ever saw the movement, so it reported the speed from before the pause, and the row
+                // slid on after a release that meant "stop here" (issue #66).
+                val isStillAtRelease = System.currentTimeMillis() - lastMoveMs > FLING_REST_MS
+                val velocity = if (isStillAtRelease) 0f else velocityTracker.calculateVelocity().x
                 if (abs(velocity) > 100f) {
                     flingJob = scope.launch {
                         var currentVelocity = -velocity
@@ -170,6 +197,7 @@ fun Modifier.horizontalMouseSwipe(
             },
             onHorizontalDrag = { change, dragAmount ->
                 velocityTracker.addPosition(change.uptimeMillis, change.position)
+                lastMoveMs = System.currentTimeMillis()
                 change.consume()
                 scope.launch {
                     state.scrollBy(-dragAmount)

@@ -29,13 +29,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import com.alananasss.kittytune.ui.player.queuePastIndices
 import androidx.compose.foundation.onClick
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ClearAll
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DragHandle
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Verified
 import com.alananasss.kittytune.ui.icons.Icon
 import androidx.compose.material3.MaterialTheme
@@ -67,7 +71,9 @@ import com.alananasss.kittytune.ui.common.Tip
 import com.alananasss.kittytune.ui.player.AnchorCurrentQueueItem
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.ui.player.queueItemKeys
+import com.alananasss.kittytune.utils.formatQueueDuration
 import com.alananasss.kittytune.utils.makeTimeString
+import com.alananasss.kittytune.ui.common.PlayingBars
 import sh.calvin.reorderable.ReorderableCollectionItemScope
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
@@ -90,6 +96,7 @@ import com.alananasss.kittytune.ui.common.ScrollableLazyColumn as LazyColumn
  */
 private sealed interface QueueListItem {
     data class PastHeader(val count: Int, val isExpanded: Boolean) : QueueListItem
+    data class UpNextHeader(val count: Int) : QueueListItem
     data class TrackItem(val queueIndex: Int, val track: Track) : QueueListItem
 }
 
@@ -100,16 +107,14 @@ private const val PAST_COLLAPSE_THRESHOLD = 3
 @Composable
 internal fun QueueList(vm: PlayerViewModel) {
     val listState = rememberLazyListState()
-    val queue = vm.queueState
-    val currentIndex = vm.currentQueueIndex
+    val queue = vm.uiQueueState
+    val currentIndex = vm.uiCurrentQueueIndex
     val keys = remember(queue) { queueItemKeys(queue) }
 
-    // Compacted for having been heard, not for sitting at a lower index. Jumping ahead to the sixth
-    // track used to draw the five skipped ones as "already played", and jumping back drew the ones
-    // really heard as still to come (issue #33).
     val played = vm.playedTrackIds
-    val pastIndices = remember(queue, currentIndex, played) {
-        queue.indices.filter { it < currentIndex - 1 && queue[it].id in played }
+    val preserveUpcoming = vm.isQueuePreserveUpcomingEnabled
+    val pastIndices = remember(queue, currentIndex, played, preserveUpcoming) {
+        queuePastIndices(queue, currentIndex, played, preserveUpcoming)
     }
     val pastCount = pastIndices.size
     val firstPast = pastIndices.firstOrNull()
@@ -117,16 +122,20 @@ internal fun QueueList(vm: PlayerViewModel) {
     var pastExpandedByUser by remember { mutableStateOf<Boolean?>(null) }
     val isPastExpanded = pastExpandedByUser ?: (pastCount <= PAST_COLLAPSE_THRESHOLD)
 
-    val listItems = remember(queue, currentIndex, played, isPastExpanded) {
+    val upNextCount = (queue.size - currentIndex - 1).coerceAtLeast(0)
+
+    val listItems = remember(queue, currentIndex, pastIndices, isPastExpanded, upNextCount) {
         buildList {
             for (index in queue.indices) {
                 if (index == firstPast) add(QueueListItem.PastHeader(count = pastCount, isExpanded = isPastExpanded))
+                if (currentIndex >= 0 && index == currentIndex + 1 && upNextCount > 0) {
+                    add(QueueListItem.UpNextHeader(count = upNextCount))
+                }
                 val isPast = index in pastIndices
                 if (!isPast || isPastExpanded) add(QueueListItem.TrackItem(queueIndex = index, track = queue[index]))
             }
         }
     }
-    val upNextCount = (queue.size - currentIndex - 1).coerceAtLeast(0)
 
     val reorderableState = rememberReorderableLazyListState(
         lazyListState = listState,
@@ -148,11 +157,13 @@ internal fun QueueList(vm: PlayerViewModel) {
     AnchorCurrentQueueItem(
         listState = listState,
         currentIndex = currentIndex,
-        currentTrackId = vm.currentTrack?.id,
+        currentTrackId = vm.uiCurrentTrack?.id,
         currentKey = currentKey,
         targetIndex = targetListIndex,
     )
 
+    Column(Modifier.fillMaxSize()) {
+    QueueToolbar(vm, upNextCount)
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize(),
@@ -164,6 +175,7 @@ internal fun QueueList(vm: PlayerViewModel) {
             key = { item ->
                 when (item) {
                     is QueueListItem.PastHeader -> "queue_header_past"
+                    is QueueListItem.UpNextHeader -> "queue_header_up_next"
                     is QueueListItem.TrackItem -> keys[item.queueIndex]
                 }
             }
@@ -176,26 +188,75 @@ internal fun QueueList(vm: PlayerViewModel) {
                     isExpanded = item.isExpanded,
                     onToggle = { pastExpandedByUser = !item.isExpanded },
                 )
+                is QueueListItem.UpNextHeader -> QueueSectionRule(
+                    label = str("queue_up_next"),
+                    count = item.count
+                )
                 is QueueListItem.TrackItem -> {
                     val index = item.queueIndex
                     ReorderableItem(state = reorderableState, key = keys[index]) { isDragging ->
-                        Column {
-                            // Named where the treatment changes, so the upcoming tracks read as a section.
-                            if (currentIndex >= 0 && index == currentIndex + 1) {
-                                QueueSectionRule(str("queue_up_next"), count = upNextCount)
-                            }
-                            QueueRow(
-                                vm = vm,
-                                track = item.track,
-                                index = index,
-                                isCurrent = index == currentIndex,
-                                isPast = index in pastIndices,
-                                isDragging = isDragging,
-                            )
-                        }
+                        QueueRow(
+                            vm = vm,
+                            track = item.track,
+                            index = index,
+                            isCurrent = index == currentIndex,
+                            isPast = index in pastIndices,
+                            isDragging = isDragging,
+                        )
                     }
                 }
             }
+        }
+    }
+    }
+}
+
+/**
+ * What is left of the queue and the two things done to all of it at once: shuffle, and clearing what comes next.
+ * The same round buttons as the rest of the panel (issue #66).
+ */
+@Composable
+private fun QueueToolbar(vm: PlayerViewModel, upNextCount: Int) {
+    val queue = vm.queueState
+    val current = vm.currentQueueIndex
+    val clip = vm.clipWindow
+    val leftMs = remember(queue, current, vm.duration, vm.currentPosition / 10_000L, clip) {
+        val upcoming = queue.drop(current + 1).sumOf { vm.clipLengthOf(it) ?: it.durationMs ?: 0L }
+        // In a trailer, what is left of the song is what is left of its window.
+        val songEnd = clip?.endMs ?: vm.duration
+        upcoming + (songEnd - vm.currentPosition).coerceAtLeast(0L)
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 2.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = str("queue_time_left", formatQueueDuration(leftMs)),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        PanelToolButton(
+            icon = Icons.Rounded.History,
+            label = str("queue_history"),
+            onClick = { vm.showQueueHistoryDialog = true },
+        )
+        Spacer(Modifier.width(6.dp))
+        PanelToolButton(
+            icon = Icons.Rounded.Shuffle,
+            label = str("btn_shuffle"),
+            isActive = vm.shuffleEnabled,
+            onClick = { vm.toggleShuffle() },
+        )
+        if (upNextCount > 0) {
+            Spacer(Modifier.width(6.dp))
+            PanelToolButton(
+                icon = Icons.Rounded.ClearAll,
+                label = str("queue_clear_upcoming"),
+                onClick = { vm.clearUpcoming() },
+            )
         }
     }
 }
@@ -306,7 +367,7 @@ private fun ReorderableCollectionItemScope.QueueRow(
             .hoverable(interactionSource)
             .onClick(
                 matcher = PointerMatcher.mouse(PointerButton.Secondary),
-                onClick = { vm.showTrackOptions(track) }
+                onClick = { vm.showTrackOptions(track, fromPlayer = true, queueIndex = index) }
             )
             .clickable(interactionSource = interactionSource, indication = null) { vm.skipToQueueItem(index) }
             .padding(horizontal = 8.dp, vertical = if (isPast) 4.dp else 6.dp)
@@ -315,7 +376,7 @@ private fun ReorderableCollectionItemScope.QueueRow(
             .then(if (isPast && !isHovered) Modifier.alpha(PAST_ROW_ALPHA) else Modifier),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        QueueCover(track, size = if (isPast) 28.dp else 44.dp, isCurrent = isCurrent, isPlaying = vm.isPlaying)
+        QueueCover(track, size = if (isPast) 28.dp else 44.dp, isCurrent = isCurrent, isPlaying = vm.uiIsPlaying)
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -348,7 +409,7 @@ private fun ReorderableCollectionItemScope.QueueRow(
         // The length and the controls share one slot; the handle stays composed while hidden, since the
         // drag has to be able to start from it the moment the row is hovered.
         Box(contentAlignment = Alignment.CenterEnd) {
-            val duration = track.durationMs?.takeIf { it > 0 }
+            val duration = (vm.clipLengthOf(track) ?: track.durationMs)?.takeIf { it > 0 }
             if (duration != null && !isPast) {
                 Text(
                     text = makeTimeString(duration),
@@ -411,32 +472,6 @@ private fun QueueCover(track: Track, size: Dp, isCurrent: Boolean, isPlaying: Bo
         }
     }
 }
-
-/** Three bars bouncing out of step, the usual "this one is playing" mark. */
-@Composable
-private fun PlayingBars(isPlaying: Boolean, modifier: Modifier = Modifier) {
-    val transition = rememberInfiniteTransition(label = "playing_bars")
-    Row(modifier, horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.Bottom) {
-        BAR_PERIODS_MS.forEachIndexed { i, period ->
-            val bounce by transition.animateFloat(
-                initialValue = 0.25f,
-                targetValue = 1f,
-                animationSpec = infiniteRepeatable(tween(period), RepeatMode.Reverse),
-                label = "playing_bar_$i"
-            )
-            Box(
-                Modifier
-                    .weight(1f)
-                    .fillMaxHeight(if (isPlaying) bounce else PAUSED_BAR_HEIGHTS[i])
-                    .clip(RoundedCornerShape(1.dp))
-                    .background(Color.White)
-            )
-        }
-    }
-}
-
-private val BAR_PERIODS_MS = listOf(420, 560, 360)
-private val PAUSED_BAR_HEIGHTS = listOf(0.4f, 0.7f, 0.5f)
 
 /** How far the already-played rows recede. Legible on purpose — they are still part of the queue. */
 private const val PAST_ROW_ALPHA = 0.55f

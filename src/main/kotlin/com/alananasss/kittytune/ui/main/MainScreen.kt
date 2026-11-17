@@ -1,5 +1,10 @@
+@file:OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+
 package com.alananasss.kittytune.ui.main
 
+import androidx.compose.ui.input.pointer.onPointerEvent
+
+import com.alananasss.kittytune.ui.common.notePointerPresses
 import androidx.compose.animation.*
 import androidx.compose.animation.core.VisibilityThreshold
 import androidx.compose.animation.togetherWith
@@ -112,13 +117,40 @@ private const val FULLSCREEN_EXIT_MS = 220
 fun MainScreen(
     playerViewModel: PlayerViewModel = viewModel { PlayerViewModel(AppInstance.application) },
 ) {
+    // Leaving MAIN cancels work and drops the state of every account screen.
+    val accountOwner = remember {
+        object : androidx.lifecycle.ViewModelStoreOwner {
+            override val viewModelStore = androidx.lifecycle.ViewModelStore()
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(accountOwner) {
+        onDispose { accountOwner.viewModelStore.clear() }
+    }
+    androidx.compose.runtime.CompositionLocalProvider(
+        androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner provides accountOwner
+    ) {
+        MainAccountScreen(playerViewModel)
+    }
+}
+
+@Composable
+private fun MainAccountScreen(playerViewModel: PlayerViewModel) {
+    com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: composition start")
+    com.alananasss.kittytune.ui.debug.TraceRecompositions("MainScreen")
     val homeViewModel: HomeViewModel = viewModel { HomeViewModel(AppInstance.application) }
     val libraryViewModel: LibraryViewModel = viewModel { LibraryViewModel(AppInstance.application) }
+    com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: view models created")
+    LaunchedEffect(playerViewModel) { playerViewModel.resetAccountProfile() }
 
     val navController = rememberNavController()
     val playerPrefs = remember { com.alananasss.kittytune.data.local.PlayerPreferences() }
     var showNowPlayingPanel by remember { mutableStateOf(playerPrefs.getRightPanelOpen()) }
     var nowPlayingTab by remember { mutableStateOf(NowPlayingTab.TRACK) }
+    // The panel's tabs keep a history of their own for the mouse's side buttons.
+    LaunchedEffect(nowPlayingTab) { PanelHistory.noteTab(nowPlayingTab) }
+    LaunchedEffect(PanelHistory.movedTick) {
+        if (PanelHistory.movedTick > 0) nowPlayingTab = PanelHistory.present.tab
+    }
 
 
     // Close full-screen lyrics when navigation happens (e.g. sidebar click)
@@ -137,12 +169,26 @@ fun MainScreen(
     // translate into NavHost routes.
     androidx.compose.runtime.LaunchedEffect(playerViewModel.navigateToPlaylistId) {
         playerViewModel.navigateToPlaylistId?.let { destinationId ->
+            // the Kitty pet window's "settings": settings, opened on the pet's page
+            if (destinationId == "pet_settings") {
+                com.alananasss.kittytune.ui.profile.SettingsNavigation.go(
+                    com.alananasss.kittytune.ui.profile.SettingsPlace(
+                        com.alananasss.kittytune.ui.profile.SettingsCategory.INTERFACE,
+                        listOf(com.alananasss.kittytune.ui.profile.SettingsSubPage.PET),
+                    )
+                )
+            }
             val targetRoute = when {
+                destinationId == "pet_settings" || destinationId == "settings" -> "settings"
                 destinationId == "history" -> "history"
+                destinationId == "home" || destinationId == "search" -> "home"
+                destinationId == "charts" -> "charts"
                 destinationId == "upload" -> "upload"
                 destinationId == "recognition" -> "recognition"
                 destinationId == "recognition_history" -> "recognition_history"
                 destinationId == "credits" -> "credits"
+                destinationId == "together" -> "together_home"
+                destinationId.startsWith("together:") -> "together/${destinationId.removePrefix("together:")}"
                 destinationId.startsWith("edit_track:") -> "edit_track/${destinationId.removePrefix("edit_track:")}"
                 destinationId.startsWith("profile:") -> "profile/${destinationId.removePrefix("profile:")}"
                 // Spotify artist profiles route to the profile screen; the string
@@ -164,8 +210,34 @@ fun MainScreen(
                 if (!isSameRoute(navController, targetRoute)) {
                     navController.navigate(targetRoute)
                 }
+                if (destinationId == "search") homeViewModel.activateSearch()
             }
             playerViewModel.onNavigationHandled()
+        }
+    }
+
+    // The home view model answers a pasted link with either a destination or a
+    // track. The desktop has no navigation bus of its own, so those answers are
+    // handed to the player, which owns the route protocol (same wiring the
+    // Android app does through HomeScreen).
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        homeViewModel.navigateTo.collect { route ->
+            playerViewModel.navigateToPlaylistId = desktopHomeDestination(route)
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        homeViewModel.playTrack.collect { track ->
+            playerViewModel.playPlaylist(listOf(track), 0)
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(playerViewModel.showEqualizerScreen) {
+        if (playerViewModel.showEqualizerScreen) {
+            playerViewModel.showEqualizerScreen = false
+            if (navController.currentDestination?.route != "equalizer") {
+                navController.navigate("equalizer")
+            }
         }
     }
 
@@ -197,6 +269,17 @@ fun MainScreen(
                 val isAlt = event.isAltPressed
                 val isMeta = event.isMetaPressed
                 val noModifiers = !isShift && !isCtrl && !isAlt && !isMeta
+
+                if (noModifiers && event.key == Key.Escape) {
+                    if (playerViewModel.showEqualizerScreen) {
+                        playerViewModel.showEqualizerScreen = false
+                        return@collect
+                    }
+                    if (navController.currentDestination?.route == "equalizer") {
+                        navController.popBackStack()
+                        return@collect
+                    }
+                }
 
                 val now = System.currentTimeMillis()
 
@@ -240,7 +323,7 @@ fun MainScreen(
                         else -> null
                     }
                     if (numberSeekFraction != null) {
-                        val duration = playerViewModel.duration
+                        val duration = playerViewModel.uiDuration
                         if (duration > 0) {
                             playerViewModel.seekTo((duration * numberSeekFraction).toLong())
                         }
@@ -263,11 +346,11 @@ fun MainScreen(
                 } else if (noModifiers) {
                     when (event.key) {
                         Key.Spacebar -> playerViewModel.togglePlayPause()
-                        Key.DirectionRight -> playerViewModel.seekTo((playerViewModel.currentPosition + 5000).coerceAtMost(playerViewModel.duration))
-                        Key.DirectionLeft -> playerViewModel.seekTo((playerViewModel.currentPosition - 5000).coerceAtLeast(0))
+                        Key.DirectionRight -> playerViewModel.seekTo((playerViewModel.uiCurrentPosition + 5000).coerceAtMost(playerViewModel.uiDuration))
+                        Key.DirectionLeft -> playerViewModel.seekTo((playerViewModel.uiCurrentPosition - 5000).coerceAtLeast(0))
                         Key.L -> playerViewModel.toggleLike()
                         Key.R -> {
-                            playerViewModel.currentTrack?.let { playerViewModel.repostTrack(it, null) }
+                            playerViewModel.uiCurrentTrack?.let { playerViewModel.repostTrack(it, null) }
                         }
                         Key.S -> {
                             navController.navigate("home")
@@ -275,7 +358,7 @@ fun MainScreen(
                         }
                         Key.M -> playerViewModel.toggleMute()
                         Key.P -> {
-                            val track = playerViewModel.currentTrack
+                            val track = playerViewModel.uiCurrentTrack
                             if (track != null) {
                                 navController.navigate("track_detail/${track.id}")
                             }
@@ -338,12 +421,23 @@ fun MainScreen(
         onOpenLyrics = {
             playerViewModel.showLyricsSheet = !playerViewModel.showLyricsSheet
         },
+        onOpenDevices = {
+            if (showNowPlayingPanel && nowPlayingTab == NowPlayingTab.DEVICES) {
+                showNowPlayingPanel = false
+                playerPrefs.setRightPanelOpen(false)
+            } else {
+                showNowPlayingPanel = true
+                playerPrefs.setRightPanelOpen(true)
+                nowPlayingTab = NowPlayingTab.DEVICES
+            }
+        },
         // Straight to the big one, which is what he asked for: "I think you can do this when you click
         // on it, the player opens in full." The lyrics button beside it still opens the panel-sized
         // lyrics, which has its own way up here (issue #33).
         onOpenFullPlayer = { playerViewModel.isLyricsFullScreen = true },
-        isNowPlayingOpen = showNowPlayingPanel && nowPlayingTab != NowPlayingTab.QUEUE,
+        isNowPlayingOpen = showNowPlayingPanel && nowPlayingTab != NowPlayingTab.QUEUE && nowPlayingTab != NowPlayingTab.DEVICES,
         isQueueOpen = showNowPlayingPanel && nowPlayingTab == NowPlayingTab.QUEUE,
+        isDevicesOpen = showNowPlayingPanel && nowPlayingTab == NowPlayingTab.DEVICES,
         modifier = barModifier,
         onBarPlaced = if (isBarFloating) { coordinates ->
             if (coordinates.isAttached) {
@@ -353,12 +447,29 @@ fun MainScreen(
     )
     }
 
+    // Everything below is covered while the full player is open: it is opaque and fills the window. Its own moving
+    // parts — the "My Wave" card, the player bar's wave and playhead, the playing bars, canvas videos — kept running
+    // underneath all the same, and with the full player's they had the window redrawn well past the screen's own
+    // needs. They are told they are unseen once the full player has finished coming in, and seen again the moment it
+    // starts going, so its fade in and out still shows them moving (issue #33).
+    val windowSeen = com.alananasss.kittytune.core.LocalWindowSeen.current
+    var coveredByFullPlayer by remember { mutableStateOf(false) }
+    LaunchedEffect(playerViewModel.isLyricsFullScreen) {
+        if (!playerViewModel.isLyricsFullScreen) {
+            coveredByFullPlayer = false
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(FULLSCREEN_ENTER_MS.toLong() + 100L)
+        coveredByFullPlayer = true
+    }
     androidx.compose.runtime.CompositionLocalProvider(
         com.alananasss.kittytune.ui.common.LocalPlayerBarOverlay provides barOverlay.takeIf { isBarFloating },
+        com.alananasss.kittytune.core.LocalWindowSeen provides (windowSeen && !coveredByFullPlayer),
     ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .notePointerPresses()
             .mouseHistoryButtons(historyNavigator)
             .clearFocusOnEmptyClick(focusManager)
             .background(MaterialTheme.colorScheme.surfaceContainerLowest)
@@ -398,9 +509,11 @@ fun MainScreen(
             var isSidebarHovered by remember { mutableStateOf(false) }
             val hoverScope = rememberCoroutineScope()
             var exitHoverJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+            var wasHoverExpandedOnDragStart by remember { mutableStateOf(false) }
+            var isHoverSuppressedUntilExit by remember { mutableStateOf(false) }
 
-            val isHoverExpanded = libraryViewModel.isSidebarCollapsed && isHoverExpandEnabled &&
-                    (isSidebarHovered || libraryViewModel.isSidebarPopupOpen) && !draggingSidebar
+            val isHoverExpanded = libraryViewModel.isSidebarCollapsed && isHoverExpandEnabled && !isHoverSuppressedUntilExit &&
+                    (isSidebarHovered || libraryViewModel.isSidebarPopupOpen || (draggingSidebar && wasHoverExpandedOnDragStart))
 
             // Keep hover active while a popup/dropdown is open, and grant a 600ms grace period on close
             // so that if the cursor is still resting on the sidebar, it stays open.
@@ -451,12 +564,13 @@ fun MainScreen(
                                     androidx.compose.ui.input.pointer.PointerEventType.Move -> {
                                         exitHoverJob?.cancel()
                                         exitHoverJob = null
-                                        if (!isSidebarHovered) {
+                                        if (!isHoverSuppressedUntilExit && !isSidebarHovered) {
                                             isSidebarHovered = true
                                         }
                                     }
                                     androidx.compose.ui.input.pointer.PointerEventType.Exit -> {
-                                        if (!libraryViewModel.isSidebarPopupOpen) {
+                                        isHoverSuppressedUntilExit = false
+                                        if (!libraryViewModel.isSidebarPopupOpen && !draggingSidebar) {
                                             exitHoverJob?.cancel()
                                             exitHoverJob = hoverScope.launch {
                                                 kotlinx.coroutines.delay(400L)
@@ -483,10 +597,24 @@ fun MainScreen(
                     libraryViewModel = libraryViewModel,
                     playerViewModel = playerViewModel,
                     homeViewModel = homeViewModel,
+                    onToggleCollapse = {
+                        val isVisuallyCollapsed = animatedSidebarWidth < ((libraryViewModel.sidebarWidth + com.alananasss.kittytune.ui.library.SIDEBAR_COLLAPSED_WIDTH) / 2).dp
+                        if (isVisuallyCollapsed) {
+                            isHoverSuppressedUntilExit = false
+                            libraryViewModel.expandSidebar()
+                        } else {
+                            isHoverSuppressedUntilExit = true
+                            exitHoverJob?.cancel()
+                            exitHoverJob = null
+                            isSidebarHovered = false
+                            libraryViewModel.collapseSidebar()
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxHeight()
                         .width(sidebarWidth)
                 )
+                com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: sidebar composed")
             }
 
             // Resize handle: drag to resize the library, drag far left to snap it
@@ -502,15 +630,30 @@ fun MainScreen(
                     .draggable(
                         orientation = androidx.compose.foundation.gestures.Orientation.Horizontal,
                         state = androidx.compose.foundation.gestures.rememberDraggableState { deltaPx ->
-                            libraryViewModel.sidebarDragBy(with(density) { deltaPx.toDp().value })
+                            libraryViewModel.sidebarDragBy(
+                                deltaDp = with(density) { deltaPx.toDp().value },
+                                isHoverExpanded = wasHoverExpandedOnDragStart
+                            )
                         },
                         onDragStarted = {
+                            wasHoverExpandedOnDragStart = isHoverExpanded
                             draggingSidebar = true
-                            libraryViewModel.sidebarDragStart()
+                            exitHoverJob?.cancel()
+                            exitHoverJob = null
+                            libraryViewModel.sidebarDragStart(isHoverExpanded = isHoverExpanded)
                         },
                         onDragStopped = {
+                            val wasHover = wasHoverExpandedOnDragStart
                             draggingSidebar = false
-                            libraryViewModel.sidebarDragEnd()
+                            wasHoverExpandedOnDragStart = false
+                            libraryViewModel.sidebarDragEnd(keepCollapsed = wasHover)
+                            if (wasHover && !libraryViewModel.isSidebarPopupOpen) {
+                                exitHoverJob?.cancel()
+                                exitHoverJob = hoverScope.launch {
+                                    kotlinx.coroutines.delay(400L)
+                                    isSidebarHovered = false
+                                }
+                            }
                         }
                     ),
                 contentAlignment = Alignment.Center
@@ -611,6 +754,7 @@ fun MainScreen(
                                 playerViewModel = playerViewModel,
                                 navController = navController,
                             )
+                            com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: home composed")
                         }
                         composable("genres") {
                             com.alananasss.kittytune.ui.home.GenresScreen(
@@ -661,6 +805,7 @@ fun MainScreen(
                                             id == "history" -> navController.navigate("history")
                                             id == "recognition_history" -> navController.navigate("recognition_history")
                                             id == "listening_stats" -> navController.navigate("listening_stats")
+                                            id == "music_passport" -> navController.navigate("music_passport")
                                             id == "settings" -> navController.navigate("settings")
                                             id.startsWith("profile:") -> {
                                                 val target = id.removePrefix("profile:")
@@ -727,6 +872,43 @@ fun MainScreen(
                                         playerViewModel.resolveAndNavigateToArtist(artist.name, artist.artistId)
                                     }
                                 },
+                                onOpenRecap = { id -> navController.navigate("recap/$id") },
+                                onOpenRecaps = { navController.navigate("recaps") },
+                                onOpenPassport = { navController.navigate("music_passport") },
+                            )
+                        }
+                        composable("music_passport") {
+                            com.alananasss.kittytune.ui.profile.passport.MusicPassportScreen(
+                                onBackClick = { navController.popBackStack() },
+                                currentUser = playerViewModel.currentUser,
+                            )
+                        }
+                        composable("recaps") {
+                            com.alananasss.kittytune.ui.profile.recap.RecapsScreen(
+                                onBackClick = { navController.popBackStack() },
+                                onOpenRecap = { id -> navController.navigate("recap/$id") },
+                            )
+                        }
+                        composable(
+                            route = "recap/{id}",
+                            arguments = listOf(androidx.navigation.navArgument("id") { type = androidx.navigation.NavType.StringType }),
+                        ) { backStackEntry ->
+                            val recapId = backStackEntry.arguments?.let { args ->
+                                runCatching { args.read { getString("id") } }.getOrNull()
+                            }.orEmpty()
+                            com.alananasss.kittytune.ui.profile.recap.RecapStoryScreen(
+                                recapId = recapId,
+                                onClose = { navController.popBackStack() },
+                                onTrackClick = { track -> playerViewModel.navigateToTrackDetails(track.trackId) },
+                                onArtistClick = { artist ->
+                                    navController.popBackStack()
+                                    val permalink = artist.permalink
+                                    if (artist.source == "spotify" && !permalink.isNullOrBlank()) {
+                                        playerViewModel.navigateToSpotifyArtist(permalink.removePrefix("spotify:artist:"))
+                                    } else {
+                                        playerViewModel.resolveAndNavigateToArtist(artist.name, artist.artistId)
+                                    }
+                                },
                             )
                         }
                         composable("sync_settings") {
@@ -763,6 +945,12 @@ fun MainScreen(
                         composable("ytmusic_account") {
                             com.alananasss.kittytune.ui.profile.integrations.YoutubeMusicScreen(
                                 onBackClick = { navController.popBackStack() }
+                            )
+                        }
+                        composable("equalizer") {
+                            com.alananasss.kittytune.ui.player.EqualizerScreen(
+                                viewModel = playerViewModel,
+                                onBack = null
                             )
                         }
                         // Settings sub-pages are now handled within SettingsScreen's Split Pane layout
@@ -808,6 +996,7 @@ fun MainScreen(
                                         id == "history" -> navController.navigate("history")
                                         id == "recognition_history" -> navController.navigate("recognition_history")
                                         id == "listening_stats" -> navController.navigate("listening_stats")
+                                        id == "music_passport" -> navController.navigate("music_passport")
                                         id == "settings" -> navController.navigate("settings")
                                         id.startsWith("profile:") -> {
                                             val target = id.removePrefix("profile:")
@@ -982,6 +1171,22 @@ fun MainScreen(
                                 playerViewModel = playerViewModel
                             )
                         }
+                        composable("together_home") {
+                            com.alananasss.kittytune.ui.together.TogetherHomeScreen(
+                                onBack = { navController.popBackStack() },
+                                onOpen = { code -> navController.navigate("together/$code") }
+                            )
+                        }
+                        composable("together/{code}") { backStackEntry ->
+                            val code = backStackEntry.arguments?.let { args ->
+                                runCatching { args.read { getString("code") } }.getOrNull()
+                            } ?: ""
+                            com.alananasss.kittytune.ui.together.TogetherScreen(
+                                code = code,
+                                playerViewModel = playerViewModel,
+                                onBack = { navController.popBackStack() }
+                            )
+                        }
                         composable("history") {
                             val historyViewModel: com.alananasss.kittytune.ui.history.HistoryViewModel = androidx.lifecycle.viewmodel.compose.viewModel {
                                 com.alananasss.kittytune.ui.history.HistoryViewModel(com.alananasss.kittytune.core.AppInstance.application)
@@ -1002,7 +1207,8 @@ fun MainScreen(
                                 onAuthRequested = { provider ->
                                     navController.navigate("music_import_auth/$provider")
                                 },
-                                onLoginClick = { navController.navigate("login") }
+                                onLoginClick = { navController.navigate("login") },
+                                onOpenPlaylist = { id -> playerViewModel.navigateToPlaylistId = id.toString() },
                             )
                         }
                         composable("music_import_auth/{provider}") { backStackEntry ->
@@ -1110,7 +1316,7 @@ fun MainScreen(
             // rather than reveal it, and the same stiffness on both sides means the two panels feel like
             // one interface.
             androidx.compose.animation.AnimatedVisibility(
-                visible = showNowPlayingPanel && playerViewModel.currentTrack != null,
+                visible = showNowPlayingPanel && (playerViewModel.uiCurrentTrack != null || nowPlayingTab == NowPlayingTab.DEVICES),
                 enter = androidx.compose.animation.fadeIn(
                     androidx.compose.animation.core.spring(stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow)
                 ) + androidx.compose.animation.expandHorizontally(
@@ -1189,14 +1395,19 @@ fun MainScreen(
                         playerPrefs.setRightPanelOpen(false)
                     },
                     onOpenFullLyrics = { playerViewModel.showLyricsSheet = !playerViewModel.showLyricsSheet },
-                    modifier = Modifier.width(rightPanelWidth)
+                    modifier = Modifier
+                        .width(rightPanelWidth)
+                        .onPointerEvent(androidx.compose.ui.input.pointer.PointerEventType.Enter) { PanelHistory.pointerInside = true }
+                        .onPointerEvent(androidx.compose.ui.input.pointer.PointerEventType.Exit) { PanelHistory.pointerInside = false }
                 )
+                com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: right panel composed")
             }
             }
         }
 
         // Docked styles sit below the panels; the floating one is drawn over them, further down.
         if (!isBarFloating) playerBar(playerBarModifier)
+        com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: player bar composed")
     }
 
     if (isBarFloating) {
@@ -1208,9 +1419,34 @@ fun MainScreen(
     }
     }
 
+    // The Kitty pet, when it is set to live inside the app's own window: drawn over the panels but
+    // held by the window's edges, never floating over another app the way its desktop window does.
+    // It is drawn here, above the app and under every menu, the full player and the dialogs.
+    com.alananasss.kittytune.ui.pet.PetInAppOverlay(
+        onOpenSettings = { playerViewModel.navigateToPlaylistId = "pet_settings" },
+        onPlayPause = { playerViewModel.togglePlayPause() },
+    )
+
     TrackOptionsOverlays(playerViewModel)
+    com.alananasss.kittytune.ui.library.LikeAllPromptHost()
 
     CoverViewerOverlay()
+    com.alananasss.kittytune.ui.profile.passport.PassportViewerOverlay()
+
+    // Notices about protected tracks, floating above the player bar.
+    Box(
+        modifier = Modifier.fillMaxSize().padding(start = 16.dp, end = 16.dp, bottom = 112.dp),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            com.alananasss.kittytune.ui.common.ToastNoticeHost()
+            com.alananasss.kittytune.ui.profile.ProtectedTracksNoticeHost()
+            if (com.alananasss.kittytune.ProtectedTracksDemo.enabled) {
+                com.alananasss.kittytune.ProtectedTracksDemo.Controls()
+            }
+        }
+    }
+    com.alananasss.kittytune.utils.StartupTimeline.markOnce("main screen: overlays composed")
 
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -1219,7 +1455,7 @@ fun MainScreen(
         com.alananasss.kittytune.ui.player.automix.AutomixDebugOverlay(
             // A lambda, not the value: reading the position here recomposed this whole screen
             // several times a second for the sake of a debug overlay that is usually hidden.
-            currentPositionMs = { playerViewModel.currentPosition },
+            currentPositionMs = { playerViewModel.uiCurrentPosition },
             modifier = Modifier.padding(bottom = 100.dp, end = 20.dp)
         )
     }
@@ -1245,6 +1481,9 @@ fun MainScreen(
             androidx.compose.animation.core.tween(FULLSCREEN_EXIT_MS)
         ),
     ) {
+        // Out here it is not under the root that notes where the pointer pressed, so the track menu opened at the
+        // last press made somewhere else: to the left of its three dots, as if the player were not full screen.
+        Box(Modifier.fillMaxSize().notePointerPresses()) {
         com.alananasss.kittytune.ui.player.FullPlayerScreen(
             viewModel = playerViewModel,
             onExitFullScreen = {
@@ -1256,6 +1495,16 @@ fun MainScreen(
                 // and the effect that applies it is idempotent.
                 com.alananasss.kittytune.core.AppWindowState.fullScreen = false
             },
+        )
+        }
+    }
+
+    AiDetectionOverlays(playerViewModel, navController)
+
+    if (playerViewModel.showQueueHistoryDialog) {
+        com.alananasss.kittytune.ui.player.QueueHistoryDialog(
+            viewModel = playerViewModel,
+            onDismiss = { playerViewModel.showQueueHistoryDialog = false }
         )
     }
 
@@ -1282,6 +1531,7 @@ fun MainScreen(
             onDismiss = { com.alananasss.kittytune.data.UpdateManager.hideDialog() }
         )
     }
+
 }
 
 /**
@@ -1295,6 +1545,7 @@ enum class NowPlayingTab(val prefKey: String) {
     QUEUE(com.alananasss.kittytune.data.local.PlayerPreferences.PANEL_TAB_QUEUE),
     LYRICS(com.alananasss.kittytune.data.local.PlayerPreferences.PANEL_TAB_LYRICS),
     EFFECTS(com.alananasss.kittytune.data.local.PlayerPreferences.PANEL_TAB_EFFECTS),
+    DEVICES(com.alananasss.kittytune.data.local.PlayerPreferences.PANEL_TAB_DEVICES),
 }
 
 @Composable
@@ -1306,6 +1557,17 @@ fun PlaceholderScreen(name: String) {
             modifier = Modifier.padding(24.dp)
         )
     }
+}
+
+/**
+ * Translates a destination the home view model asked for into the player's route
+ * protocol. Provider urns (`deezer:album:123`, `qobuz:playlist:7`) travel as they
+ * are; a route that already names a screen keeps only its id.
+ */
+private fun desktopHomeDestination(route: String): String = when {
+    route.startsWith("playlist_detail/") -> route.removePrefix("playlist_detail/")
+    route.startsWith("profile/") -> "profile:${route.removePrefix("profile/")}"
+    else -> route
 }
 
 private fun isSameRoute(navController: androidx.navigation.NavController, targetRoute: String): Boolean {

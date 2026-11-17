@@ -22,9 +22,34 @@ object SyncLog {
     private val file: File by lazy { File(AppDirs.dataDir, "sync_log.jsonl") }
     private val prefs by lazy { NamedPrefs("sync_state") }
 
-    /** In memory as well as on disk: the whole log is read for every merge, and it is small. */
-    private val events = mutableListOf<SyncEvent>()
+    /**
+     * What RAM keeps of the log: the highest sequence number each device has reached, and how many
+     * events the file holds. Not the events themselves.
+     *
+     * The whole log used to sit in a list as well as on disk, on the argument that it was small.
+     * It stopped being small when likes joined it: a first seeding pass turns a library of several
+     * thousand tracks into as many events, each carrying the whole track as JSON, and a year of
+     * listens adds tens of thousands more — all resident, forever, in strings nothing but the
+     * merges ever looked at. The file is the record; the index is all the appends need (see
+     * [append]), and readers stream the file and drop the parse the moment they are done. The
+     * transient list a read builds is bounded by what the caller keeps, not by the log's age.
+     */
+    private val maxSeqByDevice = HashMap<String, Long>()
+    private var eventCount = 0L
     private var loaded = false
+
+    /**
+     * The parsed events, cached in RAM so [all] doesn't re-parse the file on every call.
+     *
+     * `all()` used to re-read and re-parse the entire JSONL file on every call — called up to 1,000
+     * times per sync cycle (once per drain round), plus on every SyncLikes/SyncApply/SyncService path.
+     * After months of use the file is megabytes; each sync round re-parsed it. The cache is built
+     * once in [ensureLoaded] and extended in [write]. [all] returns a copy (audit Phase 5 IO gain).
+     */
+    private val eventCache = ArrayList<SyncEvent>()
+
+    /** When the log crosses this many events, it is rotated to keep only the latest per device. */
+    private const val ROTATION_THRESHOLD = 50_000L
 
     /**
      * This install's identity, generated once.
@@ -53,27 +78,48 @@ object SyncLog {
         loaded = true
         if (!file.isFile) return
         file.forEachLine { line ->
-            if (line.isBlank()) return@forEachLine
-            val event = runCatching { gson.fromJson(line, SyncEvent::class.java) }.getOrNull()
-            if (event != null && event.isWellFormed) events.add(event)
+            val event = parse(line) ?: return@forEachLine
+            eventCount++
+            index(event)
+            eventCache.add(event)
         }
     }
 
-    /** Everything the log holds, ours and every peer's. A copy: callers iterate while we append. */
+    /** Records a parsed line in the RAM index: highest seq per device, and the running count. */
+    private fun index(event: SyncEvent) {
+        val known = maxSeqByDevice[event.deviceId]
+        if (known == null || event.seq > known) maxSeqByDevice[event.deviceId] = event.seq
+    }
+
+    private fun parse(line: String): SyncEvent? {
+        if (line.isBlank()) return null
+        val event = runCatching { gson.fromJson(line, SyncEvent::class.java) }.getOrNull() ?: return null
+        return event.takeIf { it.isWellFormed }
+    }
+
+    /**
+     * Everything the log holds, ours and every peer's. Returns the in-memory cache (a copy) instead
+     * of re-parsing the file on every call — the cache is built once in [ensureLoaded] and extended
+     * in [write] (audit Phase 5 IO gain).
+     */
     @Synchronized
     fun all(): List<SyncEvent> {
         ensureLoaded()
-        return events.toList()
+        return ArrayList(eventCache)
     }
 
     @Synchronized
     fun size(): Int {
         ensureLoaded()
-        return events.size
+        return eventCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
     /**
      * Records something that happened here.
+     *
+     * The sequence number comes from the RAM index, which is built from the file itself — so a log
+     * restored from a backup still cannot hand out a number that is already in use, exactly as when
+     * the whole log was resident.
      *
      * @return the event as written, with the sequence number it was given.
      */
@@ -82,7 +128,7 @@ object SyncLog {
         ensureLoaded()
         val event = SyncEvent(
             deviceId = deviceId,
-            seq = SyncMerge.nextSeq(events, deviceId),
+            seq = (maxSeqByDevice[deviceId] ?: 0L) + 1,
             timestampMs = timestampMs,
             kind = kind,
             payload = gson.toJson(payload),
@@ -97,7 +143,7 @@ object SyncLog {
     fun appendBatch(items: List<BatchItem>): List<SyncEvent> {
         if (items.isEmpty()) return emptyList()
         ensureLoaded()
-        var currentSeq = SyncMerge.nextSeq(events, deviceId)
+        var currentSeq = (maxSeqByDevice[deviceId] ?: 0L) + 1
         val created = ArrayList<SyncEvent>(items.size)
         for (item in items) {
             created.add(
@@ -131,11 +177,42 @@ object SyncLog {
     }
 
     private fun write(batch: List<SyncEvent>) {
-        events.addAll(batch)
-        runCatching {
+        // The index only advances on a write that landed. On failure the same seq is handed out
+        // again for the retry, rather than leaving a gap: a peer's mark can only cross a gap by
+        // re-receiving everything after it, for ever (see [SyncMerge.advance]).
+        val written = runCatching {
             file.parentFile?.mkdirs()
             // One open, one append, one line each: a crash mid-batch leaves whole lines behind it.
             file.appendText(batch.joinToString("") { gson.toJson(it) + "\n" })
+        }.isSuccess
+        if (written) {
+            for (event in batch) {
+                eventCount++
+                index(event)
+                eventCache.add(event)
+            }
+            // Rotate when the log crosses the threshold: rewrite the file keeping only the latest
+            // ROTATION_THRESHOLD events, and trim the cache to match. Without this the file grew
+            // forever — a year of listening produced an 18 MB file that every sync round re-parsed.
+            if (eventCount > ROTATION_THRESHOLD) {
+                rotate()
+            }
+        }
+    }
+
+    /** Rewrites the log file keeping only the latest [ROTATION_THRESHOLD] events, and trims the cache. */
+    private fun rotate() {
+        val keep = eventCache.takeLast(ROTATION_THRESHOLD.toInt())
+        val rewritten = runCatching {
+            file.writeText(keep.joinToString("") { gson.toJson(it) + "\n" })
+        }.isSuccess
+        if (rewritten) {
+            eventCache.clear()
+            eventCache.addAll(keep)
+            eventCount = keep.size.toLong()
+            // Rebuild the index from what survived.
+            maxSeqByDevice.clear()
+            keep.forEach { index(it) }
         }
     }
 
@@ -196,7 +273,9 @@ object SyncLog {
      */
     @Synchronized
     fun clear() {
-        events.clear()
+        maxSeqByDevice.clear()
+        eventCount = 0L
+        eventCache.clear()
         loaded = true
         prefs.remove(KEY_MARKS)
         prefs.all().keys

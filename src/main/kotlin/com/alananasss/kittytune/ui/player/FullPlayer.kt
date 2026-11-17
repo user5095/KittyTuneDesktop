@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
@@ -11,18 +12,22 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -45,24 +50,29 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.HeartBroken
 import androidx.compose.material.icons.rounded.CloseFullscreen
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.ThumbDown
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Lyrics
+import com.alananasss.kittytune.ui.player.slider.mixGlow
 import com.alananasss.kittytune.ui.player.lyrics.SearchLyricsDialog
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Pause
+import com.alananasss.kittytune.ui.main.PlaybackSeekBar
+import com.alananasss.kittytune.ui.main.rememberShowRemainingTime
+import com.alananasss.kittytune.ui.main.volumeWheel
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.ui.draw.blur
 import com.alananasss.kittytune.data.local.FullPlayerBgStyle
 import androidx.compose.runtime.Composable
@@ -74,9 +84,14 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
@@ -84,9 +99,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextAlign
@@ -98,8 +110,10 @@ import com.alananasss.kittytune.ui.player.cover.AnimatedArtwork
 import com.alananasss.kittytune.ui.player.cover.CanvasVideo
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.data.local.FullPlayerLayout
+import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.ui.main.PanelLyrics
 import com.alananasss.kittytune.ui.utils.fadingEdge
+import com.alananasss.kittytune.utils.makeTimeString
 
 /**
  * The player at the size of the window, built from the reference he sent (issue #33).
@@ -136,9 +150,12 @@ import com.alananasss.kittytune.ui.utils.fadingEdge
  */
 @Composable
 fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
-    val track = viewModel.currentTrack
+    com.alananasss.kittytune.ui.debug.TraceRecompositions("FullPlayer")
+    val track = viewModel.uiCurrentTrack
     var showText by remember { mutableStateOf(true) }
     var showQuickSettings by remember { mutableStateOf(false) }
+    var lastActivityMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var screensaverActive by remember { mutableStateOf(false) }
 
     val toggleLyricsAction: () -> Unit = { showText = !showText }
 
@@ -156,14 +173,12 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
         com.alananasss.kittytune.ui.player.lyrics.QuickLyricsSettingsDialog(
             viewModel = viewModel,
             isFullScreen = true,
+            // The focus mode lives with the other settings, not as a button of its own in the corner.
+            onFocusMode = {
+                lastActivityMs = System.currentTimeMillis()
+                screensaverActive = true
+            },
             onDismiss = { showQuickSettings = false },
-        )
-    }
-
-    if (viewModel.isSearchingLyrics) {
-        SearchLyricsDialog(
-            viewModel = viewModel,
-            onDismiss = { viewModel.isSearchingLyrics = false },
         )
     }
 
@@ -191,12 +206,10 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
     val drift = rememberMeshDrift()
 
     // — Screensaver / Focus mode (Point 22) —
-    // Auto standby after inactivity in fullscreen displaying large clock, cover, 1 line of lyrics, and session stats.
+    // Auto standby after inactivity in fullscreen displaying large clock, cover, track info, and session stats.
     val layout = viewModel.fullPlayerLayout
     val screensaverEnabled = viewModel.fullPlayerScreensaverEnabled
     val screensaverTimeoutMs = (viewModel.fullPlayerScreensaverTimeoutSeconds * 1000L).coerceAtLeast(10_000L)
-    var lastActivityMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    var screensaverActive by remember { mutableStateOf(false) }
 
     LaunchedEffect(screensaverEnabled, screensaverTimeoutMs) {
         if (!screensaverEnabled) {
@@ -220,7 +233,10 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
     // weight itself is what makes the two halves trade width instead (issue #33).
     val lyricsShare by animateFloatAsState(
         targetValue = if (showText) LYRICS_SHARE else 0f,
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        animationSpec = spring(
+            dampingRatio = 0.88f,
+            stiffness = 280f,
+        ),
         label = "lyricsShare",
     )
 
@@ -245,7 +261,7 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
             palette = palette,
             drift = { drift.value },
             artworkUrl = track.fullResArtwork,
-            animatedVideoUrl = viewModel.currentAnimatedCoverTallUrl ?: viewModel.currentAnimatedCoverUrl,
+            animatedVideoUrl = viewModel.currentAnimatedCoverTallUrl ?: viewModel.uiCurrentAnimatedCoverUrl,
             fadeUiEnabled = viewModel.playerPrefs.getAnimatedCoversFadeUiEnabled()
         )
 
@@ -261,7 +277,31 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
             AnimatedContent(
                 targetState = showPortraitLyrics,
                 transitionSpec = {
-                    fadeIn(animationSpec = tween(220)).togetherWith(fadeOut(animationSpec = tween(220)))
+                    if (targetState) {
+                        (fadeIn(tween(380, easing = FastOutSlowInEasing)) + slideInVertically(
+                            animationSpec = tween(380, easing = FastOutSlowInEasing)
+                        ) { it / 14 } + scaleIn(
+                            initialScale = 0.95f,
+                            animationSpec = tween(380, easing = FastOutSlowInEasing)
+                        )).togetherWith(
+                            fadeOut(tween(240, easing = FastOutSlowInEasing)) + scaleOut(
+                                targetScale = 0.95f,
+                                animationSpec = tween(240, easing = FastOutSlowInEasing)
+                            )
+                        )
+                    } else {
+                        (fadeIn(tween(380, easing = FastOutSlowInEasing)) + scaleIn(
+                            initialScale = 0.95f,
+                            animationSpec = tween(380, easing = FastOutSlowInEasing)
+                        )).togetherWith(
+                            fadeOut(tween(240, easing = FastOutSlowInEasing)) + slideOutVertically(
+                                animationSpec = tween(240, easing = FastOutSlowInEasing)
+                            ) { it / 14 } + scaleOut(
+                                targetScale = 0.95f,
+                                animationSpec = tween(240, easing = FastOutSlowInEasing)
+                            )
+                        )
+                    }
                 },
                 label = "portraitCoverLyricsCrossfade",
                 modifier = Modifier.fillMaxSize()
@@ -342,6 +382,8 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
             modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // Lit only while what they open is open, and never left lit by keyboard focus after a click: the
+            // one pressed last used to stay highlighted until the player was closed (issue #66).
             QuietButton(
                 icon = Icons.Rounded.Search,
                 label = str("lyrics_manual_search"),
@@ -351,17 +393,8 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
             QuietButton(
                 icon = Icons.Rounded.Tune,
                 label = str("pref_lyrics_title"),
-                tint = if (viewModel.lyricsOffset != 0L) palette.bright else palette.dim,
+                tint = if (showQuickSettings) palette.bright else palette.dim,
                 onClick = { showQuickSettings = true },
-            )
-            QuietButton(
-                icon = Icons.Rounded.DarkMode,
-                label = str("screensaver_focus_mode"),
-                tint = palette.dim,
-                onClick = {
-                    lastActivityMs = System.currentTimeMillis()
-                    screensaverActive = true
-                },
             )
             QuietButton(
                 icon = Icons.Rounded.CloseFullscreen,
@@ -378,14 +411,19 @@ fun FullPlayerScreen(viewModel: PlayerViewModel, onExitFullScreen: () -> Unit) {
             exit = fadeOut(tween(220, easing = FastOutLinearInEasing)),
             modifier = Modifier.fillMaxSize(),
         ) {
-            ScreensaverOverlay(
+            SleepScreen(
                 viewModel = viewModel,
-                palette = palette,
+                accent = palette.bright,
                 onWake = {
                     lastActivityMs = System.currentTimeMillis()
                     screensaverActive = false
                 },
             )
+        }
+
+        // Inside this window, not in a window of its own: that one opened behind the full-screen player.
+        if (viewModel.isSearchingLyrics) {
+            SearchLyricsDialog(viewModel = viewModel, onDismiss = { viewModel.isSearchingLyrics = false })
         }
     }
 }
@@ -441,7 +479,11 @@ private fun CoverBesideLyrics(
         // Kept out of the row entirely once it has no width, since `weight` refuses zero.
         val words: @Composable RowScope.() -> Unit = {
             if (lyricsShare > 0.001f) {
-                val alpha = if (showText) progress else (progress * 1.4f - 0.4f).coerceIn(0f, 1f)
+                val alpha = if (showText) {
+                    FastOutSlowInEasing.transform(progress)
+                } else {
+                    FastOutSlowInEasing.transform((progress * 1.25f - 0.25f).coerceIn(0f, 1f))
+                }
                 val slide = if (lyricsFirst) -1f else 1f
                 Box(
                     Modifier
@@ -450,7 +492,10 @@ private fun CoverBesideLyrics(
                         .clipToBounds()
                         .graphicsLayer {
                             this.alpha = alpha
-                            this.translationX = slide * (1f - progress) * 40.dp.toPx()
+                            this.translationX = slide * (1f - progress) * 48.dp.toPx()
+                            val s = 0.95f + 0.05f * progress
+                            this.scaleX = s
+                            this.scaleY = s
                         },
                     contentAlignment = if (lyricsFirst) Alignment.CenterEnd else Alignment.CenterStart,
                 ) {
@@ -491,10 +536,36 @@ private fun CentredLyricsLayout(
     showText: Boolean,
     onToggleText: () -> Unit,
 ) {
-    val track = viewModel.currentTrack ?: return
+    val track = viewModel.uiCurrentTrack ?: return
     AnimatedContent(
         targetState = showText && viewModel.hasLyrics,
-        transitionSpec = { fadeIn(tween(260)).togetherWith(fadeOut(tween(200))) },
+        transitionSpec = {
+            if (targetState) {
+                (fadeIn(tween(380, easing = FastOutSlowInEasing)) + slideInVertically(
+                    animationSpec = tween(380, easing = FastOutSlowInEasing)
+                ) { it / 14 } + scaleIn(
+                    initialScale = 0.95f,
+                    animationSpec = tween(380, easing = FastOutSlowInEasing)
+                )).togetherWith(
+                    fadeOut(tween(240, easing = FastOutSlowInEasing)) + scaleOut(
+                        targetScale = 0.95f,
+                        animationSpec = tween(240, easing = FastOutSlowInEasing)
+                    )
+                )
+            } else {
+                (fadeIn(tween(380, easing = FastOutSlowInEasing)) + scaleIn(
+                    initialScale = 0.95f,
+                    animationSpec = tween(380, easing = FastOutSlowInEasing)
+                )).togetherWith(
+                    fadeOut(tween(240, easing = FastOutSlowInEasing)) + slideOutVertically(
+                        animationSpec = tween(240, easing = FastOutSlowInEasing)
+                    ) { it / 14 } + scaleOut(
+                        targetScale = 0.95f,
+                        animationSpec = tween(240, easing = FastOutSlowInEasing)
+                    )
+                )
+            }
+        },
         label = "centredLyrics",
         modifier = Modifier.fillMaxSize(),
     ) { showsWords ->
@@ -518,28 +589,13 @@ private fun CentredLyricsLayout(
                 LyricsOnCoverColour(viewModel, palette)
             }
             Spacer(Modifier.height(12.dp))
-            Row(
-                Modifier.widthIn(max = CENTRED_LYRICS_MAX_WIDTH).fillMaxWidth().padding(horizontal = 24.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
+            // Only the transport, centred under the words. Split three ways beside a thumbnail and the credit it
+            // was squeezed into a third of the row (issue #66); the words are the subject here, and the song is
+            // one tap on the lyrics button away, which brings the cover and the credit back.
+            Box(
+                Modifier.widthIn(max = CENTRED_CONTROLS_MAX_WIDTH).fillMaxWidth().padding(horizontal = 24.dp),
             ) {
-                Box(Modifier.size(72.dp)) {
-                    AnimatedArtwork(
-                        artworkUrl = track.fullResArtwork,
-                        animatedCoverUrl = viewModel.currentAnimatedCoverUrl,
-                        isPlaying = viewModel.isPlaying,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .shadow(12.dp, RoundedCornerShape(10.dp), clip = false)
-                            .clip(RoundedCornerShape(10.dp)),
-                    )
-                }
-                Box(Modifier.weight(1f)) { TrackCredit(viewModel = viewModel, palette = palette) }
-                Box(Modifier.weight(1.3f)) {
-                    FullPlayerControls(viewModel = viewModel, palette = palette, showText = showText, onToggleText = onToggleText)
-                }
+                FullPlayerControls(viewModel = viewModel, palette = palette, showText = showText, onToggleText = onToggleText)
             }
         }
     }
@@ -547,6 +603,9 @@ private fun CentredLyricsLayout(
 
 /** Wide enough for a long line at a large size, narrow enough that the eye does not travel across a 4K screen. */
 private val CENTRED_LYRICS_MAX_WIDTH = 1100.dp
+
+/** The transport under centred lyrics: as wide as it is under a cover. */
+private val CENTRED_CONTROLS_MAX_WIDTH = 520.dp
 
 /**
  * The cover alone with one line under it — the line being sung, replaced as the next one starts. The lyrics
@@ -572,355 +631,6 @@ private fun CoverAndLineLayout(
 }
 
 /**
- * Screensaver / Focus Mode overlay (Point 22).
- *
- * Appears automatically after inactivity in full screen (or on demand via the moon icon).
- * Shows a large clock with date, the album art, the current lyric line sung (or track info), and
- * the listening session stats (time listened + track plays). Any mouse movement or tap wakes it immediately.
- */
-@Composable
-private fun androidx.compose.animation.AnimatedVisibilityScope.ScreensaverOverlay(
-    viewModel: PlayerViewModel,
-    palette: FullPlayerPalette,
-    onWake: () -> Unit,
-) {
-    val track = viewModel.currentTrack ?: return
-    val focusRequester = remember { FocusRequester() }
-    val activatedAt = remember { System.currentTimeMillis() }
-    var initialPosition by remember { mutableStateOf<Offset?>(null) }
-    var hasWoken by remember { mutableStateOf(false) }
-
-    fun triggerWake() {
-        if (!hasWoken) {
-            hasWoken = true
-            onWake()
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        try {
-            focusRequester.requestFocus()
-        } catch (_: Throwable) {}
-    }
-
-    // Wake on intentional mouse movement, click/tap, or key press.
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .focusRequester(focusRequester)
-            .focusable()
-            .onPreviewKeyEvent {
-                if (System.currentTimeMillis() - activatedAt > 400L) {
-                    triggerWake()
-                    true
-                } else {
-                    false
-                }
-            }
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (!hasWoken) {
-                        val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
-                        val elapsed = System.currentTimeMillis() - activatedAt
-                        val currentPos = event.changes.firstOrNull()?.position
-
-                        // Grace period: ignore events for 600ms right after activation
-                        // (handles button release, cursor settling, and Compose enter events).
-                        if (elapsed < 600L) {
-                            if (currentPos != null) {
-                                initialPosition = currentPos
-                            }
-                            continue
-                        }
-
-                        // Wake on any mouse button click / tap
-                        val anyPressed = event.changes.any { it.pressed }
-                        if (anyPressed) {
-                            event.changes.forEach { it.consume() }
-                            triggerWake()
-                            break
-                        }
-
-                        // Wake on intentional mouse movement (> 20px)
-                        if (currentPos != null) {
-                            val startPos = initialPosition
-                            if (startPos == null) {
-                                initialPosition = currentPos
-                            } else {
-                                val dx = currentPos.x - startPos.x
-                                val dy = currentPos.y - startPos.y
-                                if (dx * dx + dy * dy > 400f) {
-                                    triggerWake()
-                                    break
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(18.dp),
-            modifier = Modifier
-                .widthIn(max = 560.dp)
-                .padding(horizontal = 32.dp, vertical = 36.dp)
-                .animateEnterExit(
-                    enter = fadeIn(tween(320, easing = LinearOutSlowInEasing)) +
-                            scaleIn(tween(320, easing = LinearOutSlowInEasing), initialScale = 0.94f),
-                    exit = fadeOut(tween(200, easing = FastOutLinearInEasing)) +
-                            scaleOut(tween(200, easing = FastOutLinearInEasing), targetScale = 0.94f),
-                ),
-        ) {
-            // ── Grande Horloge ────────────────────────────────────────────────────────
-            var now by remember { mutableStateOf(java.time.LocalDateTime.now()) }
-            LaunchedEffect(Unit) {
-                while (true) {
-                    now = java.time.LocalDateTime.now()
-                    kotlinx.coroutines.delay(1_000L)
-                }
-            }
-            val timeText = String.format("%02d:%02d", now.hour, now.minute)
-            val dateFormatter = remember {
-                java.time.format.DateTimeFormatter.ofPattern("EEEE d MMMM", java.util.Locale.getDefault())
-            }
-            val dateText = remember(now.dayOfYear) {
-                now.format(dateFormatter).replaceFirstChar { it.titlecase(java.util.Locale.getDefault()) }
-            }
-
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(bottom = 4.dp),
-            ) {
-                androidx.compose.material3.Text(
-                    text = timeText,
-                    style = MaterialTheme.typography.displayLarge.copy(
-                        fontSize = 92.sp,
-                        letterSpacing = (-2).sp,
-                    ),
-                    fontWeight = FontWeight.ExtraLight,
-                    color = Color.White,
-                    textAlign = TextAlign.Center,
-                )
-                androidx.compose.material3.Text(
-                    text = dateText,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Normal,
-                    color = Color.White.copy(alpha = 0.70f),
-                    textAlign = TextAlign.Center,
-                )
-            }
-
-            // ── Pochette ──────────────────────────────────────────────────────────────
-            Box(Modifier.size(210.dp)) {
-                AnimatedArtwork(
-                    artworkUrl = track.fullResArtwork,
-                    animatedCoverUrl = viewModel.currentAnimatedCoverUrl,
-                    isPlaying = viewModel.isPlaying,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .shadow(32.dp, RoundedCornerShape(22.dp), clip = false)
-                        .clip(RoundedCornerShape(22.dp)),
-                )
-            }
-
-            // ── 1 Ligne de Texte ──────────────────────────────────────────────────────
-            val activeLineText by remember {
-                derivedStateOf {
-                    val lines = viewModel.lyricsLines
-                    if (lines.isEmpty()) return@derivedStateOf null
-                    val activeIdx = com.alananasss.kittytune.ui.player.lyrics.LyricsUtils.activeLineIndex(
-                        lines, viewModel.currentPosition + viewModel.lyricsOffset
-                    )
-                    lines.getOrNull(activeIdx)?.text?.takeIf { it.isNotBlank() }
-                }
-            }
-
-            AnimatedContent(
-                targetState = activeLineText,
-                transitionSpec = {
-                    (fadeIn(tween(350)) + slideInVertically(tween(350)) { it / 2 })
-                        .togetherWith(fadeOut(tween(250)) + slideOutVertically(tween(250)) { -it / 2 })
-                },
-                label = "screensaverLyricLine",
-                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
-            ) { text ->
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                ) {
-                    if (text != null) {
-                        androidx.compose.material3.Text(
-                            text = text,
-                            style = MaterialTheme.typography.headlineMedium.copy(
-                                fontSize = 23.sp,
-                                lineHeight = 30.sp,
-                            ),
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White,
-                            maxLines = 2,
-                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        androidx.compose.material3.Text(
-                            text = "${track.title.orEmpty()} — ${track.displayArtist.ifBlank { track.user?.username.orEmpty() }}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.White.copy(alpha = 0.65f),
-                            maxLines = 1,
-                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
-                        )
-                    } else {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            androidx.compose.material3.Text(
-                                text = track.title.orEmpty(),
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            if (viewModel.fullPlayerSourceIndicatorEnabled) {
-                                com.alananasss.kittytune.ui.common.TrackSourceInlineDot(
-                                    track = track,
-                                    resolvedSource = viewModel.currentStreamSource,
-                                    dotColor = Color.White.copy(alpha = 0.6f),
-                                    iconTint = Color.Unspecified,
-                                    iconSize = 18.dp,
-                                    modifier = Modifier.padding(start = 6.dp)
-                                )
-                            }
-                        }
-                        Spacer(Modifier.height(2.dp))
-                        androidx.compose.material3.Text(
-                            text = track.displayArtist.ifBlank { track.user?.username.orEmpty() },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.White.copy(alpha = 0.70f),
-                            maxLines = 1,
-                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                }
-            }
-
-            // ── Statistiques d'écoute de la session ────────────────────────────────────
-            val sessionMs = viewModel.sessionTotalListenMs
-            val sessionDuration = formatSessionDuration(sessionMs)
-            val sessionPlays = viewModel.effectiveSessionPlays
-
-            androidx.compose.material3.Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = Color.White.copy(alpha = 0.08f),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.12f)),
-                modifier = Modifier.padding(top = 2.dp),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(28.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // Temps d'écoute
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        com.alananasss.kittytune.ui.icons.Icon(
-                            imageVector = Icons.Rounded.Schedule,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Column(horizontalAlignment = Alignment.Start) {
-                            androidx.compose.material3.Text(
-                                text = sessionDuration,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                            )
-                            androidx.compose.material3.Text(
-                                text = str("listening_stats_time_listened"),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.White.copy(alpha = 0.65f),
-                            )
-                        }
-                    }
-
-                    // Séparateur vertical
-                    Box(
-                        modifier = Modifier
-                            .width(1.dp)
-                            .height(28.dp)
-                            .background(Color.White.copy(alpha = 0.16f))
-                    )
-
-                    // Nombre de titres écoutés
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        com.alananasss.kittytune.ui.icons.Icon(
-                            imageVector = Icons.Rounded.MusicNote,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Column(horizontalAlignment = Alignment.Start) {
-                            androidx.compose.material3.Text(
-                                text = "$sessionPlays",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                            )
-                            androidx.compose.material3.Text(
-                                text = str("listening_stats_unique_tracks"),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.White.copy(alpha = 0.65f),
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Indication pour quitter la veille
-            androidx.compose.material3.Text(
-                text = str("screensaver_tap_to_wake"),
-                style = MaterialTheme.typography.labelSmall,
-                color = Color.White.copy(alpha = 0.40f),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(top = 4.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun formatSessionDuration(ms: Long): String {
-    val totalSeconds = (ms / 1000).coerceAtLeast(0L)
-    val hours = totalSeconds / 3600
-    val minutes = (totalSeconds % 3600) / 60
-    val seconds = totalSeconds % 60
-    return when {
-        hours > 0 -> str("listening_stats_duration_hr_min", hours, minutes)
-        minutes > 0 -> str("listening_stats_duration_min", minutes)
-        else -> str("listening_stats_duration_sec", seconds)
-    }
-}
-
-/** How long the full player must be idle (no pointer events) before the screensaver activates. */
-private const val SCREENSAVER_IDLE_MS = 60_000L
-
-/**
  * The line being sung, sliding up as the next one takes its place. Two lines tall whatever it says, so the
  * credit under it does not bob as short and long lines alternate.
  */
@@ -931,7 +641,7 @@ private fun CurrentLyricLine(viewModel: PlayerViewModel, palette: FullPlayerPale
             val lines = viewModel.lyricsLines
             lines.getOrNull(
                 com.alananasss.kittytune.ui.player.lyrics.LyricsUtils.activeLineIndex(
-                    lines, viewModel.currentPosition + viewModel.lyricsOffset
+                    lines, viewModel.uiCurrentPosition + viewModel.lyricsOffset
                 )
             )?.text.orEmpty()
         }
@@ -1130,13 +840,7 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawMesh(
     // Where each light starts, how fast it goes round, and where in its circuit it begins. The rates are
     // deliberately not multiples of each other: shared or harmonic rates make four lights read as one shape
     // pulsing, which is the thing that gives a mesh away as an animation rather than as weather.
-    val lights = listOf(
-        Blob(baseX = 0.78f, baseY = 0.12f, rate = 1.00f, phase = 0.00f),
-        Blob(baseX = 0.20f, baseY = 0.74f, rate = 0.71f, phase = 0.31f),
-        Blob(baseX = 0.92f, baseY = 0.66f, rate = 1.29f, phase = 0.63f),
-        Blob(baseX = 0.10f, baseY = 0.22f, rate = 0.53f, phase = 0.86f),
-    )
-    lights.forEachIndexed { index, blob ->
+    MESH_LIGHTS.forEachIndexed { index, blob ->
         val angle = ((drift * blob.rate + blob.phase) * 2f * Math.PI).toFloat()
         // Different multipliers on the two axes, so a light travels an ellipse rather than a circle and the
         // whole field never returns to a shape you recognise from a moment ago.
@@ -1154,6 +858,14 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawMesh(
 
 /** One light in the mesh: where it lives, how fast it circles, and where in that circle it starts. */
 private data class Blob(val baseX: Float, val baseY: Float, val rate: Float, val phase: Float)
+
+/** The four lights, built once rather than once per frame: [drawMesh] runs on every frame of the player. */
+private val MESH_LIGHTS = listOf(
+    Blob(baseX = 0.78f, baseY = 0.12f, rate = 1.00f, phase = 0.00f),
+    Blob(baseX = 0.20f, baseY = 0.74f, rate = 0.71f, phase = 0.31f),
+    Blob(baseX = 0.92f, baseY = 0.66f, rate = 1.29f, phase = 0.63f),
+    Blob(baseX = 0.10f, baseY = 0.22f, rate = 0.53f, phase = 0.86f),
+)
 
 /**
  * How far a light strays from where it started, as a fraction of the screen.
@@ -1188,22 +900,24 @@ private fun rememberMeshDrift(): androidx.compose.runtime.State<Float> {
     // Returned as state and read while drawing, and paced by `delay`: it used to be read at the top of
     // the screen and advanced by awaiting every frame, so the whole full player recomposed at the display
     // rate for lights that take twenty-six seconds to go round once.
-    LaunchedEffect(isSeen) {
+    //
+    // Stepped on the shared ambient pulse rather than its own 30 fps `delay`: every independently paced loop on this
+    // screen landed between the others' frames, and together with the lyrics, the bar and the backdrop they had the
+    // full player redrawn about 190 times a second on a 240 Hz monitor. On the one pulse they share each frame.
+    val ambientClock = com.alananasss.kittytune.ui.common.LocalAmbientClock.current
+    LaunchedEffect(isSeen, ambientClock) {
         if (!isSeen) return@LaunchedEffect
-        var last = System.nanoTime()
+        var last = com.alananasss.kittytune.ui.common.withAmbientFrameNanos(ambientClock) { it }
         while (true) {
-            kotlinx.coroutines.delay(MESH_TICK_MS)
-            val now = System.nanoTime()
-            val seconds = ((now - last) / 1_000_000_000f).coerceIn(0f, 0.1f)
-            last = now
-            drift.floatValue += seconds / (MESH_CYCLE_MS / 1000f)
+            com.alananasss.kittytune.ui.common.withAmbientFrameNanos(ambientClock) { now ->
+                val seconds = ((now - last) / 1_000_000_000f).coerceIn(0f, 0.1f)
+                last = now
+                drift.floatValue += seconds / (MESH_CYCLE_MS / 1000f)
+            }
         }
     }
     return drift
 }
-
-/** At this pace nothing visibly moves between two ticks. */
-private const val MESH_TICK_MS = 33L
 
 private const val MESH_CYCLE_MS = 26_000f
 
@@ -1270,8 +984,9 @@ private fun LyricsOnCoverColour(viewModel: PlayerViewModel, palette: FullPlayerP
     // because in a panel the list is short enough not to need it.
     val fade = remember {
         Brush.verticalGradient(
+            // A short fade at the top only: the words start up there and the first lines have to be readable.
             0f to Color.Transparent,
-            0.10f to Color.Black,
+            0.035f to Color.Black,
             0.78f to Color.Black,
             1f to Color.Transparent,
         )
@@ -1340,6 +1055,22 @@ private const val SPACING_PER_SP = 0.34f
  * height, capped, so it stays about a third of the window and keeps its air instead of growing to fill
  * whatever it is put in. That cap is the difference between this and the first attempt.
  */
+/**
+ * How much of each side of the sleeve fades out, from the setting's 0..1: from a thin fringe to the outer third of the cover.
+ * The old fixed sixth was reported as hardly blurring the edges at all.
+ */
+private fun featherFraction(amount: Float): Float = 0.10f + 0.30f * amount.coerceIn(0f, 1f)
+
+/** Fades all four edges of what it is drawn over to nothing, so the image melts into whatever is behind it. */
+private fun Modifier.featheredEdges(fraction: Float): Modifier = graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+    .drawWithContent {
+        drawContent()
+        val across = Brush.horizontalGradient(0f to Color.Transparent, fraction to Color.Black, 1f - fraction to Color.Black, 1f to Color.Transparent)
+        val down = Brush.verticalGradient(0f to Color.Transparent, fraction to Color.Black, 1f - fraction to Color.Black, 1f to Color.Transparent)
+        drawRect(brush = across, blendMode = BlendMode.DstIn)
+        drawRect(brush = down, blendMode = BlendMode.DstIn)
+    }
+
 @Composable
 private fun CoverColumn(
     viewModel: PlayerViewModel,
@@ -1351,77 +1082,80 @@ private fun CoverColumn(
     /** The line being sung, between the sleeve and the credit — the single-line layout. */
     showCurrentLine: Boolean = false,
 ) {
-    val track = viewModel.currentTrack ?: return
+    val track = viewModel.uiCurrentTrack ?: return
 
     BoxWithConstraints {
         // The cap rises as the words leave, and incorporates user cover zoom factor
         val coverScale = viewModel.fullPlayerCoverScale
         val cap = (COVER_MAX + (COVER_MAX_ALONE - COVER_MAX) * roomToItself) * coverScale
-        val lineRoom = if (showCurrentLine) CURRENT_LINE_ROOM else 0.dp
+        val lineProgress by animateFloatAsState(
+            targetValue = if (showCurrentLine) 1f else 0f,
+            animationSpec = tween(380, easing = FastOutSlowInEasing),
+            label = "lineRoomProgress",
+        )
+        val lineRoom = CURRENT_LINE_ROOM * lineProgress
         val maxCoverHeight = maxOf(maxHeight - 210.dp - lineRoom, maxHeight * 0.5f)
         val side = min(min(maxWidth, maxCoverHeight), cap)
         val controlsWidth = maxOf(side, min(maxWidth, 400.dp))
 
         Column(horizontalAlignment = Alignment.Start) {
-            // One glow, three layers, in the order they have to stack: the halo behind the sleeve so
-            // only its spill shows, the sleeve itself, then the travelling band clipped to the
-            // sleeve's corners. The wrapper is exactly the cover's width so the layout below is
-            // unaffected; the halo is free to overflow it.
-            val automixDebug by viewModel.automixDebugInfo.collectAsState()
-            val mixGlow = com.alananasss.kittytune.ui.player.cover.rememberMixGlow(
-                outgoingBpm = automixDebug?.outBpm ?: 0f,
-            )
-            val glowColors = remember(palette.mesh) { palette.mesh }
-
-            Box(Modifier.width(side)) {
-                com.alananasss.kittytune.ui.player.cover.MixHalo(
-                    glow = mixGlow,
-                    colors = glowColors,
-                    modifier = Modifier
-                        // Centred on the cover, so the spill is even on every side.
-                        .align(Alignment.Center)
-                        .size(side + com.alananasss.kittytune.ui.player.cover.MIX_HALO_MARGIN * 2),
-                )
-
-                AnimatedArtwork(
-                    artworkUrl = track.fullResArtwork,
-                    animatedCoverUrl = viewModel.currentAnimatedCoverUrl,
-                    isPlaying = viewModel.isPlaying,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .width(side)
-                        .aspectRatio(1f)
-                        // A real shadow, because in the reference the sleeve sits above the wall rather than
-                        // being printed on it. It is most of what makes that screen feel like an object.
-                        .shadow(28.dp, RoundedCornerShape(14.dp), clip = false)
-                        .clip(RoundedCornerShape(14.dp))
-                        .pointerInput(Unit) {
-                            awaitPointerEventScope {
-                                while (true) {
-                                    val event = awaitPointerEvent()
-                                    val scrollDelta = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
-                                    if (scrollDelta != 0f) {
-                                        val next = (viewModel.fullPlayerCoverScale - scrollDelta * 0.04f).coerceIn(0.6f, 1.4f)
-                                        viewModel.updateFullPlayerCoverScale(next)
-                                    }
+            // The sleeve alone. During a mix it used to light up from behind and have bands of colour run up it,
+            // which read as the cover lifting and lines crossing it; the mix shows on the seek bar now, as in
+            // the window (issue #66).
+            val coverShape = RoundedCornerShape(14.dp)
+            AnimatedArtwork(
+                artworkUrl = track.fullResArtwork,
+                animatedCoverUrl = viewModel.uiCurrentAnimatedCoverUrl,
+                isPlaying = viewModel.uiIsPlaying,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .width(side)
+                    .aspectRatio(1f)
+                    // A real shadow, because in the reference the sleeve sits above the wall rather than being
+                    // printed on it. Softer than it was: at full strength it swallowed the lower corners of a
+                    // dark sleeve, which then looked unfinished (issue #66).
+                    .shadow(
+                        elevation = 22.dp,
+                        shape = coverShape,
+                        clip = false,
+                        ambientColor = Color.Black.copy(alpha = 0.25f),
+                        spotColor = Color.Black.copy(alpha = 0.45f),
+                    )
+                    .clip(coverShape)
+                    // With the words beside it the sleeve's edges melt into the screen rather than stopping at a line.
+                    .then(if (showText && viewModel.fullPlayerCoverFeather) Modifier.featheredEdges(featherFraction(viewModel.fullPlayerCoverFeatherAmount)) else Modifier)
+                    // A hairline, so the sleeve's edge and corners read even when it is as dark as the wall.
+                    .border(1.dp, Color.White.copy(alpha = 0.08f), coverShape)
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val scrollDelta = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
+                                if (scrollDelta != 0f) {
+                                    val next = (viewModel.fullPlayerCoverScale - scrollDelta * 0.04f).coerceIn(0.6f, 1.4f)
+                                    viewModel.updateFullPlayerCoverScale(next)
                                 }
                             }
-                        },
-                )
+                        }
+                    },
+            )
 
-                com.alananasss.kittytune.ui.player.cover.MixSweep(
-                    glow = mixGlow,
-                    colors = glowColors,
-                    modifier = Modifier
-                        .matchParentSize()
-                        .clip(RoundedCornerShape(14.dp)),
-                )
-            }
-
-            if (showCurrentLine) {
-                Spacer(Modifier.height(20.dp))
-                CurrentLyricLine(viewModel, palette, Modifier.width(controlsWidth))
+            AnimatedVisibility(
+                visible = showCurrentLine,
+                enter = fadeIn(tween(350, delayMillis = 40, easing = FastOutSlowInEasing)) + expandVertically(
+                    animationSpec = tween(380, easing = FastOutSlowInEasing),
+                    expandFrom = Alignment.Top,
+                ),
+                exit = fadeOut(tween(220, easing = FastOutSlowInEasing)) + shrinkVertically(
+                    animationSpec = tween(300, easing = FastOutSlowInEasing),
+                    shrinkTowards = Alignment.Top,
+                ),
+            ) {
+                Column {
+                    Spacer(Modifier.height(20.dp))
+                    CurrentLyricLine(viewModel, palette, Modifier.width(controlsWidth))
+                }
             }
             Spacer(Modifier.height(18.dp))
             Box(Modifier.width(controlsWidth)) {
@@ -1470,15 +1204,52 @@ private val COVER_MAX_ALONE = 620.dp
  */
 @Composable
 private fun TrackCredit(viewModel: PlayerViewModel, palette: FullPlayerPalette) {
-    val track = viewModel.currentTrack ?: return
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
+    val track = viewModel.uiCurrentTrack ?: return
+    val align = viewModel.fullPlayerInfoAlign
+    // Centred text lets the heart go either side; at an edge it takes the other one (issue #66).
+    val heartAtStart = when (align) {
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.START -> false
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.END -> true
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.CENTER ->
+            viewModel.fullPlayerHeartSide == com.alananasss.kittytune.data.local.FullPlayerHeartSide.START
+    }
+    val textAlign = when (align) {
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.START -> androidx.compose.ui.text.style.TextAlign.Start
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.CENTER -> androidx.compose.ui.text.style.TextAlign.Center
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.END -> androidx.compose.ui.text.style.TextAlign.End
+    }
+    val rowArrangement = when (align) {
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.START -> Arrangement.Start
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.CENTER -> Arrangement.Center
+        com.alananasss.kittytune.data.local.FullPlayerInfoAlign.END -> Arrangement.End
+    }
+
+    val buttons: @Composable () -> Unit = {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            QuietButton(
+                icon = if (viewModel.uiIsLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                label = str("player_like"),
+                tint = if (viewModel.uiIsLiked) MaterialTheme.colorScheme.primary else palette.dim,
+                size = 22.dp,
+                onClick = { viewModel.toggleLike() },
+            )
+            if (viewModel.uiIsYourMixActive) {
+                QuietButton(
+                    icon = Icons.Rounded.ThumbDown,
+                    label = str("mix_dislike"),
+                    tint = palette.dim,
+                    size = 22.dp,
+                    onClick = { viewModel.dislikeCurrentTrackInMix() },
+                )
+            }
+        }
+    }
+    val text: @Composable (Modifier) -> Unit = { modifier ->
+        Column(modifier) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
+                horizontalArrangement = rowArrangement,
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 androidx.compose.material3.Text(
                     text = track.title ?: "",
@@ -1487,18 +1258,28 @@ private fun TrackCredit(viewModel: PlayerViewModel, palette: FullPlayerPalette) 
                     color = palette.bright,
                     maxLines = 1,
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false)
+                    textAlign = textAlign,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
                 if (viewModel.fullPlayerSourceIndicatorEnabled) {
                     com.alananasss.kittytune.ui.common.TrackSourceInlineDot(
                         track = track,
-                        resolvedSource = viewModel.currentStreamSource,
+                        resolvedSource = viewModel.uiCurrentStreamSource,
                         dotColor = palette.bright.copy(alpha = 0.6f),
                         iconTint = Color.Unspecified,
                         iconSize = 14.dp,
                         modifier = Modifier.padding(start = 6.dp)
                     )
                 }
+                // ArtifactNet AI-detection badge (issue #41)
+                val aiResult by com.alananasss.kittytune.audio.ai.AiDetectionManager.result.collectAsState()
+                com.alananasss.kittytune.ui.player.ai.AiDetectionBadge(
+                    result = aiResult.takeUnless { viewModel.isRemotePlayback },
+                    textColor = palette.bright,
+                    onClick = { viewModel.showAiDetectionSheet = true },
+                    modifier = Modifier.padding(start = 6.dp),
+                )
+                CodecBadge(viewModel = viewModel, textColor = palette.bright, modifier = Modifier.padding(start = 6.dp))
             }
             androidx.compose.material3.Text(
                 // Artist and album on one line, separated by an em dash, which is how the reference reads and
@@ -1511,29 +1292,36 @@ private fun TrackCredit(viewModel: PlayerViewModel, palette: FullPlayerPalette) 
                 color = palette.dim,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-            )
-        }
-
-        Spacer(Modifier.width(8.dp))
-        QuietButton(
-            icon = if (viewModel.isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-            label = str("player_like"),
-            tint = if (viewModel.isLiked) MaterialTheme.colorScheme.primary else palette.dim,
-            size = 22.dp,
-            onClick = { viewModel.toggleLike() },
-        )
-        if (viewModel.isYourMixActive) {
-            Spacer(Modifier.width(6.dp))
-            QuietButton(
-                icon = Icons.Outlined.HeartBroken,
-                label = str("mix_dislike"),
-                tint = palette.dim,
-                size = 22.dp,
-                onClick = { viewModel.dislikeCurrentTrackInMix() },
+                textAlign = textAlign,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
+
+    // The heart's glyph sits flush with the edge of the cover and the bar, not a touch target's padding in.
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        if (align == com.alananasss.kittytune.data.local.FullPlayerInfoAlign.CENTER) {
+            // Centred on the cover itself, not on what is left beside the heart: the same room is kept
+            // free on both sides.
+            text(Modifier.fillMaxWidth().padding(horizontal = CREDIT_BUTTON_ROOM))
+        } else {
+            text(
+                Modifier.fillMaxWidth().padding(
+                    start = if (heartAtStart) CREDIT_BUTTON_ROOM else 0.dp,
+                    end = if (heartAtStart) 0.dp else CREDIT_BUTTON_ROOM,
+                )
+            )
+        }
+        Box(
+            Modifier
+                .align(if (heartAtStart) Alignment.CenterStart else Alignment.CenterEnd)
+                .offset(x = if (heartAtStart) -QUIET_BUTTON_INSET else QUIET_BUTTON_INSET)
+        ) { buttons() }
+    }
 }
+
+/** Room the credit leaves for the heart (and the mix's dislike button beside it) on its side. */
+private val CREDIT_BUTTON_ROOM = 48.dp
 
 /**
  * The progress bar and the transport, as quiet as the reference has them.
@@ -1553,7 +1341,7 @@ private fun FullPlayerControls(
 ) {
     Column(Modifier.fillMaxWidth()) {
         com.alananasss.kittytune.ui.player.automix.AutomixDebugOverlay(
-            currentPositionMs = { viewModel.currentPosition },
+            currentPositionMs = { viewModel.uiCurrentPosition },
             modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 8.dp)
         )
 
@@ -1561,51 +1349,51 @@ private fun FullPlayerControls(
 
         Spacer(Modifier.height(8.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+        // The middle three are centred on the bar itself, and the two outer glyphs sit flush with its ends,
+        // like the times above them. Weighted spacers between buttons of unequal size left the pause button a
+        // few pixels off centre and the outer icons a touch target's padding in from the edges, which is what
+        // read as crooked (issue #66).
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
             QuietButton(
                 icon = Icons.Rounded.MoreHoriz,
                 label = str("btn_more"),
-                tint = palette.dim,
-                onClick = { viewModel.currentTrack?.let { viewModel.showTrackOptions(it, fromPlayer = true) } },
+                // Lit while its menu is open, like the lyrics button while the words show.
+                tint = if (viewModel.showMenuSheet) palette.bright else palette.dim,
+                onClick = { viewModel.uiCurrentTrack?.let { viewModel.showTrackOptions(it, fromPlayer = true) } },
+                modifier = Modifier.align(Alignment.CenterStart).offset(x = -QUIET_BUTTON_INSET),
             )
-
-            // The transport keeps the middle of the cover's width whatever sits either side of it, which is
-            // why these are weighted spacers rather than an even distribution: in the reference the pause
-            // button is centred under the sleeve, not centred between its two neighbours.
-            Spacer(Modifier.weight(1f))
-            QuietButton(
-                icon = Icons.Rounded.SkipPrevious,
-                label = str("player_previous"),
-                tint = palette.bright,
-                size = 26.dp,
-                onClick = { viewModel.smartPrevious() },
-            )
-            Spacer(Modifier.width(14.dp))
-            QuietButton(
-                icon = if (viewModel.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                label = str("player_play_pause"),
-                tint = palette.bright,
-                size = 30.dp,
-                onClick = { viewModel.togglePlayPause() },
-            )
-            Spacer(Modifier.width(14.dp))
-            QuietButton(
-                icon = Icons.Rounded.SkipNext,
-                label = str("player_next"),
-                tint = palette.bright,
-                size = 26.dp,
-                onClick = { viewModel.playNext() },
-            )
-            Spacer(Modifier.weight(1f))
-
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                QuietButton(
+                    icon = Icons.Rounded.SkipPrevious,
+                    label = str("player_previous"),
+                    tint = palette.bright,
+                    size = 28.dp,
+                    onClick = { viewModel.smartPrevious() },
+                )
+                QuietButton(
+                    icon = if (viewModel.uiIsPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    label = str("player_play_pause"),
+                    tint = palette.bright,
+                    size = 34.dp,
+                    onClick = { viewModel.togglePlayPause() },
+                )
+                QuietButton(
+                    icon = Icons.Rounded.SkipNext,
+                    label = str("player_next"),
+                    tint = palette.bright,
+                    size = 28.dp,
+                    onClick = { viewModel.playNext() },
+                )
+            }
             QuietButton(
                 icon = Icons.Rounded.Lyrics,
                 label = str("player_lyrics"),
                 tint = if (showText) palette.bright else palette.dim,
                 onClick = onToggleText,
+                modifier = Modifier.align(Alignment.CenterEnd).offset(x = QUIET_BUTTON_INSET),
             )
         }
 
@@ -1617,57 +1405,74 @@ private fun FullPlayerControls(
 /**
  * The full player's volume: the same styled track as the player bar's — plain, slim, wavy or squiggly, with
  * the dot that jumps when grabbed and the wave that moves only while music plays — in the artwork's colours.
- * The wheel works anywhere on the row.
+ *
+ * Laid out like the seek bar above it: the speaker at one end, glyph flush with the bar's end, and the level in
+ * per cent at the other, its last digit flush with the other end. A second, louder speaker used to sit where the
+ * level is: two near-identical icons that said nothing the track did not. The speaker mutes; the wheel works
+ * anywhere on the row.
  */
 @Composable
 private fun FullPlayerVolumeBar(
     viewModel: PlayerViewModel,
     palette: FullPlayerPalette,
 ) {
-    val volume = viewModel.volume.coerceIn(0f, 1f)
+    val volume = viewModel.uiVolume.coerceIn(0f, 1f)
+    val isMuted = volume <= 0.001f
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val scrollDelta = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
-                        if (scrollDelta != 0f) {
-                            viewModel.updateVolume((viewModel.volume - scrollDelta * 0.05f).coerceIn(0f, 1f))
-                            viewModel.persistVolumeSoon()
-                        }
-                    }
-                }
-            },
+            .volumeWheel(
+                currentVolume = { viewModel.uiVolume },
+                onVolumeChange = {
+                    viewModel.updateVolume(it)
+                    viewModel.persistVolumeSoon()
+                },
+            ),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        QuietButton(
-            icon = com.alananasss.kittytune.ui.main.volumeIcon(volume),
-            label = str("volume_title"),
-            tint = palette.dim,
-            size = 18.dp,
-            onClick = { viewModel.toggleMute() }
-        )
+        com.alananasss.kittytune.ui.main.OutputDevicePicker(onSelect = { viewModel.changeOutputDevice(it) }) { pickerModifier ->
+            QuietButton(
+                icon = com.alananasss.kittytune.ui.main.volumeIcon(volume),
+                label = if (isMuted) "Unmute" else str("volume_title"),
+                tint = if (isMuted) palette.dim.copy(alpha = 0.45f) else palette.dim,
+                size = 18.dp,
+                onClick = { viewModel.toggleMute() },
+                modifier = pickerModifier.offset(x = -VOLUME_BUTTON_INSET),
+            )
+        }
         com.alananasss.kittytune.ui.main.StyledVolumeTrack(
             volume = volume,
-            isPlaying = viewModel.isPlaying,
+            isPlaying = viewModel.uiIsPlaying,
             activeColor = palette.bright,
             inactiveColor = palette.dim.copy(alpha = 0.25f),
+            thumbColor = palette.bright,
             onVolumeChange = { viewModel.updateVolume(it) },
             onVolumeChangeFinished = { viewModel.persistVolume() },
             modifier = Modifier.weight(1f),
         )
         androidx.compose.material3.Text(
             text = com.alananasss.kittytune.ui.main.volumePercentLabel(volume),
-            style = MaterialTheme.typography.labelSmall,
-            color = palette.dim,
+            style = MaterialTheme.typography.labelMedium.copy(fontFeatureSettings = "tnum"),
+            color = if (isMuted) palette.dim.copy(alpha = 0.45f) else palette.dim,
             textAlign = androidx.compose.ui.text.style.TextAlign.End,
-            modifier = Modifier.width(36.dp)
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier.width(VOLUME_LABEL_WIDTH),
         )
     }
 }
+
+/** Space between a [QuietButton]'s touch target and its glyph, on each side. */
+private val QUIET_BUTTON_INSET = 9.dp
+
+/** The same for the volume row's 18 dp speaker. */
+private val VOLUME_BUTTON_INSET = 9.dp
+
+/**
+ * The level at the volume row's right end, as wide as the speaker at its left (18 dp glyph plus its insets),
+ * so the track keeps the length it had and the text ends flush with the seek bar above.
+ */
+private val VOLUME_LABEL_WIDTH = 18.dp + VOLUME_BUTTON_INSET * 2
 
 /** One glyph, no container, no ripple worth noticing. */
 @Composable
@@ -1677,11 +1482,14 @@ private fun QuietButton(
     tint: Color,
     size: androidx.compose.ui.unit.Dp = 20.dp,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     androidx.compose.material3.IconButton(
         onClick = onClick,
         shapes = IconButtonDefaults.shapes(),
-        modifier = Modifier.size(size + 18.dp),
+        modifier = modifier
+            .size(size + QUIET_BUTTON_INSET * 2)
+            .focusProperties { canFocus = false },
     ) {
         val skipName = icon.name.substringAfterLast('.')
         if (com.alananasss.kittytune.ui.theme.LocalPixelTheme.current && (skipName == "SkipNext" || skipName == "SkipPrevious")) {
@@ -1701,96 +1509,36 @@ private fun QuietButton(
     }
 }
 
-/**
- * A hairline bar with the elapsed time at one end and the time left at the other.
- *
- * Drawn rather than assembled from [androidx.compose.material3.Slider], which on this screen would be
- * wrong in three ways at once: its track is several times too thick, its thumb is a filled pill in the
- * primary colour, and it insists on a 48 dp touch height that would push the transport away from the
- * cover. What the reference has is 4 dp of rounded track and a dot, so that is what this draws.
- *
- * The scrub position is local while a drag is in progress, because the playhead reports four times a
- * second and a bar bound straight to it fights the finger.
- */
 @Composable
 private fun FullPlayerSeekBar(viewModel: PlayerViewModel, palette: FullPlayerPalette) {
-    val duration = viewModel.duration.coerceAtLeast(1L)
-    var scrubbing by remember { mutableStateOf(false) }
-    var scrubFraction by remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
+    PlaybackSeekBar(
+        viewModel = viewModel,
+        colors = SliderDefaults.colors(
+            thumbColor = palette.bright,
+            activeTrackColor = palette.bright,
+            inactiveTrackColor = palette.dim.copy(alpha = 0.25f),
+        ),
+    ) { position, duration, slider ->
+        Column(Modifier.fillMaxWidth()) {
+            slider(Modifier.fillMaxWidth())
 
-    val playedFraction =
-        if (scrubbing) scrubFraction
-        else (viewModel.currentPosition.toFloat() / duration).coerceIn(0f, 1f)
-    val shown = (playedFraction * duration).toLong()
-
-    Column(Modifier.fillMaxWidth()) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(20.dp)
-                .pointerInput(duration) {
-                    detectHorizontalDragGestures(
-                        onDragStart = { offset ->
-                            scrubbing = true
-                            scrubFraction = (offset.x / size.width).coerceIn(0f, 1f)
-                        },
-                        onDragEnd = {
-                            viewModel.seekTo((scrubFraction * duration).toLong())
-                            scrubbing = false
-                        },
-                        onDragCancel = { scrubbing = false },
-                        onHorizontalDrag = { change, _ ->
-                            scrubFraction = (change.position.x / size.width).coerceIn(0f, 1f)
-                        },
-                    )
-                }
-                .pointerInput(duration) {
-                    detectTapGestures { offset ->
-                        viewModel.seekTo(((offset.x / size.width).coerceIn(0f, 1f) * duration).toLong())
-                    }
-                }
-                .drawBehind {
-                    val track = 4.dp.toPx()
-                    val y = size.height / 2f
-                    val radius = track / 2f
-                    drawRoundRect(
-                        color = palette.dim.copy(alpha = 0.22f),
-                        topLeft = Offset(0f, y - radius),
-                        size = androidx.compose.ui.geometry.Size(size.width, track),
-                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius),
-                    )
-                    val played = size.width * playedFraction
-                    if (played > 0f) {
-                        drawRoundRect(
-                            color = palette.dim.copy(alpha = 0.8f),
-                            topLeft = Offset(0f, y - radius),
-                            size = androidx.compose.ui.geometry.Size(played, track),
-                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius),
-                        )
-                    }
-                    drawCircle(color = palette.bright, radius = track, center = Offset(played, y))
-                }
-        )
-
-        val showRemaining = rememberFullPlayerShowRemaining()
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TimeLabel(com.alananasss.kittytune.utils.makeTimeString(shown), palette)
-            com.alananasss.kittytune.ui.player.automix.AutomixBadge(textColor = palette.bright)
-            // Counting down or total duration, switchable by clicking and synced with settings.
-            TimeLabel(
-                text = if (showRemaining) "-" + com.alananasss.kittytune.utils.makeTimeString((duration - shown).coerceAtLeast(0L)) else com.alananasss.kittytune.utils.makeTimeString(duration),
-                palette = palette,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable {
-                        com.alananasss.kittytune.data.local.PlayerPreferences().setShowRemainingTime(!showRemaining)
-                    }
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-            )
+            val showRemaining = rememberShowRemainingTime()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TimeLabel(makeTimeString(position), palette)
+                TimeLabel(
+                    text = if (showRemaining) "-" + makeTimeString(duration - position) else makeTimeString(duration),
+                    palette = palette,
+                    modifier = Modifier
+                        .widthIn(min = 56.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { PlayerPreferences().setShowRemainingTime(!showRemaining) }
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                )
+            }
         }
     }
 }
@@ -1803,15 +1551,4 @@ private fun TimeLabel(text: String, palette: FullPlayerPalette, modifier: Modifi
         color = palette.dim,
         modifier = modifier,
     )
-}
-
-/**
- * Reactive read of the "show remaining time" setting; recomposes when the pref changes.
- */
-@Composable
-private fun rememberFullPlayerShowRemaining(): Boolean {
-    val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
-    return remember(prefsSnapshot) {
-        com.alananasss.kittytune.data.local.PlayerPreferences().getShowRemainingTime()
-    }
 }

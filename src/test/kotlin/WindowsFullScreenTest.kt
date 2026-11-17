@@ -6,13 +6,21 @@ import java.awt.GraphicsEnvironment
 import java.awt.Rectangle
 import javax.swing.JFrame
 import javax.swing.SwingUtilities
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
+import org.junit.Before
 import org.junit.Test
 
 class WindowsFullScreenTest {
+
+    @Before
+    @After
+    fun resetState() {
+        WindowsFullScreen.resetForTesting()
+    }
 
     @Test
     fun testNullWindowHandling() {
@@ -97,6 +105,20 @@ class WindowsFullScreenTest {
         org.junit.Assert.assertTrue((fsStyle and com.sun.jna.platform.win32.WinUser.WS_VISIBLE) != 0)
     }
 
+    @Test
+    fun testRestoredStyleClearsMaximizeAndPopup() {
+        val originalMaximizedStyle = com.sun.jna.platform.win32.WinUser.WS_OVERLAPPEDWINDOW or
+                com.sun.jna.platform.win32.WinUser.WS_MAXIMIZE or
+                com.sun.jna.platform.win32.WinUser.WS_VISIBLE
+
+        val restoredStyle = (originalMaximizedStyle and com.sun.jna.platform.win32.WinUser.WS_POPUP.inv() and com.sun.jna.platform.win32.WinUser.WS_MAXIMIZE.inv()) or
+                (com.sun.jna.platform.win32.WinUser.WS_CAPTION or com.sun.jna.platform.win32.WinUser.WS_THICKFRAME or com.sun.jna.platform.win32.WinUser.WS_OVERLAPPEDWINDOW)
+
+        org.junit.Assert.assertEquals("WS_MAXIMIZE must be stripped in restored style", 0, restoredStyle and com.sun.jna.platform.win32.WinUser.WS_MAXIMIZE)
+        org.junit.Assert.assertEquals("WS_POPUP must be stripped in restored style", 0, restoredStyle and com.sun.jna.platform.win32.WinUser.WS_POPUP)
+        org.junit.Assert.assertTrue("WS_CAPTION must be present in restored style", (restoredStyle and com.sun.jna.platform.win32.WinUser.WS_CAPTION) != 0)
+    }
+
     /**
      * The reported bug: with the full player open, clicking another monitor minimised the app. That is
      * what AWT's exclusive full screen does on purpose when its window loses focus, which is why Windows
@@ -105,9 +127,13 @@ class WindowsFullScreenTest {
     @Test
     fun borderlessFullScreenSurvivesFocusLossAndRestoresBounds() {
         assumeTrue(WindowsFullScreen.isWindows && !GraphicsEnvironment.isHeadless())
-        val start = Rectangle(120, 120, 900, 600)
+        val monitorBounds = onEdt { GraphicsEnvironment.getLocalGraphicsEnvironment().defaultScreenDevice.defaultConfiguration.bounds }
+        val startW = minOf(900, (monitorBounds.width * 0.7).toInt().coerceAtLeast(200))
+        val startH = minOf(600, (monitorBounds.height * 0.7).toInt().coerceAtLeast(150))
+        val start = Rectangle(monitorBounds.x + 40, monitorBounds.y + 40, startW, startH)
         val app = onEdt { JFrame("fs-test").apply { bounds = start; isVisible = true } }
-        val other = onEdt { JFrame("other").apply { setBounds(40, 40, 200, 150); isVisible = true } }
+        val other = onEdt { JFrame("other").apply { setBounds(monitorBounds.x + 10, monitorBounds.y + 10, 150, 100); isVisible = true } }
+        val initialBounds = onEdt { app.bounds }
         try {
             val hwnd = WindowsFullScreen.handleOf(app)!!
             val framedStyle = User32.INSTANCE.GetWindowLong(hwnd, WinUser.GWL_STYLE)
@@ -120,8 +146,8 @@ class WindowsFullScreenTest {
             Thread.sleep(300)
             assertFalse("focus loss must not minimise", onEdt { app.extendedState and java.awt.Frame.ICONIFIED != 0 })
 
-            assertTrue(onEdt { WindowsFullScreen.exit(app, WindowPlacement.Floating, start) })
-            assertEquals(start, onEdt { app.bounds })
+            assertTrue(onEdt { WindowsFullScreen.exit(app, WindowPlacement.Floating, initialBounds) })
+            assertEquals(initialBounds, onEdt { app.bounds })
             assertEquals("frame restored", framedStyle, User32.INSTANCE.GetWindowLong(hwnd, WinUser.GWL_STYLE))
             assertFalse(WindowsFullScreen.isFullScreen)
         } finally {

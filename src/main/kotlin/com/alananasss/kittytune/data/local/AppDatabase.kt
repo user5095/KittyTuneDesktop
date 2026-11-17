@@ -20,6 +20,20 @@ object AppDatabase {
     private val dbFile = File(AppDirs.dataDir, "soundtune_db.sqlite")
     private lateinit var conn: Connection
 
+    /**
+     * One thread for the one shared connection. Every statement and transaction below
+     * runs here, so an [execBatch]/[execTogether] transaction can never interleave with
+     * another write on another IO thread: previously a concurrent exec could commit the
+     * batch's half-applied rows, or land inside the transaction and be rolled back with
+     * it (lost likes, issue #33). Reads keep their cache-first path and stay cheap.
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val dbDispatcher = Dispatchers.IO.limitedParallelism(1)
+
+    /** Raw-connection access point for callers outside the helpers (e.g. loudness repo):
+     * hop onto the same single thread so autoCommit toggling stays race-free. */
+    internal suspend fun <T> withDb(block: () -> T): T = withContext(dbDispatcher) { block() }
+
     private val invalidation = MutableStateFlow(0L)
 
     private fun invalidate() {
@@ -32,18 +46,27 @@ object AppDatabase {
     val folderDao: FolderDao by lazy { FolderDao(this) }
     val beatInfoDao: BeatInfoDao by lazy { BeatInfoDao(this) }
     val recentSearchDao: RecentSearchDao by lazy { RecentSearchDao(this) }
+    val blockedContentDao: BlockedContentDao by lazy { BlockedContentDao(this) }
+    val likeDao: LikeDao by lazy { LikeDao(this) }
+    val queueHistoryDao: QueueHistoryDao by lazy { QueueHistoryDao(this) }
 
     fun init() {
         Class.forName("org.sqlite.JDBC")
+        com.alananasss.kittytune.utils.StartupTimeline.mark("db: driver loaded")
         conn = DriverManager.getConnection("jdbc:sqlite:${dbFile.absolutePath}")
         conn.autoCommit = true
+        com.alananasss.kittytune.utils.StartupTimeline.mark("db: connected")
         conn.createStatement().use { st ->
             st.execute("PRAGMA journal_mode=WAL")
             st.execute("PRAGMA foreign_keys=ON")
             st.execute("PRAGMA synchronous=NORMAL")
             st.execute("PRAGMA busy_timeout=5000")
+            st.execute("PRAGMA cache_size=-1000")
+            st.execute("PRAGMA mmap_size=0")
         }
+        com.alananasss.kittytune.utils.StartupTimeline.mark("db: pragmas")
         createSchema()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("db: schema")
     }
 
     private fun createSchema() {
@@ -109,11 +132,54 @@ object AppDatabase {
             // stacking two identical ones (issue #56).
             """CREATE TABLE IF NOT EXISTS recent_search (
                 query TEXT PRIMARY KEY NOT NULL, timestamp INTEGER NOT NULL)""",
+            // Hidden tracks and blocked artists (issue #41, ported from Android).
+            // Exactly one of trackId / artistId is non-null per row; reason is
+            // "MANUAL" or "AI_GENERATED". Unique indexes mirror the Room entity.
+            """CREATE TABLE IF NOT EXISTS blocked_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, trackId INTEGER,
+                trackTitle TEXT, trackArtworkUrl TEXT, artistId INTEGER,
+                artistName TEXT, artistAvatarUrl TEXT, source TEXT NOT NULL DEFAULT 'soundcloud',
+                reason TEXT NOT NULL DEFAULT 'MANUAL', blockedAt INTEGER NOT NULL)""",
+            // The liked-tracks library, one row per like (RAM, issue #33). It used to live as a
+            // single JSON string inside the preferences map — resident for the process lifetime,
+            // re-serialised in full on every save, and re-encoded into the whole prefs file each
+            // time. A row per track writes and reads only what changed, and the RAM copy is the
+            // StateFlow alone. likedAt is a column only so the library can come back out in the
+            // order it was saved in; the track itself (including its own likedAt) is the JSON.
+            """CREATE TABLE IF NOT EXISTS liked_tracks (
+                trackId INTEGER PRIMARY KEY NOT NULL, likedAt INTEGER NOT NULL,
+                trackJson TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS queue_history (
+                id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL,
+                trackCount INTEGER NOT NULL, tracksJson TEXT NOT NULL,
+                currentIndex INTEGER NOT NULL, currentPositionMs INTEGER NOT NULL,
+                contextJson TEXT, firstTrackArtworkUrl TEXT, firstTrackTitle TEXT,
+                firstTrackArtist TEXT, savedAt INTEGER NOT NULL)""",
         )
         conn.createStatement().use { st ->
             ddl.forEach { st.execute(it) }
             try {
                 st.execute("ALTER TABLE downloaded_playlists ADD COLUMN isDownloaded INTEGER NOT NULL DEFAULT 0")
+            } catch (_: Exception) {}
+            // A lyrics sync can have a second point (see LyricsSync); single offsets leave these empty.
+            for (column in listOf("anchorMs INTEGER NOT NULL DEFAULT 0", "endAtMs INTEGER", "endOffsetMs INTEGER")) {
+                try {
+                    st.execute("ALTER TABLE lyrics_offset ADD COLUMN $column")
+                } catch (_: Exception) {}
+            }
+            // A saved track's source and page, for tracks that are not SoundCloud's (see LocalTrack.source).
+            for (column in listOf("source TEXT", "permalinkUrl TEXT")) {
+                try {
+                    st.execute("ALTER TABLE downloaded_tracks ADD COLUMN $column")
+                } catch (_: Exception) {}
+            }
+            // How energetic a track is, for choosing how to blend it (see AutomixManager); older rows have none.
+            try {
+                st.execute("ALTER TABLE beat_info ADD COLUMN energy REAL")
+            } catch (_: Exception) {}
+            // Which analyzer wrote a row; rows from an older one are analysed again (see BeatInfoEntity).
+            try {
+                st.execute("ALTER TABLE beat_info ADD COLUMN analysisVersion INTEGER NOT NULL DEFAULT 1")
             } catch (_: Exception) {}
             st.execute("UPDATE library_folders SET parentFolderId = NULL WHERE parentFolderId = 0")
             st.execute("UPDATE library_item_meta SET folderId = NULL WHERE folderId = 0")
@@ -127,6 +193,9 @@ object AppDatabase {
             for (column in listOf(
                 "furthestPositionMs INTEGER NOT NULL DEFAULT 0",
                 "syncEventId TEXT",
+                // The track's genre, for the listening recaps' "most listened genres" slide. Nullable
+                // because older rows do not have one and because sources without genres leave it blank.
+                "genre TEXT",
             )) {
                 try {
                     st.execute("ALTER TABLE listening_stats ADD COLUMN $column")
@@ -140,6 +209,23 @@ object AppDatabase {
             )
             st.execute("CREATE INDEX IF NOT EXISTS idx_stats_track ON listening_stats(trackId)")
             st.execute("CREATE INDEX IF NOT EXISTS idx_stats_artist ON listening_stats(artistName)")
+            // Indexes that the original schema shipped without. Each one covers a hot query path
+            // that previously did a full table scan — the cross-ref lookup when a track is removed
+            // from every playlist, the play/recognition-history timestamps when the screens read
+            // newest-first, the local-audio-path existence check the library uses to filter out
+            // non-downloaded rows, and the boolean filters on downloaded_playlists. Added here so
+            // existing installs pick them up on the next launch (issue #5-DB).
+            st.execute("CREATE INDEX IF NOT EXISTS idx_ref_track ON playlist_track_cross_ref(trackId)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_play_history_ts ON play_history(timestamp DESC)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_recognition_history_ts ON recognition_history(timestamp DESC)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_tracks_localpath ON downloaded_tracks(localAudioPath)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_playlists_downloaded ON downloaded_playlists(isDownloaded)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_playlists_user ON downloaded_playlists(isUserCreated)")
+            // Unique indexes for the blocked-content table (Room parity: one block per
+            // track / artist, INSERT OR IGNORE keeps re-blocks idempotent).
+            st.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_blocked_track ON blocked_content(trackId)")
+            st.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_blocked_artist ON blocked_content(artistId)")
+            st.execute("CREATE INDEX IF NOT EXISTS idx_queue_history_ts ON queue_history(savedAt DESC)")
             // What makes applying a synced listen twice impossible rather than merely unlikely. SQLite
             // treats NULLs as distinct in a unique index, so the rows from before sync existed — all of
             // which have no id — do not collide with each other (issue #33).
@@ -159,7 +245,7 @@ object AppDatabase {
 
 
     internal suspend fun <T> query(sql: String, vararg args: Any?, mapper: (ResultSet) -> T): List<T> =
-        withContext(Dispatchers.IO) {
+        withContext(dbDispatcher) {
             conn.prepareStatement(sql).use { ps ->
                 bind(ps, args)
                 ps.executeQuery().use { rs ->
@@ -171,7 +257,7 @@ object AppDatabase {
     internal suspend fun <T> queryOne(sql: String, vararg args: Any?, mapper: (ResultSet) -> T): T? =
         query(sql, *args, mapper = mapper).firstOrNull()
 
-    internal suspend fun exec(sql: String, vararg args: Any?) = withContext(Dispatchers.IO) {
+    internal suspend fun exec(sql: String, vararg args: Any?) = withContext(dbDispatcher) {
         conn.prepareStatement(sql).use { ps ->
             bind(ps, args)
             ps.executeUpdate()
@@ -187,17 +273,17 @@ object AppDatabase {
      * and thousands of cache invalidations, each waking every screen watching the database. Here it is one
      * of each (issue #33).
      *
-     * The transaction is on the one shared connection, so a write issued from elsewhere during these few
-     * milliseconds joins it and would be rolled back with it. That is worth stating rather than hiding, and
-     * it is an acceptable trade here: the only way this rolls back is a failing disk, and the alternative —
-     * a commit per row — is the cost this exists to remove.
+     * The transaction runs on the one shared connection, on the single [dbDispatcher] thread —
+     * a write issued from elsewhere now queues behind it instead of joining it, so nothing can
+     * be rolled back with it that did not ask to be. The only way this rolls back is a failing
+     * disk, and the alternative — a commit per row — is the cost this exists to remove.
      *
      * @return how many rows the statement actually changed. With `INSERT OR IGNORE` a duplicate reports
      *   zero, so this is the count of genuinely new rows and no separate counting query is needed.
      */
     internal suspend fun execBatch(sql: String, rows: List<Array<out Any?>>): Int {
         if (rows.isEmpty()) return 0
-        val changed = withContext(Dispatchers.IO) {
+        val changed = withContext(dbDispatcher) {
             val previousAutoCommit = conn.autoCommit
             conn.autoCommit = false
             try {
@@ -223,10 +309,33 @@ object AppDatabase {
         return changed
     }
 
-    internal suspend fun execSilent(sql: String, vararg args: Any?) = withContext(Dispatchers.IO) {
+    internal suspend fun execSilent(sql: String, vararg args: Any?) = withContext(dbDispatcher) {
         conn.prepareStatement(sql).use { ps ->
             bind(ps, args)
             ps.executeUpdate()
+        }
+    }
+
+    /**
+     * Arbitrary statements, one transaction, on the single [dbDispatcher] thread.
+     *
+     * For the writes that do not fit the shaped helpers — a replace-all is a DELETE plus a batch
+     * INSERT, and doing them as two [exec]s would leave a window where a crash drops the table to
+     * empty between the two commits. Same autoCommit discipline as [execBatch]/[execTogether];
+     * no invalidation, because the one caller so far (the likes table) has nothing observing it.
+     */
+    internal suspend fun <T> execTransaction(block: () -> T): T = withContext(dbDispatcher) {
+        val previousAutoCommit = conn.autoCommit
+        conn.autoCommit = false
+        try {
+            val result = block()
+            conn.commit()
+            result
+        } catch (t: Throwable) {
+            runCatching { conn.rollback() }
+            throw t
+        } finally {
+            conn.autoCommit = previousAutoCommit
         }
     }
 
@@ -238,11 +347,12 @@ object AppDatabase {
      * its own commit and its own invalidation, so a crash between them would leave the table one row
      * over the cap, and every screen watching the database would recompute twice for one keystroke.
      *
-     * The transaction is on the one shared connection, as [execBatch]'s is, with the same trade.
+     * The transaction runs on the one shared connection, on the single [dbDispatcher] thread, with
+     * the same guarantees as [execBatch].
      */
     internal suspend fun execTogether(vararg statements: Pair<String, Array<out Any?>>) {
         if (statements.isEmpty()) return
-        withContext(Dispatchers.IO) {
+        withContext(dbDispatcher) {
             val previousAutoCommit = conn.autoCommit
             conn.autoCommit = false
             try {

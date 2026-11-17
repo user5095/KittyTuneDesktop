@@ -1,0 +1,115 @@
+import com.alananasss.kittytune.core.Prefs
+import com.alananasss.kittytune.data.local.PlayerPreferences
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+
+class PlayerBarButtonsTest {
+
+    private val prefs = PlayerPreferences()
+
+    @Before
+    fun setUp() {
+        Prefs.remove("player_bar_buttons")
+        Prefs.remove("player_bar_devices_migrated")
+        Prefs.remove("player_bar_pet_migrated")
+    }
+
+    @Test
+    fun testDevicesConstant() {
+        assertEquals("devices", PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES)
+    }
+
+    @Test
+    fun testDefaultButtonsIncludeDevices() {
+        assertTrue(
+            "Default player bar buttons should include devices",
+            PlayerPreferences.PLAYER_BAR_BUTTONS_DEFAULT.contains(PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES)
+        )
+        val buttons = prefs.getPlayerBarButtons()
+        assertTrue(buttons.contains(PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES))
+    }
+
+    @Test
+    fun testLegacyMigrationAddsDevices() {
+        // User had older preferences without "devices"
+        Prefs.putString("player_bar_buttons", "like,panel,queue,lyrics,miniplayer,shuffle,repeat")
+        Prefs.remove("player_bar_devices_migrated")
+
+        val buttons = prefs.getPlayerBarButtons()
+        assertTrue(
+            "Migration should include devices for legacy users",
+            buttons.contains(PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES)
+        )
+        assertTrue(buttons.contains(PlayerPreferences.PLAYER_BAR_BUTTON_LIKE))
+        assertTrue(buttons.contains(PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE))
+    }
+
+    @Test
+    fun testPreDesignProfileGetsNewButtonsOnce() {
+        Prefs.putString("player_bar_buttons", "like,queue")
+
+        assertEquals(
+            PlayerPreferences.PLAYER_BAR_BUTTONS_DEFAULT - PlayerPreferences.PLAYER_BAR_BUTTON_PANEL,
+            prefs.getPlayerBarButtons(),
+        )
+
+        prefs.setPlayerBarButtons(emptySet())
+        assertEquals(emptySet<String>(), prefs.getPlayerBarButtons())
+    }
+
+    @Test
+    fun testShuffleAndRepeatVisibilityAreIndependent() {
+        val shuffle = PlayerPreferences.PLAYER_BAR_BUTTON_SHUFFLE
+        val repeat = PlayerPreferences.PLAYER_BAR_BUTTON_REPEAT
+        val pet = PlayerPreferences.PLAYER_BAR_BUTTON_PET
+
+        for (transportButtons in listOf(setOf(repeat), emptySet(), setOf(shuffle), setOf(shuffle, repeat))) {
+            val visible = transportButtons + pet
+            prefs.setPlayerBarButtons(visible)
+            assertEquals(visible, prefs.getPlayerBarButtons())
+        }
+    }
+
+    @Test
+    fun testPetMigrationPreservesHiddenPlayerDesignButtons() {
+        Prefs.putString("player_bar_buttons", "")
+        Prefs.putBoolean("player_bar_devices_migrated", true)
+
+        assertEquals(setOf(PlayerPreferences.PLAYER_BAR_BUTTON_PET), prefs.getPlayerBarButtons())
+    }
+
+    @Test
+    fun testExplicitlyDisabledDevicesDoesNotResurrect() {
+        // User explicitly toggles off devices in settings
+        val customized = setOf(
+            PlayerPreferences.PLAYER_BAR_BUTTON_LIKE,
+            PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE,
+        )
+        prefs.setPlayerBarButtons(customized)
+
+        val retrieved = prefs.getPlayerBarButtons()
+        assertFalse(
+            "Disabled devices button should remain disabled",
+            retrieved.contains(PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES)
+        )
+        assertTrue(retrieved.contains(PlayerPreferences.PLAYER_BAR_BUTTON_LIKE))
+        assertTrue(retrieved.contains(PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE))
+    }
+
+    @Test
+    fun testPanelTabDevicesConstantAndHiding() {
+        assertEquals("devices", PlayerPreferences.PANEL_TAB_DEVICES)
+        val initialHidden = prefs.getHiddenPanelTabs()
+        assertFalse(initialHidden.contains(PlayerPreferences.PANEL_TAB_DEVICES))
+
+        prefs.setHiddenPanelTabs(initialHidden + PlayerPreferences.PANEL_TAB_DEVICES)
+        val updatedHidden = prefs.getHiddenPanelTabs()
+        assertTrue(updatedHidden.contains(PlayerPreferences.PANEL_TAB_DEVICES))
+
+        prefs.setHiddenPanelTabs(updatedHidden - PlayerPreferences.PANEL_TAB_DEVICES)
+        assertFalse(prefs.getHiddenPanelTabs().contains(PlayerPreferences.PANEL_TAB_DEVICES))
+    }
+}

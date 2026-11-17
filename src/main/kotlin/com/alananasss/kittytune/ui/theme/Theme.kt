@@ -44,7 +44,7 @@ object ThemeState {
     var coverMeshColors by mutableStateOf<List<Int>>(emptyList())
 }
 
-internal val KittyTuneDefaultSeedColor = Color(0xFFFF7A1A)
+internal val KittyTuneDefaultSeedColor = Color(0xFF1565C0)
 
 /**
  * How long the palette takes to travel to a new cover's colour. Long enough to read as a
@@ -294,7 +294,7 @@ fun SoundTuneTheme(
     androidx.compose.runtime.CompositionLocalProvider(LocalPixelTheme provides pixelTheme) {
         MaterialExpressiveTheme(
             colorScheme = colorScheme,
-            typography = if (pixelTheme) PixelTypography else typography,
+            typography = if (pixelTheme) PixelTypography else remember(typography) { typography.withDesktopTextRendering() },
             // Menus, tooltips and snackbars use the extra-small shape; the stock 4 dp made every dropdown look
             // square next to the app's 16–28 dp cards, so they all get the same softer corner.
             shapes = androidx.compose.material3.Shapes(

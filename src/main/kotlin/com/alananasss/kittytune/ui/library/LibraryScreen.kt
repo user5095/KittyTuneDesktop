@@ -55,6 +55,7 @@ import kotlinx.coroutines.launch
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import com.alananasss.kittytune.data.DownloadManager
+import com.alananasss.kittytune.data.BlockManager
 import com.alananasss.kittytune.data.TokenManager
 import com.alananasss.kittytune.data.local.LibraryFolder
 import com.alananasss.kittytune.data.local.LocalArtist
@@ -64,6 +65,8 @@ import com.alananasss.kittytune.domain.User
 import com.alananasss.kittytune.ui.common.SquareCardShimmer
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.ui.profile.ArtistAvatar
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -77,6 +80,7 @@ fun LibraryScreen(
     libraryViewModel: LibraryViewModel = viewModel()
 ) {
 
+    com.alananasss.kittytune.ui.debug.TraceRecompositions("LibraryScreen")
     val listState = rememberLazyGridState()
     // collapse fab text when scrolling
     val fabExpanded by remember {
@@ -353,7 +357,7 @@ fun LibraryScreen(
             floatingActionButton = {
                 if (!showLogin || isGuest) {
                     val bottomNavHeight = 90.dp
-                    val miniPlayerHeight = if (playerViewModel.currentTrack != null) 72.dp else 0.dp
+                    val miniPlayerHeight = if (playerViewModel.uiCurrentTrack != null) 72.dp else 0.dp
                     val totalBottomPadding = bottomNavHeight + miniPlayerHeight
     
                     Box(modifier = Modifier.padding(bottom = totalBottomPadding)) {
@@ -484,6 +488,17 @@ fun LibraryScreen(
         val playlistsFilter = str("lib_playlists")
         val uploadsFilter = str("lib_your_uploads")
         val shouldShowPlaylists = (viewModel.selectedFilter == null || viewModel.selectedFilter == playlistsFilter) && viewModel.currentFolderId == null
+
+        // Content filtering (issue #41): artists are LocalArtist here, not User,
+        // so the ArtistItems are filtered via the block flow directly. Playlists
+        // themselves are never filtered.
+        val blockedArtistIds by BlockManager.blockedArtistIdsFlow.collectAsState()
+        val blockedTrackIds by BlockManager.blockedTrackIdsFlow.collectAsState()
+        val visibleItems = remember(viewModel.displayedItems, blockedArtistIds) {
+            viewModel.displayedItems.filter { item ->
+                (item as? LibraryItem.ArtistItem)?.artist?.id?.let { !BlockManager.isArtistBlocked(it) } ?: true
+            }
+        }
     
         LazyVerticalGrid(
             state = listState,
@@ -521,23 +536,29 @@ fun LibraryScreen(
                     UploadsSortOption.ARTIST -> privacyFiltered.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.user?.username.orEmpty() })
                 }
 
-                if (sortedTracks.isEmpty()) {
+                // Content filtering (issue #41): plain filter — this is the grid's
+                // non-composable DSL scope, so the block flows collected in the
+                // body above are applied directly. The queue and the rows share
+                // the filtered list so indices stay aligned.
+                val visibleTracks = sortedTracks.filter { !BlockManager.isBlocked(it) }
+
+                if (visibleTracks.isEmpty()) {
                     item(span = { GridItemSpan(if (viewModel.isGridLayout) 2 else 1) }, key = "empty_uploads") {
                         EmptyUploadsView()
                     }
                 } else {
                     items(
-                        items = sortedTracks,
+                        items = visibleTracks,
                         key = { track -> "upload_track_${track.id}" }
                     ) { track ->
-                        val index = sortedTracks.indexOf(track)
+                        val index = visibleTracks.indexOf(track)
                         val trackIndex = if (index >= 0) index else 0
                         Box(modifier = Modifier.animateItem()) {
                             if (viewModel.isGridLayout) {
                                 UploadTrackGridCard(
                                     track = track,
                                     onClick = {
-                                        playerViewModel.playPlaylist(sortedTracks, trackIndex)
+                                        playerViewModel.playPlaylist(visibleTracks, trackIndex)
                                     },
                                     onOptionClick = {
                                         playerViewModel.showTrackOptions(track)
@@ -548,7 +569,7 @@ fun LibraryScreen(
                                 UploadTrackListCard(
                                     track = track,
                                     onClick = {
-                                        playerViewModel.playPlaylist(sortedTracks, trackIndex)
+                                        playerViewModel.playPlaylist(visibleTracks, trackIndex)
                                     },
                                     onOptionClick = {
                                         playerViewModel.showTrackOptions(track)
@@ -612,7 +633,7 @@ fun LibraryScreen(
             }
     
             items(
-                items = viewModel.displayedItems,
+                items = visibleItems,
                 key = { item -> item.key }
             ) { item ->
                 val showPin = item.isPinned && !isInsideFolder
@@ -636,11 +657,12 @@ fun LibraryScreen(
                         is LibraryItem.PlaylistItem -> {
                             val permalink = item.playlist.permalinkUrl
                             val isYoutubeShortcut = permalink != null && permalink.startsWith("yt_radio:")
+                            val isSpotifyRadioShortcut = permalink != null && permalink.startsWith("spotify_radio:")
                             val isTrackStation = item.playlist.isTrackStation || permalink?.contains("track-stations") == true || item.playlist.urn?.contains("track-stations") == true
                             val isArtistStation = item.playlist.isArtistStation || permalink?.contains("artist-stations") == true || item.playlist.urn?.contains("artist-stations") == true
  
-                            val navId = if (isYoutubeShortcut) {
-                                java.net.URLEncoder.encode(permalink, "UTF-8")
+                            val navId = if (isYoutubeShortcut || isSpotifyRadioShortcut) {
+                                permalink.orEmpty()
                             } else if (isTrackStation) {
                                 "station:${item.playlist.numericId}"
                             } else if (isArtistStation) {
@@ -835,40 +857,32 @@ fun LibraryScreen(
                     )
                 }
             } else if (shouldShowOwnershipFilter) {
-                val filterText = when (viewModel.ownershipFilter) {
-                    OwnershipFilter.ALL -> str("filter_all")
-                    OwnershipFilter.CREATED -> str("filter_created")
-                    OwnershipFilter.LIKED -> str("filter_liked")
-                }
-                Row(
-                    modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable {
-                        viewModel.ownershipFilter = when (viewModel.ownershipFilter) {
-                            OwnershipFilter.ALL -> OwnershipFilter.CREATED
-                            OwnershipFilter.CREATED -> OwnershipFilter.LIKED
-                            OwnershipFilter.LIKED -> OwnershipFilter.ALL
-                        }
-                    }.padding(4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(text = filterText, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Icon(
-                        imageVector = androidx.compose.material.icons.Icons.Rounded.FilterList,
-                        contentDescription = filterText, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary
-                    )
-                }
+                // The same button as every other filter: it used to cycle through the three on each click, with
+                // nothing saying that is what it would do (issue #66).
+                val ownership = listOf(
+                    Triple(OwnershipFilter.ALL, str("filter_all"), Icons.Rounded.LibraryMusic),
+                    Triple(OwnershipFilter.CREATED, str("filter_created"), Icons.Rounded.Edit),
+                    Triple(OwnershipFilter.LIKED, str("filter_liked"), Icons.Rounded.Favorite),
+                )
+                com.alananasss.kittytune.ui.common.IconChoiceButton(
+                    options = ownership,
+                    selected = ownership.first { it.first == viewModel.ownershipFilter },
+                    onSelect = { viewModel.ownershipFilter = it.first },
+                    icon = { it.third },
+                    label = { it.second },
+                )
             } else {
-                Row(
-                    modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { viewModel.isSortDescending = !viewModel.isSortDescending }.padding(4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(text = str("sort_date_added"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Icon(
-                        imageVector = if (viewModel.isSortDescending) Icons.Rounded.ArrowDownward else Icons.Rounded.ArrowUpward,
-                        contentDescription = str("sort_date_added"), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary
-                    )
-                }
+                val order = listOf(
+                    Triple(true, str("sort_recently_added"), Icons.Rounded.ArrowDownward),
+                    Triple(false, str("sort_first_added"), Icons.Rounded.ArrowUpward),
+                )
+                com.alananasss.kittytune.ui.common.IconChoiceButton(
+                    options = order,
+                    selected = order.first { it.first == viewModel.isSortDescending },
+                    onSelect = { viewModel.isSortDescending = it.first },
+                    icon = { it.third },
+                    label = { it.second },
+                )
             }
             IconButton(
                 onClick = { viewModel.isGridLayout = !viewModel.isGridLayout },
@@ -1332,7 +1346,7 @@ fun LibraryScreen(
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
-                IconButton(
+                IconButton(shapes = IconButtonDefaults.shapes(),
                     onClick = onOptionClick,
                     modifier = Modifier.size(28.dp)
                 ) {
@@ -1410,7 +1424,7 @@ fun LibraryScreen(
                     onArtistClick = onArtistClick
                 )
             }
-            IconButton(onClick = onOptionClick) {
+            IconButton(shapes = IconButtonDefaults.shapes(), onClick = onOptionClick) {
                 Icon(
                     imageVector = Icons.Default.MoreVert,
                     contentDescription = str("btn_options"),
@@ -1523,7 +1537,7 @@ fun LibraryScreen(
                 }
             },
             confirmButton = {
-                TextButton(
+                TextButton(shapes = ButtonDefaults.shapes(),
                     onClick = {
                         viewModel.uploadsSortOption = selectedSort
                         viewModel.uploadsPrivacyFilter = selectedPrivacy
@@ -1534,7 +1548,7 @@ fun LibraryScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = onDismiss) {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) {
                     Text(str("btn_cancel"))
                 }
             }

@@ -7,9 +7,11 @@ build/
 kotlin-js-store/
 .gemini/
 .claude/
+.agents/
 *.class
 *.log
 *.png
+!images/*
 !src/main/resources/icons/*.png
 # The alternate app icons are real product assets, not scratch images: without this
 # they are swallowed by the *.png rule above and the icon picker crashes on a build
@@ -17,10 +19,19 @@ kotlin-js-store/
 !src/main/resources/icons/variants/*.png
 *.wav
 *.py
+!scripts/check-linux-dbus.py
 *.ps1
+!scripts/build-smtc-bridge.ps1
+!scripts/build-native-windows.ps1
+!scripts/build-windows.ps1
+!scripts/optimize-windows-startup.ps1
+!scripts/build-native-cdm.ps1
+!scripts/setup-cdm-sidecar.ps1
+/release/
 *.txt
 context_dump.txt
 *.msi
+*.dll
 TestColor.kt
 first_token_manager.json
 scratch/
@@ -46,3 +57,4 @@ bin/
 .DS_Store
 arch_build/
 *.pkg.tar.zst
+!scripts/enable-segment-heap.ps1

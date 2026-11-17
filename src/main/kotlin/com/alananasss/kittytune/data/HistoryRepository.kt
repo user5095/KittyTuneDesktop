@@ -6,18 +6,21 @@ import com.alananasss.kittytune.data.local.HistoryItem
 import com.alananasss.kittytune.domain.Playlist
 import com.alananasss.kittytune.domain.Track
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 object HistoryRepository {
     private val dao get() = AppDatabase.downloadDao
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun init() {
         // Database is initialized globally; nothing to wire here.
     }
 
     fun addToHistory(track: Track) {
+        // "Pause listening history" silences every row written here while it is on.
+        if (com.alananasss.kittytune.data.local.PlayerPreferences().getPauseListenHistory()) return
         scope.launch {
             val safeSource = (track.source as? String) ?: "soundcloud"
 
@@ -37,6 +40,8 @@ object HistoryRepository {
     }
 
     fun addToHistory(playlist: Playlist, isStation: Boolean = false, isProfile: Boolean = false) {
+        // "Pause listening history" silences every row written here while it is on.
+        if (com.alananasss.kittytune.data.local.PlayerPreferences().getPauseListenHistory()) return
         if ((playlist.id == 0L && playlist.permalinkUrl.isNullOrBlank() && playlist.urn.isNullOrBlank()) || playlist.title.equals(
                 "history",
                 ignoreCase = true

@@ -41,11 +41,14 @@ import com.alananasss.kittytune.domain.Playlist
 import com.alananasss.kittytune.domain.StreamItem
 import com.alananasss.kittytune.domain.Track
 import com.alananasss.kittytune.ui.common.ScrollableLazyColumn as LazyColumn
+import com.alananasss.kittytune.ui.common.rememberFilteredTracks
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -70,6 +73,13 @@ fun FeedScreen(
         }
     }
 
+    // Hide blocked tracks/artists (issue #41); playlists are never filtered.
+    val visibleTracks = rememberFilteredTracks(feedViewModel.feedItems.mapNotNull { it.track })
+    val feedItems = remember(feedViewModel.feedItems, visibleTracks) {
+        val visibleIds = visibleTracks.map { it.id }.toSet()
+        feedViewModel.feedItems.filter { it.track == null || it.track.id in visibleIds }
+    }
+
     Column(Modifier.fillMaxSize()) {
         // Header
         Row(
@@ -84,7 +94,7 @@ fun FeedScreen(
                 style = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
             )
-            IconButton(onClick = { feedViewModel.refresh() }) {
+            IconButton(shapes = IconButtonDefaults.shapes(), onClick = { feedViewModel.refresh() }) {
                 Icon(Icons.Rounded.Refresh, contentDescription = str("feed_refresh"))
             }
         }
@@ -100,13 +110,13 @@ fun FeedScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Icon(Icons.Rounded.CloudOff, contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         Text(str("error_generic"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Button(onClick = { feedViewModel.refresh() }) {
+                        Button(shapes = ButtonDefaults.shapes(), onClick = { feedViewModel.refresh() }) {
                             Text(str("btn_retry"))
                         }
                     }
                 }
             }
-            feedViewModel.feedItems.isEmpty() -> {
+            feedItems.isEmpty() -> {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Icon(Icons.Rounded.DynamicFeed, contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -121,8 +131,8 @@ fun FeedScreen(
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    items(feedViewModel.feedItems.size) { index ->
-                        val item = feedViewModel.feedItems[index]
+                    items(feedItems.size) { index ->
+                        val item = feedItems[index]
                         FeedItem(
                             item = item,
                             playerViewModel = playerViewModel,
@@ -321,17 +331,6 @@ private fun TrackFeedItem(
                     }
                 }
 
-                // Options button
-                IconButton(
-                    onClick = onRightClick,
-                    modifier = Modifier.size(36.dp),
-                ) {
-                    Icon(
-                        Icons.Rounded.MoreVert,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             }
 
             // Posted time (if not a repost, show post date at the bottom)
@@ -458,16 +457,6 @@ private fun PlaylistFeedItem(
                     }
                 }
 
-                IconButton(
-                    onClick = onRightClick,
-                    modifier = Modifier.size(36.dp),
-                ) {
-                    Icon(
-                        Icons.Rounded.MoreVert,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             }
 
             if (!isRepost) {
@@ -495,13 +484,9 @@ private fun ReposterRow(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         modifier = Modifier.clickable(onClick = onClick),
     ) {
-        AsyncImage(
-            model = reposter.avatarUrl,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .size(20.dp)
-                .clip(CircleShape),
+        com.alananasss.kittytune.ui.common.UserAvatar(
+            url = reposter.avatarUrl,
+            modifier = Modifier.size(20.dp),
         )
         Icon(
             Icons.Rounded.Repeat,

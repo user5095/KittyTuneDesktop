@@ -3,8 +3,10 @@ package com.alananasss.kittytune.ui.profile
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -13,13 +15,11 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.QueueMusic
+import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.automirrored.outlined.QueueMusic
 import androidx.compose.material.icons.automirrored.rounded.TextSnippet
-import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import com.alananasss.kittytune.ui.theme.Switch
@@ -30,12 +30,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import com.alananasss.kittytune.core.str
@@ -43,6 +45,7 @@ import com.alananasss.kittytune.data.local.PlayerBarStyle
 import com.alananasss.kittytune.ui.common.settingHighlight
 import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.data.local.PlayerSliderStyle
+import com.alananasss.kittytune.ui.common.ExpressiveConnectedButtonGroup
 import com.alananasss.kittytune.ui.common.ScrollableColumn
 import com.alananasss.kittytune.ui.common.SettingsGroupTitle
 import com.alananasss.kittytune.ui.common.SettingsItem
@@ -51,6 +54,7 @@ import com.alananasss.kittytune.ui.common.Slider
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.ui.player.slider.PlayerSlider
 import kotlin.math.roundToInt
+import androidx.compose.material3.ButtonDefaults
 
 /**
  * Dedicated Player Design Screen (issue #56).
@@ -77,7 +81,7 @@ fun PlayerDesignScreen(
             contentPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Box(Modifier.fillMaxWidth().widthIn(max = 860.dp)) { PlayerDesignContent() }
+            Box(Modifier.fillMaxWidth().widthIn(max = 860.dp)) { PlayerDesignContent(playerViewModel = playerViewModel) }
             Spacer(Modifier.height(40.dp))
         }
     }
@@ -85,7 +89,10 @@ fun PlayerDesignScreen(
 
 /** The player's shape, sliders, bar buttons and scroll step; shared by its own screen and the settings page. */
 @Composable
-fun PlayerDesignContent(modifier: Modifier = Modifier) {
+fun PlayerDesignContent(
+    modifier: Modifier = Modifier,
+    playerViewModel: PlayerViewModel? = null
+) {
     val prefs = remember { PlayerPreferences() }
 
     var playerBarStyle by remember { mutableStateOf(prefs.getPlayerBarStyle()) }
@@ -97,6 +104,13 @@ fun PlayerDesignContent(modifier: Modifier = Modifier) {
     var seekWheelSeconds by remember { mutableFloatStateOf(prefs.getSeekWheelSeconds()) }
     var showRemainingTime by remember { mutableStateOf(prefs.getShowRemainingTime()) }
     var fullPlayerSourceEnabled by remember { mutableStateOf(prefs.getFullPlayerSourceIndicatorEnabled()) }
+    var localScreensaverEnabled by remember { mutableStateOf(prefs.getFullPlayerScreensaverEnabled()) }
+    var localScreensaverTimeout by remember { mutableIntStateOf(prefs.getFullPlayerScreensaverTimeout()) }
+    var fullPlayerCoverFeather by remember { mutableStateOf(playerViewModel?.fullPlayerCoverFeather ?: prefs.getFullPlayerCoverFeather()) }
+    var fullPlayerCoverFeatherAmount by remember { mutableFloatStateOf(playerViewModel?.fullPlayerCoverFeatherAmount ?: prefs.getFullPlayerCoverFeatherAmount()) }
+
+    val currentScreensaverEnabled = playerViewModel?.fullPlayerScreensaverEnabled ?: localScreensaverEnabled
+    val currentScreensaverTimeout = playerViewModel?.fullPlayerScreensaverTimeoutSeconds ?: localScreensaverTimeout
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -168,14 +182,58 @@ fun PlayerDesignContent(modifier: Modifier = Modifier) {
             }
         )
 
-        // 5. Source audio en plein écran (Audio source badge)
-        TrackSourceSection(
-            enabled = fullPlayerSourceEnabled,
-            onEnabledChange = {
-                fullPlayerSourceEnabled = it
-                prefs.setFullPlayerSourceIndicatorEnabled(it)
-            }
-        )
+        // 5. Options plein écran (Source audio & Écran de veille)
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            TrackSourceSection(
+                shape = RoundedCornerShape(
+                    topStart = 24.dp,
+                    topEnd = 24.dp,
+                    bottomStart = 4.dp,
+                    bottomEnd = 4.dp
+                ),
+                enabled = fullPlayerSourceEnabled,
+                onEnabledChange = {
+                    fullPlayerSourceEnabled = it
+                    prefs.setFullPlayerSourceIndicatorEnabled(it)
+                }
+            )
+
+            ScreensaverSection(
+                topRadius = 4.dp,
+                enabled = currentScreensaverEnabled,
+                onEnabledChange = { enabled ->
+                    localScreensaverEnabled = enabled
+                    playerViewModel?.updateFullPlayerScreensaverEnabled(enabled) ?: prefs.setFullPlayerScreensaverEnabled(enabled)
+                },
+                timeoutSeconds = currentScreensaverTimeout,
+                onTimeoutChange = { timeout ->
+                    localScreensaverTimeout = timeout
+                    playerViewModel?.updateFullPlayerScreensaverTimeout(timeout) ?: prefs.setFullPlayerScreensaverTimeout(timeout)
+                }
+            )
+
+            CoverFeatherSection(
+                shape = RoundedCornerShape(
+                    topStart = 4.dp,
+                    topEnd = 4.dp,
+                    bottomStart = 24.dp,
+                    bottomEnd = 24.dp
+                ),
+                enabled = fullPlayerCoverFeather,
+                onEnabledChange = { enabled ->
+                    fullPlayerCoverFeather = enabled
+                    playerViewModel?.updateFullPlayerCoverFeather(enabled) ?: prefs.setFullPlayerCoverFeather(enabled)
+                },
+                amount = fullPlayerCoverFeatherAmount,
+                onAmountChange = { amount ->
+                    fullPlayerCoverFeatherAmount = amount
+                    playerViewModel?.updateFullPlayerCoverFeatherAmount(amount) ?: prefs.setFullPlayerCoverFeatherAmount(amount)
+                }
+            )
+        }
     }
 }
 
@@ -571,7 +629,7 @@ private fun PlayerButtonsSection(
             key = PlayerPreferences.PLAYER_BAR_BUTTON_LIKE,
             label = str("player_button_like"),
             desc = str("player_button_like_desc"),
-            mark = rememberVectorPainter(Icons.Filled.Favorite),
+            mark = rememberVectorPainter(Icons.Rounded.Favorite),
             enabled = PlayerPreferences.PLAYER_BAR_BUTTON_LIKE in visibleButtons
         ),
         ButtonConfigItem(
@@ -590,31 +648,45 @@ private fun PlayerButtonsSection(
             enabled = PlayerPreferences.PLAYER_BAR_BUTTON_MINIPLAYER in visibleButtons
         ),
         ButtonConfigItem(
+            key = PlayerPreferences.PLAYER_BAR_BUTTON_PET,
+            label = str("pet_settings_title"),
+            desc = str("pet_desk_bar_button_desc"),
+            mark = rememberVectorPainter(Icons.Rounded.Pets),
+            enabled = PlayerPreferences.PLAYER_BAR_BUTTON_PET in visibleButtons
+        ),
+        ButtonConfigItem(
             key = PlayerPreferences.PLAYER_BAR_BUTTON_PANEL,
             label = str("player_button_panel"),
             desc = str("player_button_panel_desc"),
-            mark = rememberVectorPainter(Icons.Outlined.Tune),
+            mark = rememberVectorPainter(Icons.Rounded.ViewSidebar),
             enabled = PlayerPreferences.PLAYER_BAR_BUTTON_PANEL in visibleButtons
         ),
         ButtonConfigItem(
             key = PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE,
             label = str("player_button_queue"),
             desc = str("player_button_queue_desc"),
-            mark = rememberVectorPainter(Icons.Outlined.QueueMusic),
+            mark = rememberVectorPainter(Icons.AutoMirrored.Rounded.QueueMusic),
             enabled = PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE in visibleButtons
+        ),
+        ButtonConfigItem(
+            key = PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES,
+            label = str("player_button_devices"),
+            desc = str("player_button_devices_desc"),
+            mark = rememberVectorPainter(Icons.Rounded.Devices),
+            enabled = PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES in visibleButtons
         ),
         ButtonConfigItem(
             key = PlayerPreferences.PLAYER_BAR_BUTTON_SHUFFLE,
             label = str("player_button_shuffle"),
             desc = str("player_button_shuffle_desc"),
-            mark = rememberVectorPainter(Icons.Filled.Shuffle),
+            mark = rememberVectorPainter(Icons.Rounded.Shuffle),
             enabled = PlayerPreferences.PLAYER_BAR_BUTTON_SHUFFLE in visibleButtons
         ),
         ButtonConfigItem(
             key = PlayerPreferences.PLAYER_BAR_BUTTON_REPEAT,
             label = str("player_button_repeat"),
             desc = str("player_button_repeat_desc"),
-            mark = rememberVectorPainter(Icons.Filled.Repeat),
+            mark = rememberVectorPainter(Icons.Rounded.Repeat),
             enabled = PlayerPreferences.PLAYER_BAR_BUTTON_REPEAT in visibleButtons
         ),
     )
@@ -759,9 +831,10 @@ private fun PlayerAdvancedSection(
 private fun TrackSourceSection(
     enabled: Boolean,
     onEnabledChange: (Boolean) -> Unit,
+    shape: Shape = RoundedCornerShape(24.dp),
 ) {
     SettingsItem(
-        shape = RoundedCornerShape(24.dp),
+        shape = shape,
         title = str("pref_full_player_source_title"),
         subtitle = str("pref_full_player_source_desc"),
         icon = Icons.Rounded.GraphicEq,
@@ -772,22 +845,238 @@ private fun TrackSourceSection(
     )
 }
 
-/** Screensaver toggle — dims the full-screen player after a period of inactivity. */
+/** Screensaver toggle and inactivity delay slider — dims the full-screen player after a period of inactivity. */
 @Composable
 private fun ScreensaverSection(
     enabled: Boolean,
     onEnabledChange: (Boolean) -> Unit,
+    timeoutSeconds: Int,
+    onTimeoutChange: (Int) -> Unit,
+    topRadius: Dp = 24.dp,
 ) {
-    SettingsItem(
-        shape = RoundedCornerShape(24.dp),
-        title = str("pref_screensaver_title"),
-        subtitle = str("pref_screensaver_desc"),
-        icon = Icons.Rounded.DarkMode,
-        hasSwitch = true,
-        switchState = enabled,
-        onSwitchChange = onEnabledChange,
-        highlightKey = "pref_screensaver"
+    // Preset steps for inactivity timeout (in seconds): 15s, 30s, 45s, 60s (1m), 90s, 120s (2m), 180s (3m), 300s (5m)
+    val steps = remember { listOf(15, 30, 45, 60, 90, 120, 180, 300) }
+    val presetOptions = remember { listOf(30, 60, 120, 300) }
+
+    fun formatDuration(sec: Int): String = when {
+        sec < 60 -> "${sec}s"
+        sec % 60 == 0 -> "${sec / 60} min"
+        else -> "${sec / 60}m ${sec % 60}s"
+    }
+
+    fun formatSubtitle(sec: Int): String {
+        val formatted = formatDuration(sec)
+        val template = str("pref_screensaver_desc")
+        val regex = Regex("""60\s*(s|sec|сек|с|mp|giây)?""", RegexOption.IGNORE_CASE)
+        return if (regex.containsMatchIn(template)) {
+            template.replace(regex, formatted)
+        } else {
+            "$template ($formatted)"
+        }
+    }
+
+    val bottomRadius = 4.dp
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        SettingsItem(
+            shape = RoundedCornerShape(
+                topStart = topRadius,
+                topEnd = topRadius,
+                bottomStart = bottomRadius,
+                bottomEnd = bottomRadius
+            ),
+            title = str("pref_screensaver_title"),
+            subtitle = if (enabled) formatSubtitle(timeoutSeconds) else str("pref_screensaver_desc"),
+            icon = Icons.Rounded.DarkMode,
+            hasSwitch = true,
+            switchState = enabled,
+            onSwitchChange = onEnabledChange,
+            highlightKey = "pref_screensaver"
+        )
+
+        AnimatedVisibility(
+            visible = enabled,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = str("screensaver_timeout_title"),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer
+                        ) {
+                            Text(
+                                text = formatDuration(timeoutSeconds),
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    // Connected button group for preset options (30s, 1 min, 2 min, 5 min)
+                    ExpressiveConnectedButtonGroup(
+                        options = presetOptions,
+                        selectedOption = if (timeoutSeconds in presetOptions) timeoutSeconds else null,
+                        onOptionSelected = { chosen ->
+                            onTimeoutChange(chosen)
+                        },
+                        fillMaxWidth = true,
+                        labelProvider = { sec ->
+                            Text(
+                                text = formatDuration(sec),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = if (timeoutSeconds == sec) FontWeight.Bold else FontWeight.Medium,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
+                    )
+
+                    // Discrete slider for fine-grained adjustment
+                    val currentStepIndex = remember(timeoutSeconds, steps) {
+                        val idx = steps.indexOf(timeoutSeconds)
+                        if (idx >= 0) idx.toFloat()
+                        else {
+                            steps.indices.minByOrNull { kotlin.math.abs(steps[it] - timeoutSeconds) }?.toFloat() ?: 3f
+                        }
+                    }
+
+                    var sliderPos by remember(currentStepIndex) { mutableFloatStateOf(currentStepIndex) }
+                    LaunchedEffect(currentStepIndex) {
+                        sliderPos = currentStepIndex
+                    }
+
+                    Slider(
+                        value = sliderPos,
+                        onValueChange = { newPos ->
+                            sliderPos = newPos
+                            val snappedIndex = newPos.roundToInt().coerceIn(0, steps.lastIndex)
+                            val targetTimeout = steps[snappedIndex]
+                            if (targetTimeout != timeoutSeconds) {
+                                onTimeoutChange(targetTimeout)
+                            }
+                        },
+                        valueRange = 0f..(steps.lastIndex).toFloat(),
+                        steps = steps.size - 2,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoverFeatherSection(
+    shape: Shape,
+    enabled: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+    amount: Float,
+    onAmountChange: (Float) -> Unit,
+) {
+    val bottomRadius by animateDpAsState(
+        targetValue = if (enabled) 4.dp else 24.dp,
+        label = "CoverFeatherCornerAnimation"
     )
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        SettingsItem(
+            shape = RoundedCornerShape(
+                topStart = 4.dp,
+                topEnd = 4.dp,
+                bottomStart = bottomRadius,
+                bottomEnd = bottomRadius
+            ),
+            title = str("full_player_cover_feather"),
+            subtitle = str("full_player_cover_feather_desc"),
+            icon = Icons.Rounded.BlurOn,
+            hasSwitch = true,
+            switchState = enabled,
+            onSwitchChange = onEnabledChange,
+            highlightKey = "full_player_cover_feather"
+        )
+
+        AnimatedVisibility(
+            visible = enabled,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(
+                    topStart = 4.dp,
+                    topEnd = 4.dp,
+                    bottomStart = 24.dp,
+                    bottomEnd = 24.dp
+                ),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = str("full_player_cover_feather_amount"),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer
+                        ) {
+                            Text(
+                                text = "${(amount * 100).roundToInt()}%",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Slider(
+                        value = amount,
+                        onValueChange = onAmountChange,
+                        valueRange = 0f..1f,
+                        steps = 19,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
+    }
 }
 
 private fun sliderStyleKey(style: PlayerSliderStyle): String = when (style) {
@@ -889,7 +1178,9 @@ private fun menuTileIcon(id: String): ImageVector = when (id) {
     "go_artist" -> Icons.Rounded.Person
     "edit_track" -> Icons.Rounded.Edit
     "track_radio" -> Icons.Rounded.Radio
-    "share" -> Icons.Rounded.Share
+    "share" -> Icons.Rounded.Link
+    "block_track" -> Icons.Rounded.VisibilityOff
+    "block_artist" -> Icons.Rounded.PersonOff
     "remove_from_playlist" -> Icons.Rounded.RemoveCircleOutline
     "sleep_timer" -> Icons.Rounded.Bedtime
     "trim" -> Icons.Rounded.ContentCut
@@ -926,7 +1217,7 @@ internal fun MenuTilesSection(title: String, menu: String, catalogue: List<com.a
                     Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                     Text(str("menu_tiles_desc"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                TextButton(onClick = {
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = {
                     prefs.resetMenuTiles(menu)
                     hidden = emptySet()
                 }) { Text(str("menu_tiles_reset")) }
@@ -969,7 +1260,7 @@ private fun FloatingBarSection() {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(str("floating_bar_title"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                TextButton(onClick = { update(com.alananasss.kittytune.data.local.FloatingBarLook.DEFAULT) }) { Text(str("btn_reset")) }
+                TextButton(shapes = ButtonDefaults.shapes(), onClick = { update(com.alananasss.kittytune.data.local.FloatingBarLook.DEFAULT) }) { Text(str("btn_reset")) }
             }
             // A live miniature of the bar with the chosen corner and width.
             Box(Modifier.fillMaxWidth().height(56.dp).clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.surfaceContainerLowest), contentAlignment = Alignment.Center) {

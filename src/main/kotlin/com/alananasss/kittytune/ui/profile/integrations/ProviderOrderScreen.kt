@@ -32,6 +32,8 @@ import com.alananasss.kittytune.ui.common.SettingsSwitch
 import androidx.compose.ui.draw.alpha
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 
 @Composable
 fun ProviderOrderScreen(
@@ -186,7 +188,7 @@ fun ProviderOrderScreen(
                             Spacer(modifier = Modifier.width(8.dp))
 
                             // Quick Move Up/Down buttons for desktop mouse convenience
-                            IconButton(
+                            IconButton(shapes = IconButtonDefaults.shapes(),
                                 onClick = { moveItem(index, index - 1) },
                                 enabled = index > 0,
                                 modifier = Modifier.size(32.dp)
@@ -198,7 +200,7 @@ fun ProviderOrderScreen(
                                     modifier = Modifier.size(18.dp)
                                 )
                             }
-                            IconButton(
+                            IconButton(shapes = IconButtonDefaults.shapes(),
                                 onClick = { moveItem(index, index + 1) },
                                 enabled = index < currentList.lastIndex,
                                 modifier = Modifier.size(32.dp)
@@ -233,7 +235,7 @@ fun ProviderOrderScreen(
                 modifier = Modifier.padding(top = 12.dp)
             )
 
-            TextButton(
+            TextButton(shapes = ButtonDefaults.shapes(),
                 onClick = {
                     currentList.clear()
                     currentList.addAll(AudioProviderOrder.Default)

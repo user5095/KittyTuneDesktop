@@ -80,12 +80,14 @@ fun FloatingMenuWindow(
         size = DpSize(windowWidth, windowHeight),
     )
     val latestOnDismiss by rememberUpdatedState(onDismiss)
+    // Opaque where a transparent window froze the app (RTSS); see FloatingWindowCompat.
+    val compat = remember { com.alananasss.kittytune.core.FloatingWindowCompat.opaque }
 
     Window(
         onCloseRequest = onDismiss,
         state = windowState,
         undecorated = true,
-        transparent = true,
+        transparent = !compat,
         // Never takes focus on Windows. Taking it closed the shell's own hidden-icons flyout the menu was
         // opened from, the moment the menu appeared. Outside clicks close the menu instead, so it needs
         // no focus; Linux keeps focus, which is what closes it there.
@@ -102,7 +104,13 @@ fun FloatingMenuWindow(
             }
         },
     ) {
-        runCatching { window.background = java.awt.Color(0, 0, 0, 0) }
+        if (compat) {
+            // The card's 16 dp corners, inside the shadow margin, cut by the window's shape.
+            DisposableEffect(window) {
+                val remove = com.alananasss.kittytune.core.FloatingWindowCompat.keepRoundedShape(window, inset = SHADOW_PAD.value.toDouble()) { 16.0 }
+                onDispose { remove() }
+            }
+        }
 
         // A tool window, so the menu never flashes a taskbar button of its own. On Linux it takes focus so
         // that Escape reaches it and focus loss can close it.
@@ -130,16 +138,21 @@ fun FloatingMenuWindow(
             }
         }
 
-        KittyTuneTheme {
-            Box(Modifier.fillMaxSize().padding(SHADOW_PAD)) {
-                Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainer,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)),
-                    shadowElevation = 8.dp,
-                    modifier = Modifier.fillMaxSize(),
-                ) {
-                    Column(Modifier.fillMaxSize().padding(6.dp), content = content)
+        val windowSeen = com.alananasss.kittytune.core.rememberWindowSeen(window)
+        androidx.compose.runtime.CompositionLocalProvider(
+            com.alananasss.kittytune.core.LocalWindowSeen provides windowSeen,
+        ) {
+            KittyTuneTheme {
+                Box(Modifier.fillMaxSize().padding(SHADOW_PAD)) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)),
+                        shadowElevation = 8.dp,
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        Column(Modifier.fillMaxSize().padding(6.dp), content = content)
+                    }
                 }
             }
         }

@@ -7,8 +7,8 @@ kotlin {
     jvmToolchain(21)
 }
 
-val ktorVersion = "3.6.0"
-val serializationVersion = "1.7.1"
+val ktorVersion = "3.6.1"
+val serializationVersion = "1.13.0"
 val coroutinesVersion = "1.11.0"
 
 dependencies {

@@ -46,7 +46,7 @@ class CreditsRepositoryTest {
         assertTrue(withAvatar.isNotEmpty())
         withAvatar.forEach {
             assertTrue(
-                it.endsWith(".png"),
+                it.substringBefore('?').endsWith(".png"),
                 "A GitHub avatar is the login plus .png: $it",
             )
         }
@@ -71,7 +71,7 @@ class CreditsRepositoryTest {
 
     @Test
     fun testEveryRoleHasATranslatedDescriptionInEveryLanguage() {
-        val languages = listOf("en", "fr", "de", "hu", "ru", "vi")
+        val languages = listOf("en", "fr", "de", "hu", "ru", "vi", "tr")
         val keys = all.flatMap { listOf(it.roleResKey, it.descriptionResKey) }.distinct()
 
         val previous = Strings.appLanguage

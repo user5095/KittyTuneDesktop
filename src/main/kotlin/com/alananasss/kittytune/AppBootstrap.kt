@@ -1,5 +1,6 @@
 package com.alananasss.kittytune
 
+import com.alananasss.kittytune.core.AppDirs
 import com.alananasss.kittytune.core.NetworkMonitor
 import com.alananasss.kittytune.core.Strings
 import com.alananasss.kittytune.data.AlbumResolver
@@ -11,10 +12,17 @@ import com.alananasss.kittytune.data.MusicManager
 import com.alananasss.kittytune.data.RecognitionHistoryRepository
 import com.alananasss.kittytune.data.RepostRepository
 import com.alananasss.kittytune.data.SessionManager
+import com.alananasss.kittytune.data.cache.AudioCache
 import com.alananasss.kittytune.data.local.AppDatabase
 import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.utils.Config
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * One-shot application bootstrap — the desktop equivalent of the init sequence that
@@ -26,10 +34,39 @@ object AppBootstrap {
     @Volatile
     private var done = false
 
+    /**
+     * A single supervised scope for the bootstrap's long-running coroutines (sync reconcile,
+     * client_id scrape, native memory trim). The previous code created three separate
+     * `CoroutineScope(Dispatchers.X).launch { ... }` with no stored reference — the scopes
+     * were unparented and the launched coroutines had no parent job, making them impossible to
+     * cancel and structurally unstructured. This scope is owned by the singleton, so the
+     * coroutines are properly parented and the whole group can be cancelled if ever needed.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Set to true when the main window is visible, false when it's hidden/minimised. The native
+     * memory trim loop reads this to skip work while the app is in the tray — paying 15-second
+     * native trim cycles on an idle hidden app is wasted CPU (audit issue).
+     */
+    @Volatile
+    var windowVisible: Boolean = true
+
     @OptIn(androidx.compose.ui.InternalComposeUiApi::class)
-    fun init() {
+    fun init(trainStartupCache: Boolean = false) {
         if (done) return
         done = true
+
+        // Initialize native memory allocator (M_ARENA_MAX=2 on Linux to eliminate 96-arena multi-gigabyte bloat)
+        com.alananasss.kittytune.utils.NativeMemoryManager.init()
+
+        // Cap JavaCPP off-heap memory to 64MB so FFmpeg/native decoders release frame buffers promptly
+        System.setProperty("org.bytedeco.javacpp.maxbytes", "67108864")
+        // Prevent JavaCPP from falsely throwing OutOfMemoryError when host physical memory > 8GB
+        System.setProperty("org.bytedeco.javacpp.maxphysicalbytes", "0")
+
+        // ONNX Runtime is loaded by the first model that runs (AI detection, karaoke), not here.
+        com.alananasss.kittytune.core.LinuxAppIdHelper.apply()
 
         runCatching {
             androidx.compose.ui.platform.registerSkikoComposeImplementation()
@@ -78,7 +115,49 @@ object AppBootstrap {
 
         // 1. Core config + persistence.
         Config.init()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: Config.init")
         AppDatabase.init()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: AppDatabase.init")
+
+        // 1c. Cache sweep: drop leftover partial/temp files from a previous run, prune stale
+        //     lyrics JSON, and pull the audio cache back under its byte bound. Each step is
+        //     wrapped in its own runCatching so a failure in one (a locked file, a half-deleted
+        //     dir) does not stop the others — startup is the cheapest moment to do this work,
+        //     since nothing is reading these files yet (issue #5-DB).
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                // .part files: a download (audio cache, demucs remux, etc.) killed mid-write
+                // leaves these behind. They are never servable and only confuse the decoder.
+                runCatching {
+                    AppDirs.audioCacheDir.listFiles { f -> f.isFile && f.extension == "part" }
+                        ?.forEach { runCatching { it.delete() } }
+                }
+                // temp_* / tagged_* scratch files from the recognition + tagger pipelines.
+                runCatching {
+                    AppDirs.audioCacheDir.listFiles { f ->
+                        f.isFile && (f.name.startsWith("temp_") || f.name.startsWith("tagged_"))
+                    }?.forEach { runCatching { it.delete() } }
+                }
+                // demucs_tmp_* directories: the source-separation worker leaves these on crash.
+                runCatching {
+                    AppDirs.cacheDir.listFiles { f -> f.isDirectory && f.name.startsWith("demucs_tmp_") }
+                        ?.forEach { runCatching { it.deleteRecursively() } }
+                }
+                // Lyrics cache: one .json per track ever played. Prune files older than 90 days,
+                // which matches the in-memory found-entry TTL in LyricsCache.
+                runCatching {
+                    val lyricsDir = File(AppDirs.cacheDir, "lyrics")
+                    val cutoff = System.currentTimeMillis() - 90L * 24 * 60 * 60 * 1000
+                    lyricsDir.listFiles { f -> f.isFile && f.extension == "json" }
+                        ?.filter { it.lastModified() < cutoff }
+                        ?.forEach { runCatching { it.delete() } }
+                }
+                // AudioCache already drops .part files in its own init, but only inside the
+                // tracks/ subdir. Run trim() here too so the cache is bounded if it drifted
+                // over the limit while the app was closed.
+                runCatching { AudioCache.trim() }
+            }
+        }
 
         // 1b. Network Proxy (applies system properties and OkHttp hooks)
         com.alananasss.kittytune.data.network.ProxyManager.applyConfiguration()
@@ -86,15 +165,29 @@ object AppBootstrap {
         // 2. Language (mirrors KittyTuneApp locale setup).
         Strings.appLanguage = PlayerPreferences().getAppLanguage().code
 
+        // A first launch gets protected tracks from the DRM settings and the assistant like everything else; the
+        // "they are here" card is for people updating from a version without them. Decided before the setup
+        // screens run, since finishing them is what marks the install as no longer new.
+        PlayerPreferences().let { prefs ->
+            if (!prefs.getHasCompletedSetup() && !prefs.getProtectedTracksAnnounced()) prefs.setProtectedTracksAnnounced(true)
+        }
+
         // 3. Repositories (all global singletons, like the Android objects).
         com.alananasss.kittytune.data.ytmusic.YtmSession.init()
         LikeRepository.init()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: LikeRepository.init")
         HistoryRepository.init()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: HistoryRepository.init")
         ListeningStatsRepository.init()
         RepostRepository.init()
         RecognitionHistoryRepository.init()
         DownloadManager.init()
         AlbumResolver.init()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: remaining repositories")
+
+        // The Kitty pet follows playback from the start (it gets hungry, sad, sleepy on its own),
+        // whether or not its window is shown.
+        com.alananasss.kittytune.ui.pet.PetState.start()
 
         // The sync listener. It opens a port on the local network, so it stays off until there is a
         // reason for it — which is a device having been paired. Pairing turns it on; an install that
@@ -109,14 +202,16 @@ object AppBootstrap {
             // Anything the log holds that the statistics table is missing goes back in. The marks advance
             // when events are merged, not when their rows land, so a failed or cancelled insert used to lose
             // listens the peer would never send again (issue #33).
-            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            scope.launch {
                 com.alananasss.kittytune.data.sync.SyncApply.reconcile()
             }
         }
 
         // 4. Player + session keep-alive.
         MusicManager.init()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: MusicManager.init")
         SessionManager.start()
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: SessionManager.start")
 
         // 4a. YouTube Music two-way sync: shortly after launch, then whenever the last one is old enough.
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -129,16 +224,29 @@ object AppBootstrap {
 
         // 4b. Anonymous client_id: validate/scrape in background (replaces the ghost
         // WebView interception on Android). Guest mode depends on this.
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            com.alananasss.kittytune.data.ClientIdScraper.ensureClientId()
+        if (!trainStartupCache) {
+            scope.launch {
+                com.alananasss.kittytune.data.ClientIdScraper.ensureClientId()
+            }
+            NetworkMonitor.start()
         }
-
-        // 5. Connectivity watcher (replaces ConnectivityManager callback).
-        NetworkMonitor.start()
 
         // 6. End4 dotfiles Material You watcher (live color updates)
         if (com.alananasss.kittytune.data.theme.End4ThemeManager.isInstalled()) {
             com.alananasss.kittytune.data.theme.End4ThemeManager.startWatching()
         }
+
+        // 7. Periodic native memory cleanup (JavaCPP Pointer + Linux glibc arena trim).
+        // Skipped while the main window is hidden: paying 15-second native trim cycles on an
+        // idle hidden app is wasted CPU (audit issue). The loop checks [windowVisible] each tick
+        // so visibility changes take effect without restarting the loop.
+        scope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(15_000L)
+                if (!windowVisible) continue
+                com.alananasss.kittytune.utils.NativeMemoryManager.trim()
+            }
+        }
+        com.alananasss.kittytune.utils.StartupTimeline.mark("bootstrap: done")
     }
 }

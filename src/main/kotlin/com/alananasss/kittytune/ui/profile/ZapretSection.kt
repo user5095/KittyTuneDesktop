@@ -27,6 +27,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import androidx.compose.material3.ButtonDefaults
 
 /**
  * Zapret: where it is, which of the app's services get through without it, and adding the domains of the
@@ -77,7 +78,7 @@ fun ZapretSection() {
     }
 
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-        SettingsGroupTitle("Zapret")
+        SettingsGroupTitle(str("zapret_title"))
         Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Text(str("zapret_sub"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -96,7 +97,7 @@ fun ZapretSection() {
                             overflow = TextOverflow.MiddleEllipsis,
                         )
                     }
-                    TextButton(
+                    TextButton(shapes = ButtonDefaults.shapes(),
                         onClick = {
                             if (!isDetecting) {
                                 isDetecting = true
@@ -120,7 +121,7 @@ fun ZapretSection() {
                             Text(str("zapret_detect"))
                         }
                     }
-                    FilledTonalButton(onClick = { useFolder(pickFolder(str("zapret_folder"), folder)) }) {
+                    FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { useFolder(pickFolder(str("zapret_folder"), folder)) }) {
                         Text(str("zapret_choose"))
                     }
                 }
@@ -132,14 +133,14 @@ fun ZapretSection() {
 
                 // The services.
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = ::runCheck, enabled = !isChecking) {
+                    Button(shapes = ButtonDefaults.shapes(), onClick = ::runCheck, enabled = !isChecking) {
                         Icon(Icons.Rounded.NetworkCheck, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(str(if (isChecking) "zapret_checking" else "zapret_check"))
                     }
                     val blocked = checks.orEmpty().filter { it.reachability == Reachability.BLOCKED && !it.isCovered }
                     if (install != null && blocked.isNotEmpty()) {
-                        FilledTonalButton(onClick = { add(blocked.map { it.service }) }) {
+                        FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { add(blocked.map { it.service }) }) {
                             Text(str("zapret_add_blocked", blocked.size))
                         }
                     }
@@ -161,7 +162,7 @@ fun ZapretSection() {
                             Text(str("zapret_own_title"), style = MaterialTheme.typography.titleSmall)
                             Text(own.joinToString(", "), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                        TextButton(onClick = {
+                        TextButton(shapes = ButtonDefaults.shapes(), onClick = {
                             scope.launch {
                                 ZapretManager.removeOwnDomains()
                                 own = emptyList()
@@ -205,7 +206,7 @@ private fun ServiceRow(check: ServiceCheck, canAdd: Boolean, onAdd: () -> Unit) 
         Text(label, style = MaterialTheme.typography.labelMedium, color = color)
         if (canAdd && !check.isCovered && check.reachability == Reachability.BLOCKED) {
             Spacer(Modifier.width(4.dp))
-            TextButton(onClick = onAdd) { Text(str("zapret_add")) }
+            TextButton(shapes = ButtonDefaults.shapes(), onClick = onAdd) { Text(str("zapret_add")) }
         }
     }
 }

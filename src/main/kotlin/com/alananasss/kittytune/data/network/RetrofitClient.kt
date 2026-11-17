@@ -35,7 +35,7 @@ object RetrofitClient {
 
         val authInterceptor = Interceptor { chain ->
             val originalRequest = chain.request()
-            var token = SessionManager.harvestStoredSession() ?: tokenManager.getAccessToken()
+            var token = tokenManager.getAccessToken()
 
             if (!token.isNullOrEmpty() && !tokenManager.isGuestMode() && tokenManager.shouldRefreshAccessToken()) {
                 token = SessionManager.refreshSessionBlocking(
@@ -57,25 +57,18 @@ object RetrofitClient {
             }
 
             val deviceId = Config.getOrCreateSoundCloudDeviceId()
-            val buildVersion = "2025.12.10-release"
-            // Android Build.VERSION.RELEASE / MODEL are unavailable on desktop â€”
+            val buildVersion = "2026.11.02-release"
+            // Android Build.VERSION.RELEASE / MODEL are unavailable on desktop —
             // use stable values matching a generic device (the API only reads the UA loosely).
-            val customUserAgent = "SoundCloud/$buildVersion (Android 10; Android)"
+            val customUserAgent = "SoundCloud/$buildVersion (Android 14; Pixel 8)"
 
             val requestBuilder = originalRequest.newBuilder()
                 .url(newUrl)
                 .header("User-Agent", customUserAgent)
                 .header("Accept", "application/json")
                 .header("Accept-Language", com.alananasss.kittytune.core.Strings.getAcceptLanguage())
-                .header("App-Version", "330120")
+                .header("App-Version", "379060")
                 .header("UDID", deviceId)
-
-            // DataDome cookie (harvested separately) merged in if present.
-            SessionManager.getStoredDataDomeCookie()?.let { dd ->
-                val existing = originalRequest.header("Cookie")
-                val merged = if (existing.isNullOrBlank()) dd else "$existing; $dd"
-                requestBuilder.header("Cookie", merged)
-            }
 
             if (!token.isNullOrEmpty()) {
                 requestBuilder.header("Authorization", "OAuth $token")
@@ -129,7 +122,9 @@ object RetrofitClient {
             }
         }
 
-        val builder = OkHttpClient.Builder()
+        // Rooted on ProxyManager's shared client so the connection pool and dispatcher are the
+        // app's one pool; the cookie jar, interceptors and timeouts below stay this API's own.
+        val builder = ProxyManager.getOkHttpClient().newBuilder()
             .retryOnConnectionFailure(true)
             .cookieJar(CookieStore)
             .addInterceptor(authInterceptor)

@@ -1,6 +1,7 @@
 package com.alananasss.kittytune.data
 
 import com.alananasss.kittytune.core.NamedPrefs
+import com.alananasss.kittytune.data.local.ExternalPlaylists
 import com.alananasss.kittytune.data.network.PlaylistLikeItem
 import com.alananasss.kittytune.data.network.PlaylistLikeRequest
 import com.alananasss.kittytune.data.network.RetrofitClient
@@ -11,6 +12,7 @@ import com.alananasss.kittytune.domain.Track
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -26,8 +28,14 @@ import java.lang.reflect.Type
  * Desktop port of the Android LikeRepository.
  * SharedPreferences("soundtune_likes_v3") -> NamedPrefs; StringSet stored as a
  * separator-joined string. Same keys, same optimistic + blacklist sync semantics.
+ *
+ * The tracks themselves moved to the [com.alananasss.kittytune.data.local.LikeDao] table: the
+ * old single JSON string of the whole library sat resident in the preferences map for the
+ * process lifetime and was rebuilt on every save (RAM, issue #33). What stays in prefs is small
+ * by nature — playlist ids and the unlike blacklist — and is migrated away on first launch.
  */
 object LikeRepository {
+    /** Legacy: the whole library as one JSON string, before it moved to the [com.alananasss.kittytune.data.local.LikeDao] table. Kept only to migrate it away. */
     private const val KEY_LIKED_TRACKS = "liked_tracks_full"
     private const val KEY_LIKED_PLAYLISTS = "liked_playlists_ids"
     private const val KEY_LOCALLY_UNLIKED_IDS = "locally_unliked_ids"
@@ -38,10 +46,15 @@ object LikeRepository {
     private val gson = Gson()
     private var cachedUserId: Long? = null
 
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _likedTracks = MutableStateFlow<List<Track>>(emptyList())
     val likedTracks = _likedTracks.asStateFlow()
+
+    /** True once the library has been read from disk (an empty list before that means "unknown", not "none"). */
+    @Volatile
+    var isReady = false
+        private set
 
     private val _likedPlaylists = MutableStateFlow<Set<Long>>(emptySet())
     val likedPlaylists = _likedPlaylists.asStateFlow()
@@ -51,6 +64,7 @@ object LikeRepository {
 
     private val tokenManager = TokenManager
     private val playerPrefs = com.alananasss.kittytune.data.local.PlayerPreferences()
+    private val likeDao get() = com.alananasss.kittytune.data.local.AppDatabase.likeDao
 
     private fun getStringSet(key: String): Set<String> =
         prefs.getString(key, null)?.split(SET_SEP)?.filter { it.isNotEmpty() }?.toSet() ?: emptySet()
@@ -87,13 +101,22 @@ object LikeRepository {
     private fun writeUnlikeMarks(marks: Collection<UnlikeMark>) =
         putStringSet(KEY_LOCALLY_UNLIKED_IDS, marks.map { "${it.trackId}:${it.atMs}" }.toSet())
 
-    private fun addToBlacklist(trackId: Long) {
-        val kept = readUnlikeMarks().filterNot { it.trackId == trackId }
-        writeUnlikeMarks(kept + UnlikeMark(trackId, System.currentTimeMillis()))
+    private fun addToBlacklist(trackId: Long) = addToBlacklist(listOf(trackId))
+
+    private fun addToBlacklist(trackIds: Collection<Long>) {
+        if (trackIds.isEmpty()) return
+        val ids = trackIds.toSet()
+        val kept = readUnlikeMarks().filterNot { it.trackId in ids }
+        val now = System.currentTimeMillis()
+        writeUnlikeMarks(kept + ids.map { UnlikeMark(it, now) })
     }
 
-    private fun removeFromBlacklist(trackId: Long) {
-        writeUnlikeMarks(readUnlikeMarks().filterNot { it.trackId == trackId })
+    private fun removeFromBlacklist(trackId: Long) = removeFromBlacklist(listOf(trackId))
+
+    private fun removeFromBlacklist(trackIds: Collection<Long>) {
+        if (trackIds.isEmpty()) return
+        val ids = trackIds.toSet()
+        writeUnlikeMarks(readUnlikeMarks().filterNot { it.trackId in ids })
     }
 
     private fun getBlacklist(): Set<Long> {
@@ -121,21 +144,21 @@ object LikeRepository {
 
     fun init() {
         pruneBlacklist()
-        loadFromPrefs()
+        loadFromDb()
 
         scope.launch {
             com.alananasss.kittytune.data.sync.SyncLikes.seedMissing()
             com.alananasss.kittytune.data.sync.SyncLikes.seedMissingPlaylists()
         }
 
-        // Closes the coalescing window. Prefs has a hook of its own, but the order between shutdown
-        // hooks is undefined, so this forces the flush rather than hoping ours ran first.
+        // Closes the coalescing window: a burst of likes still in the 1 s delay would otherwise
+        // be lost to process exit. The database commit is already durable, so there is no
+        // second store left to flush behind this hook.
         Runtime.getRuntime().addShutdownHook(
             Thread {
                 if (pendingSave?.isActive == true) {
                     pendingSave?.cancel()
-                    saveToPrefs()
-                    com.alananasss.kittytune.core.Prefs.flush(force = true)
+                    kotlinx.coroutines.runBlocking { saveToDb() }
                 }
             }
         )
@@ -345,18 +368,26 @@ object LikeRepository {
 
     fun setLikedPlaylists(ids: Set<Long>) {
         val currentLiked = _likedPlaylists.value
-        val preservedLocalIds = try {
-            val dao = com.alananasss.kittytune.data.local.AppDatabase.downloadDao
-            val allLocal = kotlinx.coroutines.runBlocking { dao.getAllPlaylists().first() }
-            allLocal.filter { local ->
-                currentLiked.contains(local.id) && (local.permalinkUrl?.contains("spotify") == true || local.id < 0 || local.isDownloaded)
-            }.map { it.id }.toSet()
-        } catch (e: Exception) {
-            emptySet()
+        // Optimistic update: apply the server's set immediately so the UI reflects the change
+        // without waiting for a DB round-trip. The locally-preserved ids (downloaded / Spotify /
+        // user-created) are merged in asynchronously — they were the source of a runBlocking on
+        // the UI thread that froze playlist toggles (audit issue).
+        _likedPlaylists.value = ids
+        scope.launch {
+            val preservedLocalIds = try {
+                val dao = com.alananasss.kittytune.data.local.AppDatabase.downloadDao
+                val allLocal = dao.getAllPlaylists().first()
+                allLocal.filter { local ->
+                    currentLiked.contains(local.id) && (ExternalPlaylists.isExternalPermalink(local.permalinkUrl) || local.id < 0 || local.isDownloaded)
+                }.map { it.id }.toSet()
+            } catch (e: Exception) {
+                emptySet()
+            }
+            // Merge: only add preserved ids that aren't already in the set (avoids clobbering
+            // a concurrent change).
+            _likedPlaylists.update { current -> (current + preservedLocalIds) }
+            scheduleSave()
         }
-
-        _likedPlaylists.value = ids + preservedLocalIds
-        scheduleSave()
     }
 
     fun togglePlaylistLike(playlistId: Long, isLiked: Boolean, permalink: String? = null, urn: String? = null) {
@@ -366,14 +397,10 @@ object LikeRepository {
             DownloadManager.clearDeletedPlaylistId(playlistId)
         } else {
             current.remove(playlistId)
-            val isUserCreated = try {
-                val db = com.alananasss.kittytune.data.local.AppDatabase.downloadDao
-                val p = kotlinx.coroutines.runBlocking { db.getPlaylist(playlistId) }
-                p?.isUserCreated == true
-            } catch (_: Exception) { false }
-            if (!isUserCreated) {
-                DownloadManager.addDeletedPlaylistId(playlistId)
-            }
+            // Optimistic: mark as deleted now, revert if the DB check reveals it's user-created.
+            // The previous runBlocking here to read db.getPlaylist() froze the UI thread on every
+            // playlist unlike (audit issue).
+            DownloadManager.addDeletedPlaylistId(playlistId)
         }
         _likedPlaylists.value = current
         DownloadManager.notifyLibraryUpdated()
@@ -385,6 +412,11 @@ object LikeRepository {
                 try {
                     val dao = com.alananasss.kittytune.data.local.AppDatabase.downloadDao
                     val p = dao.getPlaylist(playlistId)
+                    if (p?.isUserCreated == true) {
+                        // User-created playlists are not marked as deleted: revert the optimistic
+                        // addDeletedPlaylistId above.
+                        DownloadManager.clearDeletedPlaylistId(playlistId)
+                    }
                     if (p != null && !p.isDownloaded && !p.isUserCreated) {
                         dao.deletePlaylist(playlistId)
                         dao.deletePlaylistRefs(playlistId)
@@ -396,10 +428,10 @@ object LikeRepository {
             }
 
             val safePermalink = permalink ?: ""
-            val isSpotify = safePermalink.contains("spotify.com") || safePermalink.contains("spotify:")
-                    || urn?.startsWith("spotify:") == true || (urn != null && urn.contains("spotify"))
-                    || playlistId == 0L
-            if (isSpotify) {
+            val isExternal = ExternalPlaylists.isExternalPermalink(safePermalink) ||
+                urn?.startsWith("spotify:") == true || (urn != null && urn.contains("spotify")) ||
+                playlistId == 0L
+            if (isExternal) {
                 return@launch
             }
 
@@ -521,7 +553,10 @@ object LikeRepository {
      */
     fun applyRemoteLikesBatch(tracks: List<Pair<Track, Long>>) {
         if (tracks.isEmpty()) return
-        tracks.forEach { removeFromBlacklist(it.first.id) }
+        // One prefs read+write for the whole batch: the per-track version rewrote the
+        // entire preferences file once per id, which is the write storm a big first
+        // sync showed in the profiler.
+        removeFromBlacklist(tracks.map { it.first.id })
         _likedTracks.update { current ->
             val trackMap = current.associateBy { it.id }.toMutableMap()
             val now = System.currentTimeMillis()
@@ -561,7 +596,7 @@ object LikeRepository {
      */
     fun applyRemoteUnlikesBatch(trackIds: Set<Long>) {
         if (trackIds.isEmpty()) return
-        trackIds.forEach { addToBlacklist(it) }
+        addToBlacklist(trackIds)
         _likedTracks.update { it.filterNot { t -> t.id in trackIds } }
         scheduleSave()
     }
@@ -576,13 +611,17 @@ object LikeRepository {
             DownloadManager.clearDeletedPlaylistId(playlistId)
         } else {
             current.remove(playlistId)
-            val isUserCreated = try {
-                val db = com.alananasss.kittytune.data.local.AppDatabase.downloadDao
-                val p = kotlinx.coroutines.runBlocking { db.getPlaylist(playlistId) }
-                p?.isUserCreated == true
-            } catch (_: Exception) { false }
-            if (!isUserCreated) {
-                DownloadManager.addDeletedPlaylistId(playlistId)
+            // Optimistic: mark as deleted, revert if the DB check reveals it's user-created.
+            // The previous runBlocking here froze the sync apply path (audit issue).
+            DownloadManager.addDeletedPlaylistId(playlistId)
+            scope.launch {
+                try {
+                    val db = com.alananasss.kittytune.data.local.AppDatabase.downloadDao
+                    val p = db.getPlaylist(playlistId)
+                    if (p?.isUserCreated == true) {
+                        DownloadManager.clearDeletedPlaylistId(playlistId)
+                    }
+                } catch (_: Exception) {}
             }
         }
         _likedPlaylists.value = current
@@ -595,6 +634,11 @@ object LikeRepository {
         _likedTracks.value = emptyList()
         _likedPlaylists.value = emptySet()
         _isSyncing.value = false
+        // The table goes with the session: a login that did not clear it would meet its likes
+        // again on the next launch, from a store nobody had written to since.
+        pendingSave?.cancel()
+        // Async: the previous runBlocking here blocked the calling thread on a DB transaction.
+        scope.launch { runCatching { likeDao.clear() } }
         prefs.remove(KEY_LIKED_TRACKS)
         prefs.remove(KEY_LIKED_PLAYLISTS)
         prefs.remove(KEY_LOCALLY_UNLIKED_IDS)
@@ -630,43 +674,87 @@ object LikeRepository {
         pendingSave?.cancel()
         pendingSave = scope.launch {
             delay(SAVE_COALESCE_MS)
-            saveToPrefs()
+            saveToDb()
         }
     }
 
-    private fun saveToPrefs() {
-        val json = gson.toJson(_likedTracks.value)
-        prefs.putString(KEY_LIKED_TRACKS, json)
+    /**
+     * Writes the liked list to the database, at most once per burst (issue #33).
+     *
+     * ## Why this is coalesced
+     *
+     * The save is a whole-library transaction: DELETE plus one INSERT per track. For a library of
+     * several thousand that is thousands of rows paid per burst, and [removeLike] used to pay for
+     * the whole-library serialisation on the caller's thread — so unliking from a list did a
+     * multi-megabyte write on the UI thread.
+     *
+     * Liking half a dozen tracks in a row therefore did the same library-sized write over and
+     * over in a few seconds. That is the shape of churn that turns into a collection pause, and a
+     * pause in the wrong place is the audio drop-out that was reported alongside the memory
+     * figures. Coalescing collapses a burst into one write of the final state, which is the only
+     * state anyone wanted written.
+     *
+     * The window is short and the shutdown hook closes it, so nothing is lost by waiting; a like is
+     * also already on its way to the server, which is where the next launch reads it from anyway.
+     */
+    private suspend fun saveToDb() {
+        runCatching { likeDao.replaceAll(_likedTracks.value) }
+            .onFailure { e ->
+                e.printStackTrace()
+            }
         putStringSet(KEY_LIKED_PLAYLISTS, _likedPlaylists.value.map { it.toString() }.toSet())
     }
 
     /** Long enough to swallow a run of likes, short enough that nobody could close the app inside it. */
     private const val SAVE_COALESCE_MS = 1_000L
 
-    private fun loadFromPrefs() {
-        val json = prefs.getString(KEY_LIKED_TRACKS, null)
-        if (json != null) {
-            try {
+    private fun loadFromDb() {
+        // One-time migration. The library used to be one JSON string in the preferences map; it
+        // moves to the table here and the prefs key goes, because leaving it would keep the
+        // several-megabyte string resident in that map for the whole process (RAM, issue #33).
+        val legacyJson = prefs.getString(KEY_LIKED_TRACKS, null)
+        if (legacyJson != null) {
+            // Migration path: parse the legacy JSON synchronously (it's already in memory, same
+            // cost as the old load), populate the StateFlow immediately so the UI paints, and
+            // write to the DB asynchronously — the previous runBlocking here on likeDao.replaceAll
+            // blocked the startup thread for thousands of inserts.
+            val parsed: List<Track> = try {
                 val type: Type = object : TypeToken<List<Track>>() {}.type
-                val loadedList: List<Track> = gson.fromJson(json, type) ?: emptyList()
-
-                val now = System.currentTimeMillis()
-                val maxAllowedTime = now + 86_400_000L
-                val migratedList = loadedList.mapIndexed { index, track ->
-                    val validLikedAt = track.likedAt?.takeIf { it in 1..maxAllowedTime }
-                    if (validLikedAt == null) {
-                        track.copy(likedAt = now - (index * 1000))
-                    } else {
-                        track.copy(likedAt = validLikedAt)
-                    }
-                }
-
-                val blacklist = getBlacklist()
-                _likedTracks.value = migratedList.filter { !blacklist.contains(it.id) }
+                gson.fromJson(legacyJson, type) ?: emptyList()
             } catch (e: Exception) {
-                _likedTracks.value = emptyList()
+                emptyList()
+            }
+            prefs.remove(KEY_LIKED_TRACKS)
+            scope.launch { runCatching { likeDao.replaceAll(parsed) } }
+            populateFromLoaded(parsed)
+        } else {
+            // Normal path: load from the DB asynchronously. The previous runBlocking here on
+            // likeDao.loadAll() blocked the startup thread for the whole library read — the
+            // single biggest startup freeze on large libraries (audit issue). The UI paints an
+            // empty library first, then populates once the DB read completes (typically <50 ms).
+            scope.launch {
+                val loaded = runCatching { likeDao.loadAll() }.getOrDefault(emptyList())
+                populateFromLoaded(loaded)
             }
         }
+    }
+
+    /** Applies the loaded list to [_likedTracks], normalising likedAt and filtering the blacklist. */
+    private fun populateFromLoaded(loaded: List<Track>) {
+        val now = System.currentTimeMillis()
+        val maxAllowedTime = now + 86_400_000L
+        val migratedList = loaded.mapIndexed { index, track ->
+            val validLikedAt = track.likedAt?.takeIf { it in 1..maxAllowedTime }
+            if (validLikedAt == null) {
+                track.copy(likedAt = now - (index * 1000))
+            } else {
+                track.copy(likedAt = validLikedAt)
+            }
+        }
+
+        val blacklist = getBlacklist()
+        _likedTracks.value = migratedList.filter { !blacklist.contains(it.id) }
+        isReady = true
 
         val savedPlaylistIds = getStringSet(KEY_LIKED_PLAYLISTS).mapNotNull { it.toLongOrNull() }.toSet()
         _likedPlaylists.value = savedPlaylistIds

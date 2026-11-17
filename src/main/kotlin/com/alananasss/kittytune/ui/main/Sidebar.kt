@@ -38,6 +38,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.*
@@ -60,7 +61,9 @@ import androidx.compose.material3.TextButton
 
 import com.alananasss.kittytune.ui.common.pressScale
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -122,8 +125,10 @@ fun Sidebar(
     libraryViewModel: LibraryViewModel,
     playerViewModel: PlayerViewModel,
     homeViewModel: HomeViewModel? = null,
+    onToggleCollapse: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    com.alananasss.kittytune.ui.debug.TraceRecompositions("Sidebar")
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
@@ -169,12 +174,19 @@ fun Sidebar(
                     key(destination.key) {
                         val isSearchRow = destination.key == PlayerPreferences.SIDEBAR_NAV_SEARCH
                         val isHomeRow = destination.key == PlayerPreferences.SIDEBAR_NAV_HOME
+                        val isPetRow = destination.key == PlayerPreferences.SIDEBAR_NAV_PET
+                        val isSettingsRow = destination.key == PlayerPreferences.SIDEBAR_NAV_SETTINGS
+                        val onPetPage = com.alananasss.kittytune.ui.profile.SettingsNavigation.current.pages.firstOrNull() ==
+                            com.alananasss.kittytune.ui.profile.SettingsSubPage.PET
                         val searching = homeViewModel?.isSearching == true
                         SidebarNavItem(
                             label = str(destination.labelKey),
                             selected = currentRoute == destination.route && when {
                                 isSearchRow -> searching
                                 isHomeRow -> !searching
+                                // both live on the settings route: the pet row owns its page
+                                isPetRow -> onPetPage
+                                isSettingsRow -> !onPetPage
                                 else -> true
                             },
                             iconSelected = destination.iconSelected,
@@ -185,6 +197,12 @@ fun Sidebar(
                             when {
                                 isSearchRow -> homeViewModel?.activateSearch()
                                 isHomeRow -> homeViewModel?.clearSearch()
+                                isPetRow -> com.alananasss.kittytune.ui.profile.SettingsNavigation.go(
+                                    com.alananasss.kittytune.ui.profile.SettingsPlace(
+                                        com.alananasss.kittytune.ui.profile.SettingsCategory.INTERFACE,
+                                        listOf(com.alananasss.kittytune.ui.profile.SettingsSubPage.PET),
+                                    )
+                                )
                             }
                             if (currentRoute != destination.route) {
                                 navController.navigate(destination.route) { launchSingleTop = true }
@@ -213,6 +231,7 @@ fun Sidebar(
                 playerViewModel.showLyricsSheet = false
                 navController.navigate("upload")
             },
+            onToggleCollapse = onToggleCollapse,
             modifier = Modifier.weight(1f),
         )
 
@@ -378,6 +397,10 @@ private fun ProfileMenu(
             onDismiss()
             com.alananasss.kittytune.data.TokenManager.logout()
         }
+        if (!isGuest) ProfileMenuItem(str("onboard_account_switch"), Icons.Rounded.SwapHoriz) {
+            onDismiss()
+            com.alananasss.kittytune.ui.setup.AccountLauncher.requested = true
+        }
         androidx.compose.material3.HorizontalDivider(Modifier.padding(vertical = 4.dp))
         ProfileMenuItem(str("menu_about"), Icons.Rounded.Info) {
             onDismiss()
@@ -468,6 +491,7 @@ fun LibraryPanel(
     onImport: () -> Unit = {},
     onHistory: () -> Unit = {},
     onUpload: () -> Unit = {},
+    onToggleCollapse: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var showCreatePlaylistDialog by remember { mutableStateOf(false) }
@@ -483,6 +507,8 @@ fun LibraryPanel(
             folderToRename != null || folderToDelete != null || playlistForMenu != null ||
             movingItemKey != null || playlistForDetails != null
     TrackSidebarPopup(isAnyDialogOpen, libraryViewModel)
+    // Esc folds the expanded library back, after any dialog or search on top of it has taken its own Esc.
+    com.alananasss.kittytune.core.BackHandler(enabled = fullScreen) { libraryViewModel.isLibraryFullScreen = false }
 
     val openEntry: (LibEntry) -> Unit = { entry ->
         playerViewModel.showLyricsSheet = false
@@ -549,6 +575,7 @@ fun LibraryPanel(
                 onImport = onImport,
                 onHistory = onHistory,
                 onUpload = onUpload,
+                onToggleCollapse = onToggleCollapse,
             )
 
             // One slot for both: the search row recedes in it and the rail's actions arrive in it. They
@@ -800,6 +827,23 @@ private fun rememberFixedLibraryTiles(): List<LibEntry> {
                 )
             )
         }
+        // Listening together lives in the library as a playlist would, with a room's cover, not as a button of its own.
+        val rooms by com.alananasss.kittytune.data.together.Together.saved.collectAsState()
+        val roomCover = rooms.firstOrNull()?.tracks?.firstOrNull()?.artworkUrl
+        add(
+            LibEntry(
+                key = "pin_together",
+                title = str("together_title"),
+                subtitle = str("together_library_subtitle"),
+                artworkUrl = roomCover,
+                icon = if (roomCover == null) Icons.Rounded.Groups else null,
+                gradient = if (themed || roomCover != null) null else listOf(Color(0xFFFF7A1A), Color(0xFFFFB27A)),
+                flatColor = if (themed && roomCover == null) scheme.tertiaryContainer else null,
+                iconTint = if (themed) scheme.onTertiaryContainer else Color.White,
+                destination = "together",
+                isPinned = true,
+            )
+        )
         if (PlayerPreferences.LIBRARY_TILE_LOCAL !in hidden) {
             add(
                 LibEntry(
@@ -887,11 +931,12 @@ private fun buildLibraryEntries(libraryViewModel: LibraryViewModel): List<LibEnt
                 val pl = item.playlist
                 val permalink = pl.permalinkUrl
                 val isYoutubeShortcut = permalink != null && permalink.startsWith("yt_radio:")
+                val isSpotifyRadioShortcut = permalink != null && permalink.startsWith("spotify_radio:")
                 val isTrackStation = pl.isTrackStation || permalink?.contains("track-stations") == true || pl.urn?.contains("track-stations") == true
                 val isArtistStation = pl.isArtistStation || permalink?.contains("artist-stations") == true || pl.urn?.contains("artist-stations") == true
 
                 val dest = when {
-                    isYoutubeShortcut -> java.net.URLEncoder.encode(permalink, "UTF-8")
+                    isYoutubeShortcut || isSpotifyRadioShortcut -> permalink.orEmpty()
                     isTrackStation -> "station:${pl.numericId}"
                     isArtistStation -> "station_artist:${pl.numericId}"
                     pl.urn?.startsWith("soundcloud:system-playlists:") == true -> "system_playlist:${pl.urn}"
@@ -904,6 +949,8 @@ private fun buildLibraryEntries(libraryViewModel: LibraryViewModel): List<LibEnt
                     title = pl.title ?: "",
                     subtitle = listOfNotNull(
                         when {
+                            isYoutubeShortcut -> str("radio") + " • YouTube"
+                            isSpotifyRadioShortcut -> str("radio") + " • Spotify"
                             isTrackStation || isArtistStation -> str("lib_stations")
                             pl.isRealAlbum -> str("lib_albums")
                             else -> str("lib_playlists")
@@ -952,6 +999,7 @@ private fun LibraryHeader(
     onImport: () -> Unit,
     onHistory: () -> Unit,
     onUpload: () -> Unit = {},
+    onToggleCollapse: (() -> Unit)? = null,
 ) {
     var showCreateMenu by remember { mutableStateOf(false) }
     TrackSidebarPopup(showCreateMenu, libraryViewModel)
@@ -961,7 +1009,7 @@ private fun LibraryHeader(
         .collectAsState(initial = headerPrefs.getHiddenLibraryButtons())
 
     val headerVerticalPadding = androidx.compose.ui.unit.lerp(10.dp, 8.dp, collapse)
-    Row(
+    AdaptiveLibraryHeader(
         modifier = Modifier
             .fillMaxWidth()
             // Inset so this header's icon sits on the same vertical line as the rail's toggle, the
@@ -972,314 +1020,328 @@ private fun LibraryHeader(
                 end = 8.dp,
                 top = headerVerticalPadding,
                 bottom = 4.dp,
-            ),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        val currentFolder = libraryViewModel.currentFolder
-        if (currentFolder != null) {
-            IconButton(
-                onClick = { libraryViewModel.navigateUp() },
-                shapes = IconButtonDefaults.shapes(),
-                modifier = Modifier.size(32.dp)
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Rounded.ArrowBack,
-                    contentDescription = str("btn_back"),
-                    tint = MaterialTheme.colorScheme.onSurface
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = currentFolder.name,
-                style = if (fullScreen) MaterialTheme.typography.titleLarge else MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
             )
-            Spacer(Modifier.width(8.dp))
-            FolderPlaySplitButton(
-                folder = currentFolder,
-                libraryViewModel = libraryViewModel,
-                playerViewModel = playerViewModel
-            )
-            Spacer(Modifier.width(6.dp))
-        } else if (fullScreen) {
-            Icon(
-                Icons.Filled.LibraryMusic,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 4.dp),
-            )
-            Spacer(Modifier.width(10.dp))
-            Text(
-                text = str("nav_library"),
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            Spacer(Modifier.weight(1f))
-        } else {
-            // One control for both directions now that there is one layout: the same icon in the same
-            // place, saying which way it will go.
-            val toggleTip =
-                if (libraryViewModel.isSidebarCollapsed) str("lib_open_tooltip")
-                else str("lib_collapse_tooltip")
-            Tip(toggleTip) {
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable { libraryViewModel.toggleSidebarCollapsed() }
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        Icons.Filled.LibraryMusic,
-                        contentDescription = toggleTip,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(SidebarMorph.ICON_SIZE),
-                    )
-                    // Leaves the way the navigation labels above it do, so the whole panel closes with
-                    // one gesture instead of the top half receding and the library card cutting.
-                    Box(Modifier.pushedBack(collapse).padding(start = 10.dp)) {
-                        Text(
-                            text = str("nav_library"),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            softWrap = false,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-            if (collapse < 0.9f) {
-                Spacer(Modifier.weight(1f))
-            }
-        }
-
-        if (collapse < 0.9f) {
-            Row(Modifier.receded(collapse), verticalAlignment = Alignment.CenterVertically) {
-        // Extended "+ Créer" with dropdown menu. Outlined rather than filled tonal: next to a row
-        // of plain icon buttons the tonal fill made it the loudest thing in the header, which is
-        // not what a secondary action should be (issue #33).
-        val extendedCreate = fullScreen || libraryViewModel.sidebarWidth >= 340f
-        val showCreate = PlayerPreferences.LIBRARY_BUTTON_CREATE !in hiddenButtons
-        Box {
-            if (showCreate) Tip(str("lib_create_playlist_tooltip")) {
-                if (extendedCreate) {
-                    OutlinedButton(
-                        onClick = { showCreateMenu = true },
-                        shapes = ButtonDefaults.shapes(),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                    ) {
-                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text(str("lib_create"))
-                    }
-                } else {
+            // Keep a stable minimum height; exceptionally narrow headers can use two rows.
+            .heightIn(min = LIBRARY_HEADER_HEIGHT),
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val currentFolder = libraryViewModel.currentFolder
+                if (currentFolder != null) {
                     IconButton(
-                        onClick = { showCreateMenu = true },
+                        onClick = { libraryViewModel.navigateUp() },
                         shapes = IconButtonDefaults.shapes(),
-                        modifier = Modifier.size(32.dp),
+                        modifier = Modifier.size(32.dp)
                     ) {
                         Icon(
-                            Icons.Rounded.Add,
-                            contentDescription = str("lib_create_playlist_tooltip"),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(18.dp),
+                            Icons.AutoMirrored.Rounded.ArrowBack,
+                            contentDescription = str("btn_back"),
+                            tint = MaterialTheme.colorScheme.onSurface
                         )
                     }
-                }
-            }
-
-            DropdownMenu(
-                expanded = showCreateMenu,
-                onDismissRequest = { showCreateMenu = false }
-            ) {
-                DropdownMenuItem(
-                    text = { Text(str("lib_create_playlist_title")) },
-                    leadingIcon = { Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, contentDescription = null) },
-                    onClick = {
-                        showCreateMenu = false
-                        onCreatePlaylist()
-                    }
-                )
-                DropdownMenuItem(
-                    text = { Text(str("lib_create_folder_title")) },
-                    leadingIcon = { Icon(Icons.Rounded.CreateNewFolder, contentDescription = null) },
-                    onClick = {
-                        showCreateMenu = false
-                        onCreateFolder()
-                    }
-                )
-                DropdownMenuItem(
-                    text = { Text(str("upload_screen_title")) },
-                    leadingIcon = { Icon(Icons.Rounded.CloudUpload, contentDescription = null) },
-                    onClick = {
-                        showCreateMenu = false
-                        onUpload()
-                    }
-                )
-            }
-        }
-        if (PlayerPreferences.LIBRARY_BUTTON_HISTORY !in hiddenButtons) {
-            Spacer(Modifier.width(4.dp))
-            Tip(str("history_title")) {
-                IconButton(
-                    shapes = IconButtonDefaults.shapes(),
-                    onClick = onHistory,
-                    modifier = Modifier.size(32.dp),
-                ) {
-                    // A plain clock rather than the clock-with-arrow: the arrow read as an undo or a
-                    // refresh next to the other header icons (issue #33).
-                    Icon(
-                        Icons.Rounded.Schedule,
-                        contentDescription = str("history_title"),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(20.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = currentFolder.name,
+                        style = if (fullScreen) MaterialTheme.typography.titleLarge else MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
                     )
+                    Spacer(Modifier.width(8.dp))
+
+                } else if (fullScreen) {
+                    Icon(
+                        Icons.Filled.LibraryMusic,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        text = str("nav_library"),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                } else {
+                    // One control for both directions now that there is one layout: the same icon in the same
+                    // place, saying which way it will go.
+                    val isVisuallyCollapsed = collapse > 0.5f
+                    val toggleTip =
+                        if (isVisuallyCollapsed) str("lib_open_tooltip")
+                        else str("lib_collapse_tooltip")
+                    Tip(toggleTip) {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    if (onToggleCollapse != null) {
+                                        onToggleCollapse()
+                                    } else {
+                                        if (isVisuallyCollapsed) {
+                                            libraryViewModel.expandSidebar()
+                                        } else {
+                                            libraryViewModel.collapseSidebar()
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                Icons.Filled.LibraryMusic,
+                                contentDescription = toggleTip,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(SidebarMorph.ICON_SIZE),
+                            )
+                            // Leaves the way the navigation labels above it do, so the whole panel closes with
+                            // one gesture instead of the top half receding and the library card cutting.
+                            Box(Modifier.pushedBack(collapse).padding(start = 10.dp)) {
+                                Text(
+                                    text = str("nav_library"),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    softWrap = false,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
                 }
             }
-        }
-        Spacer(Modifier.width(4.dp))
-        Tip(str("lib_import_playlist")) {
-            IconButton(
-                shapes = IconButtonDefaults.shapes(),
-                onClick = onImport,
-                modifier = Modifier.size(32.dp),
-            ) {
-                Icon(
-                    Icons.Rounded.ImportExport,
-                    contentDescription = str("lib_import_playlist"),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-        }
-        Spacer(Modifier.width(4.dp))
-        val enlargeTip = if (fullScreen) str("lib_restore_tooltip") else str("lib_enlarge_tooltip")
-        Tip(enlargeTip) {
-            IconButton(
-                shapes = IconButtonDefaults.shapes(),
-                onClick = { libraryViewModel.isLibraryFullScreen = !libraryViewModel.isLibraryFullScreen },
+        },
+        actions = { extendedCreate, measuring ->
+            // Only while they can be seen: past FADE_DONE_AT they have faded out, so leaving or arriving there is
+            // invisible. They keep their full size throughout and give up room instead of being squeezed into it,
+            // which is what made them shrink and pop while the panel was still narrow.
+            if (collapse < SidebarMorph.FADE_DONE_AT) {
+                Row(Modifier.receded(collapse), verticalAlignment = Alignment.CenterVertically) {
+                    libraryViewModel.currentFolder?.let { folder ->
+                        FolderPlaySplitButton(folder, libraryViewModel, playerViewModel, showMenu = !measuring)
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    // Extended "+ Créer" with dropdown menu. Outlined rather than filled tonal: next to a row
+                    // of plain icon buttons the tonal fill made it the loudest thing in the header, which is
+                    // not what a secondary action should be (issue #33).
+                    val showCreate = PlayerPreferences.LIBRARY_BUTTON_CREATE !in hiddenButtons
+                    Box {
+                        if (showCreate) Tip(str("lib_create_playlist_tooltip")) {
+                            if (extendedCreate) {
+                                OutlinedButton(
+                                    onClick = { showCreateMenu = true },
+                                    shapes = ButtonDefaults.shapes(),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                                ) {
+                                    Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(str("lib_create"), maxLines = 1, softWrap = false)
+                                }
+                            } else {
+                                IconButton(
+                                    onClick = { showCreateMenu = true },
+                                    shapes = IconButtonDefaults.shapes(),
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.Add,
+                                        contentDescription = str("lib_create_playlist_tooltip"),
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                            }
+                        }
 
-                modifier = Modifier.size(32.dp),
-            ) {
-                Icon(
-                    if (fullScreen) Icons.Rounded.CloseFullscreen else Icons.Rounded.OpenInFull,
-                    contentDescription = enlargeTip,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp),
-                )
+                        DropdownMenu(
+                            expanded = showCreateMenu && !measuring,
+                            onDismissRequest = { showCreateMenu = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text(str("lib_create_playlist_title")) },
+                                leadingIcon = { Icon(Icons.AutoMirrored.Rounded.PlaylistAdd, contentDescription = null) },
+                                onClick = {
+                                    showCreateMenu = false
+                                    onCreatePlaylist()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(str("lib_create_folder_title")) },
+                                leadingIcon = { Icon(Icons.Rounded.CreateNewFolder, contentDescription = null) },
+                                onClick = {
+                                    showCreateMenu = false
+                                    onCreateFolder()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(str("upload_screen_title")) },
+                                leadingIcon = { Icon(Icons.Rounded.CloudUpload, contentDescription = null) },
+                                onClick = {
+                                    showCreateMenu = false
+                                    onUpload()
+                                }
+                            )
+                        }
+                    }
+                    if (PlayerPreferences.LIBRARY_BUTTON_HISTORY !in hiddenButtons) {
+                        Spacer(Modifier.width(4.dp))
+                        Tip(str("history_title")) {
+                            IconButton(
+                                shapes = IconButtonDefaults.shapes(),
+                                onClick = onHistory,
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                // A plain clock rather than the clock-with-arrow: the arrow read as an undo or a
+                                // refresh next to the other header icons (issue #33).
+                                Icon(
+                                    Icons.Rounded.Schedule,
+                                    contentDescription = str("history_title"),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    Tip(str("lib_import_playlist")) {
+                        IconButton(
+                            shapes = IconButtonDefaults.shapes(),
+                            onClick = onImport,
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                Icons.Rounded.ImportExport,
+                                contentDescription = str("lib_import_playlist"),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    val enlargeTip = if (fullScreen) str("lib_restore_tooltip") else str("lib_enlarge_tooltip")
+                    Tip(enlargeTip) {
+                        IconButton(
+                            shapes = IconButtonDefaults.shapes(),
+                            onClick = { libraryViewModel.isLibraryFullScreen = !libraryViewModel.isLibraryFullScreen },
+
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                if (fullScreen) Icons.Rounded.CloseFullscreen else Icons.Rounded.OpenInFull,
+                                contentDescription = enlargeTip,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                }
             }
-        }
-        }
-    }
-}
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Search + sort/view-mode row
 // ---------------------------------------------------------------------------
 
+/**
+ * The library's search: one long field that is always there, in Material's search-bar shape, with the filter and
+ * sort buttons after it (issue #66). It used to be an icon that unfolded into a small box. The field says nothing
+ * until it is used: its hint only shows once it has the focus, so the panel does not carry a line of grey text
+ * all the time.
+ */
 @Composable
 private fun LibrarySearchRow(libraryViewModel: LibraryViewModel) {
-    var searchActive by remember { mutableStateOf(libraryViewModel.searchQuery.isNotBlank()) }
-    TrackSidebarPopup(searchActive, libraryViewModel)
-    // One way out, whichever gesture asked for it: the cross, Escape, or a click anywhere else.
-    val dismiss = {
+    val query = libraryViewModel.searchQuery
+    TrackSidebarPopup(query.isNotBlank(), libraryViewModel)
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    var isFocused by remember { mutableStateOf(false) }
+    val clear = {
         libraryViewModel.searchQuery = ""
-        searchActive = false
+        focusManager.clearFocus()
     }
+    val scheme = MaterialTheme.colorScheme
+    val container by androidx.compose.animation.animateColorAsState(
+        if (isFocused) scheme.surfaceContainerHighest else scheme.surfaceContainerHigh,
+        label = "librarySearchContainer",
+    )
 
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).height(36.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).height(40.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (searchActive) {
-            val focusRequester = remember { FocusRequester() }
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                modifier = Modifier.weight(1f).height(32.dp),
+        Surface(
+            shape = CircleShape,
+            color = container,
+            // No hard outline when focused: the thin accent line was what read as a stripe. The field lifts a shade
+            // and its icon takes the accent instead.
+            border = null,
+            modifier = Modifier.weight(1f).height(40.dp),
+        ) {
+            Row(
+                modifier = Modifier.padding(start = 12.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        Icons.Rounded.Search,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                        if (libraryViewModel.searchQuery.isEmpty()) {
-                            Text(
-                                str("lib_search_hint"),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        BasicTextField(
-                            value = libraryViewModel.searchQuery,
-                            onValueChange = { libraryViewModel.searchQuery = it },
-                            singleLine = true,
-                            textStyle = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurface),
-                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .trackTextInput()
-                                .focusRequester(focusRequester)
-                                // This field is an icon until it is pressed, so both gestures close it
-                                // outright — see [escapeDismisses] for why they are separate modifiers.
-                                .escapeDismisses(dismiss)
-                                .focusLossDismisses(dismiss),
+                Icon(
+                    Icons.Rounded.Search,
+                    contentDescription = str("lib_search_tooltip"),
+                    tint = if (isFocused) scheme.primary else scheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = isFocused && query.isEmpty(),
+                        enter = androidx.compose.animation.fadeIn(),
+                        exit = androidx.compose.animation.fadeOut(),
+                    ) {
+                        Text(
+                            str("lib_search_hint"),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = scheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
+                    BasicTextField(
+                        value = query,
+                        onValueChange = { libraryViewModel.searchQuery = it },
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = scheme.onSurface),
+                        cursorBrush = SolidColor(scheme.primary),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .trackTextInput()
+                            .onFocusChanged { isFocused = it.isFocused }
+                            .escapeDismisses(clear),
+                    )
+                }
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = query.isNotEmpty(),
+                    enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(),
+                    exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut(),
+                ) {
                     IconButton(
                         shapes = IconButtonDefaults.shapes(),
-                        onClick = dismiss,
-                        modifier = Modifier.size(20.dp),
+                        onClick = clear,
+                        modifier = Modifier.size(32.dp),
                     ) {
                         Icon(
                             Icons.Rounded.Close,
                             contentDescription = str("btn_cancel"),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(14.dp),
+                            tint = scheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp),
                         )
                     }
                 }
             }
-            LaunchedEffect(Unit) { focusRequester.requestFocus() }
-        } else {
-            Tip(str("lib_search_tooltip")) {
-                IconButton(
-                    shapes = IconButtonDefaults.shapes(),
-                    onClick = { searchActive = true },
-
-                    modifier = Modifier.size(32.dp),
-                ) {
-                    Icon(
-                        Icons.Rounded.Search,
-                        contentDescription = str("lib_search_tooltip"),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp),
-                    )
-                }
-            }
-            Spacer(Modifier.weight(1f))
         }
 
-        Spacer(Modifier.width(8.dp))
+        Spacer(Modifier.width(6.dp))
         LibraryCategoryButton(libraryViewModel)
-        Spacer(Modifier.width(4.dp))
+        Spacer(Modifier.width(2.dp))
         SortAndViewMenuButton(libraryViewModel)
     }
 }
@@ -1306,7 +1368,9 @@ private fun LibraryCategoryButton(libraryViewModel: LibraryViewModel) {
     var expanded by remember { mutableStateOf(false) }
     TrackSidebarPopup(expanded, libraryViewModel)
     val all = str("search_filter_all")
-    val categories = buildList {
+    // null is "All": no filter is a choice with a name and an icon of its own, like the others.
+    val categories = buildList<Pair<String?, ImageVector>> {
+        add(null to Icons.Rounded.LibraryMusic)
         add(str("lib_playlists") to Icons.Rounded.QueueMusic)
         add(str("lib_albums") to Icons.Rounded.Album)
         add(str("lib_artists") to Icons.Rounded.Person)
@@ -1315,66 +1379,19 @@ private fun LibraryCategoryButton(libraryViewModel: LibraryViewModel) {
             add(str("lib_your_uploads") to Icons.Rounded.CloudUpload)
         }
     }
-    val selected = libraryViewModel.selectedFilter
+    val selected = categories.firstOrNull { it.first == libraryViewModel.selectedFilter } ?: categories.first()
 
-    Box {
-        Tip(str("lib_filter_tooltip")) {
-            TextButton(
-                onClick = { expanded = true },
-                shapes = ButtonDefaults.shapes(),
-                contentPadding = PaddingValues(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-            ) {
-                Text(
-                    text = selected ?: all,
-                    style = MaterialTheme.typography.labelMedium,
-                    // Single line and truncated rather than wrapped: this sits in a row that follows the
-                    // panel's width, and a label that wraps takes the row's height with it.
-                    softWrap = false,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    color = if (selected == null) MaterialTheme.colorScheme.onSurfaceVariant
-                    else MaterialTheme.colorScheme.onSurface,
-                )
-                Icon(
-                    Icons.Rounded.ArrowDropDown,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            DropdownMenuItem(
-                text = { Text(all) },
-                leadingIcon = { CategoryCheck(isSelected = selected == null) },
-                onClick = {
-                    expanded = false
-                    libraryViewModel.selectedFilter = null
-                },
-            )
-            categories.forEach { (label, icon) ->
-                DropdownMenuItem(
-                    text = { Text(label) },
-                    leadingIcon = {
-                        if (selected == label) CategoryCheck(isSelected = true)
-                        else Icon(icon, contentDescription = null)
-                    },
-                    onClick = {
-                        expanded = false
-                        libraryViewModel.selectedFilter = label
-                    },
-                )
-            }
-        }
-    }
-}
-
-/** The tick that says which one is live, or the space it would take, so the labels stay in a column. */
-@Composable
-private fun CategoryCheck(isSelected: Boolean) {
-    if (isSelected) Icon(Icons.Rounded.Check, contentDescription = null)
-    else Spacer(Modifier.size(24.dp))
+    com.alananasss.kittytune.ui.common.IconChoiceButton(
+        options = categories,
+        selected = selected,
+        onSelect = { libraryViewModel.selectedFilter = it.first },
+        icon = { it.second },
+        label = { it.first ?: all },
+        tooltip = { str("lib_filter_tooltip") + ": " + (it.first ?: all) },
+        size = 32.dp,
+        iconSize = 18.dp,
+        onExpandedChange = { expanded = it },
+    )
 }
 
 private fun viewModeIcon(mode: LibraryViewMode): ImageVector = when (mode) {
@@ -1391,6 +1408,12 @@ private fun viewModeLabel(mode: LibraryViewMode): String = when (mode) {
     LibraryViewMode.GRID -> str("lib_view_grid")
 }
 
+/**
+ * What the library shows, in what order and how: one button, with the view mode's icon on it.
+ *
+ * It used to read "Recent" whatever was chosen, over a menu offering "All / Created / Liked" with no "Recent"
+ * among them (issue #66). The menu is now three headed groups of the same rows every filter menu uses.
+ */
 @Composable
 private fun SortAndViewMenuButton(libraryViewModel: LibraryViewModel) {
     var menuOpen by remember { mutableStateOf(false) }
@@ -1398,95 +1421,50 @@ private fun SortAndViewMenuButton(libraryViewModel: LibraryViewModel) {
     val shouldShowOwnershipFilter = libraryViewModel.selectedFilter == null ||
             libraryViewModel.selectedFilter == str("lib_playlists") ||
             libraryViewModel.selectedFilter == str("lib_albums")
+    val ownership = listOf(
+        Triple(OwnershipFilter.ALL, str("filter_all"), Icons.Rounded.LibraryMusic),
+        Triple(OwnershipFilter.CREATED, str("filter_created"), Icons.Rounded.Edit),
+        Triple(OwnershipFilter.LIKED, str("filter_liked"), Icons.Rounded.Favorite),
+    )
+    val sortLabel = if (libraryViewModel.isSortDescending) str("sort_recently_added") else str("sort_first_added")
+    val tooltip = listOfNotNull(
+        ownership.first { it.first == libraryViewModel.ownershipFilter }.second.takeIf { shouldShowOwnershipFilter },
+        sortLabel,
+        viewModeLabel(libraryViewModel.viewMode),
+    ).joinToString(" · ")
 
-    val label = if (shouldShowOwnershipFilter && libraryViewModel.ownershipFilter != OwnershipFilter.ALL) {
-        when (libraryViewModel.ownershipFilter) {
-            OwnershipFilter.CREATED -> str("filter_created")
-            OwnershipFilter.LIKED -> str("filter_liked")
-            OwnershipFilter.ALL -> str("lib_recents")
-        }
-    } else str("lib_recents")
-
-    Box {
-        Surface(
-            modifier = Modifier.clickable { menuOpen = true },
-            shape = RoundedCornerShape(8.dp),
-            color = Color.Transparent,
-            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(text = label, style = MaterialTheme.typography.bodySmall, maxLines = 1)
-                Spacer(Modifier.width(6.dp))
-                Icon(viewModeIcon(libraryViewModel.viewMode), contentDescription = str("lib_view_mode"), modifier = Modifier.size(16.dp))
-            }
-        }
-
-        DropdownMenu(
-            expanded = menuOpen,
-            onDismissRequest = { menuOpen = false },
-        ) {
-            if (shouldShowOwnershipFilter) {
-                val options = listOf(
-                    OwnershipFilter.ALL to str("filter_all"),
-                    OwnershipFilter.CREATED to str("filter_created"),
-                    OwnershipFilter.LIKED to str("filter_liked"),
-                )
-                options.forEach { (filter, text) ->
-                    DropdownMenuItem(
-                        text = { Text(text) },
-                        trailingIcon = {
-                            if (libraryViewModel.ownershipFilter == filter) {
-                                Icon(Icons.Rounded.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                            }
-                        },
-                        onClick = {
-                            libraryViewModel.ownershipFilter = filter
-                            menuOpen = false
-                        },
-                    )
+    com.alananasss.kittytune.ui.common.IconMenuButton(
+        icon = viewModeIcon(libraryViewModel.viewMode),
+        tooltip = tooltip,
+        size = 32.dp,
+        iconSize = 18.dp,
+        onExpandedChange = { menuOpen = it },
+    ) { dismiss ->
+        if (shouldShowOwnershipFilter) {
+            com.alananasss.kittytune.ui.common.ChoiceMenuHeader(str("lib_menu_show"))
+            ownership.forEach { (filter, text, icon) ->
+                com.alananasss.kittytune.ui.common.ChoiceMenuItem(text, icon, libraryViewModel.ownershipFilter == filter) {
+                    libraryViewModel.ownershipFilter = filter
+                    dismiss()
                 }
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
             }
-
-            DropdownMenuItem(
-                text = { Text(str("sort_date_added")) },
-                trailingIcon = {
-                    Icon(
-                        if (libraryViewModel.isSortDescending) Icons.Rounded.ArrowDownward else Icons.Rounded.ArrowUpward,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(18.dp),
-                    )
-                },
-                onClick = { libraryViewModel.isSortDescending = !libraryViewModel.isSortDescending },
-            )
-
             HorizontalDivider(Modifier.padding(vertical = 4.dp))
-
-            Text(
-                str("lib_view_mode"),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-            )
-            Row(
-                modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                LibraryViewMode.entries.forEach { mode ->
-                    Tip(viewModeLabel(mode)) {
-                        FilledIconToggleButton(
-                            checked = libraryViewModel.viewMode == mode,
-                            onCheckedChange = { libraryViewModel.viewMode = mode },
-                            modifier = Modifier.size(40.dp),
-                        ) {
-                            Icon(viewModeIcon(mode), contentDescription = viewModeLabel(mode), modifier = Modifier.size(18.dp))
-                        }
-                    }
-                }
+        }
+        com.alananasss.kittytune.ui.common.ChoiceMenuHeader(str("lib_sort_by_title"))
+        com.alananasss.kittytune.ui.common.ChoiceMenuItem(str("sort_recently_added"), Icons.Rounded.ArrowDownward, libraryViewModel.isSortDescending) {
+            libraryViewModel.isSortDescending = true
+            dismiss()
+        }
+        com.alananasss.kittytune.ui.common.ChoiceMenuItem(str("sort_first_added"), Icons.Rounded.ArrowUpward, !libraryViewModel.isSortDescending) {
+            libraryViewModel.isSortDescending = false
+            dismiss()
+        }
+        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        com.alananasss.kittytune.ui.common.ChoiceMenuHeader(str("lib_view_mode"))
+        LibraryViewMode.entries.forEach { mode ->
+            com.alananasss.kittytune.ui.common.ChoiceMenuItem(viewModeLabel(mode), viewModeIcon(mode), libraryViewModel.viewMode == mode) {
+                libraryViewModel.viewMode = mode
+                dismiss()
             }
         }
     }
@@ -1891,6 +1869,9 @@ private fun EntryArtwork(
  * do not exist at all before then — an invisible button that can still be clicked is worse than no
  * animation.
  */
+/** Minimum header height, including when only compact icon actions are visible. */
+private val LIBRARY_HEADER_HEIGHT = 40.dp
+
 @Composable
 private fun RailActions(collapse: Float, onCreate: () -> Unit, onHistory: () -> Unit) {
     val appearance = SidebarMorph.arrivalOf(collapse)

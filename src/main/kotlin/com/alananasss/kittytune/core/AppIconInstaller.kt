@@ -1,6 +1,8 @@
 package com.alananasss.kittytune.core
 
 import java.io.File
+import java.nio.file.Files
+import java.util.concurrent.Executors
 
 /** `SHChangeNotify` is not in JNA's bundled Shell32 mapping, so declare the one call we need. */
 private interface WindowsShellNotifier : com.sun.jna.win32.StdCallLibrary {
@@ -20,26 +22,19 @@ private const val SHCNF_IDLIST = 0x0000
  *    Menu, on the Desktop and in the taskbar pins, pointing them at a generated multi-size
  *    .ico under %APPDATA%\KittyTune. The icon embedded in the exe itself cannot change
  *    without repackaging, but every shortcut the user actually clicks does switch.
- *  - **macOS**: replaces the .icns inside the running .app bundle and re-registers it with
- *    LaunchServices, which is what Finder, Launchpad and the Dock read.
+ *  - **macOS**: sets the Finder custom icon on the running .app through NSWorkspace.
  *
  * The running window's own icon switches on every OS (Main.kt), and the Dock image plus the
  * multi-size window icons are handled by [AppIconRuntime].
  */
 object AppIconInstaller {
 
-    /**
-     * Installs the variant for launchers, off the calling thread.
-     *
-     * Every platform's path ends in shell commands that have to be waited on — kbuildsycoca,
-     * update-desktop-database, lsregister, ie4uinit — and together they take long enough to
-     * stutter the UI if run from a click handler, which is where this is called from.
-     */
+    private val installer = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "kittytune-icon-install").apply { isDaemon = true }
+    }
+
     fun apply(variantKey: String) {
-        Thread({ install(variantKey) }, "kittytune-icon-install").apply {
-            isDaemon = true
-            start()
-        }
+        installer.execute { install(variantKey) }
     }
 
     private fun install(variantKey: String) {
@@ -51,10 +46,14 @@ object AppIconInstaller {
         }
     }
 
-    private fun variantPng(variantKey: String): ByteArray? =
-        Thread.currentThread().contextClassLoader
-            ?.getResourceAsStream(AppIconVariants.resourcePath(variantKey))
+    private fun variantPng(variantKey: String): ByteArray? {
+        val res = AppIconVariants.resourcePath(variantKey)
+        return (Thread.currentThread().contextClassLoader ?: AppIconInstaller::class.java.classLoader)
+            ?.getResourceAsStream(res)
             ?.use { it.readBytes() }
+            ?: AppIconInstaller::class.java.getResourceAsStream("/" + res.removePrefix("/"))
+                ?.use { it.readBytes() }
+    }
 
     // ------------------------------------------------------------------ linux
 
@@ -66,42 +65,51 @@ object AppIconInstaller {
     private val LINUX_SIZES = intArrayOf(16, 22, 24, 32, 48, 64, 128, 256, 512)
 
     /** Must match the WM_CLASS Main.kt sets via `sun.java2d.wm.className`. */
-    private const val LINUX_WM_CLASS = "kitty-tune"
+    private const val LINUX_WM_CLASS = LinuxDesktopIdentity.APP_ID
 
     private fun applyLinux(variantKey: String) {
         try {
-            val pngBytes = variantPng(variantKey) ?: return
+            val pngBytes = variantPng(variantKey) ?: variantPng(AppIconVariants.DEFAULT_KEY) ?: return
             val source = IconEncoders.decode(pngBytes) ?: return
 
-            val iconsRoot = File(System.getProperty("user.home"), ".local/share/icons")
+            val userHome = System.getProperty("user.home") ?: return
+            val iconsRoot = File(linuxDataHome(), "icons")
             val hicolor = File(iconsRoot, "hicolor")
+            val pixmaps = File(linuxDataHome(), "pixmaps").apply { mkdirs() }
+            val userApps = File(linuxDataHome(), "applications").apply { mkdirs() }
 
             for (size in LINUX_SIZES) {
-                if (size > maxOf(source.width, source.height)) continue
                 val dir = File(hicolor, "${size}x${size}/apps")
                 if (!dir.isDirectory && !dir.mkdirs()) continue
                 val scaled = IconEncoders.png(IconEncoders.scaled(source, size))
-                // Variant-specific icon name: launchers cache pixmaps per icon NAME,
-                // so switching variant must switch name to bust the cache.
+
+                // Variant-specific icon names: launchers cache pixmaps per icon NAME,
+                // so switching variant switches name to bust the cache cleanly.
+                File(dir, "kitty-tune-$variantKey.png").writeBytes(scaled)
                 File(dir, "kittytune-$variantKey.png").writeBytes(scaled)
-                // Keep the plain name in sync for other consumers (taskbar pins, GTK).
+                File(dir, "com-alananasss-kittytune-MainKt-$variantKey.png").writeBytes(scaled)
+
+                // Un-suffixed current active icons for standard theme / window lookups
+                File(dir, "kitty-tune.png").writeBytes(scaled)
                 File(dir, "kittytune.png").writeBytes(scaled)
+                File(dir, "com-alananasss-kittytune-MainKt.png").writeBytes(scaled)
             }
 
-            // User-level .desktop override pointing at the variant icon — takes
-            // precedence over the package's desktop file, per XDG spec.
+            // Standard XDG pixmaps fallback directory
+            val pixmapScaled = IconEncoders.png(IconEncoders.scaled(source, 256))
+            File(pixmaps, "kitty-tune.png").writeBytes(pixmapScaled)
+            File(pixmaps, "kittytune.png").writeBytes(pixmapScaled)
+            File(pixmaps, "com-alananasss-kittytune-MainKt.png").writeBytes(pixmapScaled)
+
+            // User-level .desktop overrides pointing at the variant icon
             overrideDesktopFile(variantKey)
-            // Same for shortcuts living on the desktop itself (real files or
-            // symlinks to the system entry — symlinks are replaced by real files
-            // so the icon name can change).
+            // Same for shortcuts living on the desktop itself
             rewriteDesktopShortcuts(variantKey)
 
             // Gentle cache invalidation — no shell restart:
             //  - GTK apps: icon theme cache
+            //  - update-desktop-database for XDG application entries
             //  - KDE: KSycoca (app entries) + icon-cache.kcache (KIconLoader disk cache)
-            //  - touch the theme dirs so inotify watchers notice (writing only the
-            //    leaf apps/ dir does not bump the watched theme root mtime)
-            val userApps = File(System.getProperty("user.home"), ".local/share/applications")
             listOf(
                 ProcessBuilder("gtk-update-icon-cache", "-f", "-t", hicolor.canonicalPath),
                 ProcessBuilder("update-desktop-database", userApps.canonicalPath),
@@ -115,7 +123,7 @@ object AppIconInstaller {
             }
 
             runCatching {
-                File(System.getProperty("user.home"), ".cache/icon-cache.kcache").delete()
+                File(userHome, ".cache/icon-cache.kcache").delete()
             }
             runCatching {
                 val now = System.currentTimeMillis()
@@ -125,68 +133,53 @@ object AppIconInstaller {
                 }
                 hicolor.setLastModified(now)
                 iconsRoot.setLastModified(now)
+                pixmaps.setLastModified(now)
+                userApps.setLastModified(now)
             }
         } catch (e: Throwable) {
             println("[AppIconInstaller] Failed to install launcher icon: ${e.message}")
         }
     }
 
-    /**
-     * Copies the system KittyTune .desktop into ~/.local/share/applications with
-     * `Icon=kittytune-<variant>` so the launcher resolves a fresh (uncached) icon
-     * name on every switch. User desktop files shadow system ones per XDG spec.
-     */
-    private fun overrideDesktopFile(variantKey: String) {
-        val systemDesktop = findInstalledDesktopFile() ?: run {
-            println("[AppIconInstaller] No system .desktop found; skipping override")
-            return
+    private fun findExecutablePath(): String {
+        val systemDesktop = findInstalledDesktopFile()
+        if (systemDesktop != null) {
+            val exec = runCatching { systemDesktop.readLines() }.getOrNull()
+                ?.firstOrNull { it.startsWith("Exec=") }
+                ?.removePrefix("Exec=")
+                ?.trim()
+            if (!exec.isNullOrBlank()) return exec
         }
+        val optBin = File("/opt/kitty-tune/bin/KittyTune")
+        if (optBin.exists()) return optBin.absolutePath
 
-        val userApps = File(System.getProperty("user.home"), ".local/share/applications").apply { mkdirs() }
-        val userDesktop = File(userApps, systemDesktop.name)
-        val original = systemDesktop.readLines()
+        val procCmd = runCatching { ProcessHandle.current().info().command().orElse(null) }.getOrNull()
+        if (!procCmd.isNullOrBlank() && File(procCmd).exists() && !procCmd.endsWith("java")) return procCmd
 
-        val rewritten = original.map { line ->
-            if (line.startsWith("Icon=")) "Icon=kittytune-$variantKey" else line
-        }.toMutableList()
-
-        if (original.none { it.startsWith("Icon=") }) {
-            rewritten += "Icon=kittytune-$variantKey"
-        }
-        // Without StartupWMClass the shell has to guess which entry an open window belongs to.
-        // KDE guesses right because the WM_CLASS Main.kt sets matches the entry's file name,
-        // but GNOME and wlroots-based shells do not, and then the running window shows a
-        // generic icon while the pinned launcher shows the variant. Stating it removes the guess.
-        if (original.none { it.startsWith("StartupWMClass=") }) {
-            rewritten += "StartupWMClass=$LINUX_WM_CLASS"
-        }
-
-        userDesktop.writeText(rewritten.joinToString("\n") + "\n")
+        return "kitty-tune"
     }
 
-    /**
-     * The KittyTune launcher entry the package installed, wherever the package manager put it —
-     * deb, rpm and AUR builds name it differently. Our own auth-handler stubs are skipped.
-     */
-    internal fun findInstalledDesktopFile(): File? {
-        val dataDirs = listOf(
-            File("/usr/share/applications"),
-            File("/usr/local/share/applications"),
-            File(System.getProperty("user.home"), ".local/share/applications")
-        ) + (System.getenv("XDG_DATA_DIRS") ?: "")
-            .split(":").filter { it.isNotBlank() }
-            .map { File(it, "applications") }
+    /** Publish the canonical ID and migrate old launchers without deleting their launch URLs. */
+    private fun overrideDesktopFile(variantKey: String) {
+        LinuxDesktopIdentity.install(
+            File(linuxDataHome(), "applications"), installedDesktopFiles(), findExecutablePath(), variantKey)
+    }
 
-        return dataDirs
-            .filter { it.isDirectory }
-            .flatMap { dir -> dir.listFiles { f -> f.isFile && f.extension == "desktop" }?.toList() ?: emptyList() }
-            .filter { it.name.contains("kitty", ignoreCase = true) && it.name.contains("tune", ignoreCase = true) }
-            .firstOrNull { df ->
-                val txt = runCatching { df.readText() }.getOrDefault("")
-                // Skip our own auth-handler stubs (NoDisplay=true).
-                !txt.contains("NoDisplay=true") &&
-                    (txt.contains("Name=KittyTune") || txt.contains("itty-tune", ignoreCase = true))
-            }
+    private fun linuxDataHome(): File = System.getenv("XDG_DATA_HOME")?.takeIf { it.isNotBlank() }
+        ?.let(::File) ?: File(System.getProperty("user.home"), ".local/share")
+
+    private fun installedDesktopFiles(): List<File> {
+        val dataDirs = listOf(linuxDataHome()) +
+            (System.getenv("XDG_DATA_DIRS") ?: "/usr/local/share:/usr/share")
+                .split(':').filter { it.isNotBlank() }.map(::File)
+        return dataDirs.flatMap { File(it, "applications").listFiles()?.toList().orEmpty() }
+            .filter(LinuxDesktopIdentity::isLauncher)
+    }
+
+    internal fun findInstalledDesktopFile(): File? {
+        val entries = installedDesktopFiles()
+        return entries.firstOrNull { it.name == LinuxDesktopIdentity.DESKTOP_FILE }
+            ?: entries.firstOrNull { !it.readText().contains("NoDisplay=true") }
     }
 
     /** XDG desktop directory (handles localized names like ~/Bureau), fallback ~/Desktop. */
@@ -229,17 +222,25 @@ object AppIconInstaller {
                 val lines = target.readLines()
                 if (lines.any { it.trim() == "NoDisplay=true" }) return@runCatching
 
-                val content = lines.joinToString("\n") { line ->
-                    if (line.startsWith("Icon=")) "Icon=kittytune-$variantKey" else line
-                } + if (lines.any { it.startsWith("Icon=") }) "" else "\nIcon=kittytune-$variantKey"
+                val updated = lines.map { line ->
+                    when {
+                        line.startsWith("Icon=") -> "Icon=kittytune-$variantKey"
+                        line.startsWith("StartupWMClass=") -> "StartupWMClass=$LINUX_WM_CLASS"
+                        else -> line
+                    }
+                }.toMutableList()
 
+                if (updated.none { it.startsWith("Icon=") }) updated += "Icon=kittytune-$variantKey"
+                if (updated.none { it.startsWith("StartupWMClass=") }) updated += "StartupWMClass=$LINUX_WM_CLASS"
+
+                val content = updated.joinToString("\n") + "\n"
                 if (java.nio.file.Files.isSymbolicLink(shortcut.toPath())) {
                     shortcut.delete()
-                    shortcut.writeText(content + "\n")
+                    shortcut.writeText(content)
                     shortcut.setExecutable(true)   // Plasma "trusted" flag
                 } else {
                     runCatching { shortcut.setWritable(true) }
-                    shortcut.writeText(content + "\n")
+                    shortcut.writeText(content)
                     shortcut.setExecutable(true)
                 }
                 desktopDir.setLastModified(System.currentTimeMillis())
@@ -259,20 +260,40 @@ object AppIconInstaller {
             // variant-specific icon name: Explorer caches by path, and pointing a shortcut at
             // a path it has never seen is the one cache bust that always works.
             val icoFile = File(iconDir, "app_icon_$variantKey.ico")
-            icoFile.writeBytes(IconEncoders.ico(source))
-
-            // Drop the ICOs for other variants so the directory does not grow without bound.
-            iconDir.listFiles { f ->
-                f.isFile && f.name.startsWith("app_icon") && f.name != icoFile.name
-            }?.forEach { runCatching { it.delete() } }
+            val ico = IconEncoders.ico(source)
 
             val links = findWindowsShortcuts()
-            if (links.isNotEmpty()) updateShortcutIcons(links, icoFile)
+            // This runs at every launch. When the icon and every shortcut are already as they were left, there
+            // is nothing to do — and redoing it is not free: restarting the Start menu makes it reload every
+            // recent item it shows, which wakes whatever those point at (a `\\wsl.localhost` file from a removed
+            // distribution starts Windows' "install WSL" prompt). A shortcut rewritten since (an update, a
+            // reinstall) no longer matches, so it is patched again.
+            val stampFile = File(iconDir, "windows_applied.txt")
+            val before = windowsStamp(variantKey, ico, links)
+            if (icoFile.isFile && runCatching { stampFile.readText() }.getOrNull() == before) return
+            icoFile.writeBytes(ico)
+
+            if (links.isNotEmpty()) WindowsAppIdHelper.patchShortcuts(links, appId = WindowsAppIdHelper.APP_ID, icoPath = icoFile.canonicalPath)
 
             notifyWindowsShell()
+            // Patching rewrites the shortcuts: the stamp records them as they are now.
+            runCatching { stampFile.writeText(windowsStamp(variantKey, ico, links)) }
         } catch (e: Throwable) {
             println("[AppIconInstaller] Failed to update Windows shortcut icons: ${e.message}")
         }
+    }
+
+    /**
+     * What the last Windows icon pass left: the variant, its icon, and each shortcut's content. Content, not
+     * date: the AppUserModelID pass touches every shortcut's date at each launch without changing it.
+     */
+    internal fun windowsStamp(variantKey: String, ico: ByteArray, links: List<File>): String = buildString {
+        fun sha(bytes: ByteArray) =
+            java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        append(variantKey).append('|').append(sha(ico))
+        links.map { it.absolutePath.lowercase() to (runCatching { sha(it.readBytes()) }.getOrNull() ?: "") }
+            .sortedBy { it.first }
+            .forEach { (path, content) -> append('\n').append(path).append('|').append(content) }
     }
 
     /**
@@ -281,7 +302,7 @@ object AppIconInstaller {
      * in-memory copy in StartMenuExperienceHost, which only lets go when it restarts — that is
      * safe (Windows brings it back on demand, and open windows and the taskbar are untouched).
      */
-    private fun notifyWindowsShell() {
+    internal fun notifyWindowsShell() {
         runCatching {
             val shell = com.sun.jna.Native.load(
                 "shell32", WindowsShellNotifier::class.java,
@@ -294,7 +315,10 @@ object AppIconInstaller {
             listOf("ie4uinit.exe", "-ClearIconCache"),
             listOf("taskkill", "/f", "/im", "StartMenuExperienceHost.exe")
         ).forEach { cmd ->
-            runCatching { ProcessBuilder(cmd).start() }
+            runCatching {
+                val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
+                p.waitFor(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
         }
     }
 
@@ -330,66 +354,10 @@ object AppIconInstaller {
     /** The launcher jpackage produces from `packageName = "KittyTune"`. */
     private const val WINDOWS_EXE = "KittyTune.exe"
 
-    /**
-     * Points each of our .lnk files' IconLocation at [icoFile].
-     *
-     * Shortcuts are matched on their TARGET, not their name: a shortcut the user renamed still
-     * gets caught, and — the reason a name match is not good enough — an unrelated app whose
-     * name happens to contain "kitty" does not. KiTTY and the kitty terminal both exist, and
-     * rewriting their icons would be a nasty thing to do.
-     *
-     * The shortcut list is handed over in a file rather than interpolated into the command, so
-     * neither an apostrophe in a user name nor a hundred shortcuts can break the invocation.
-     */
-    private fun updateShortcutIcons(links: List<File>, icoFile: File) {
-        val listFile = File(icoFile.parentFile, "shortcuts.txt")
-        runCatching {
-            listFile.writeText(links.joinToString("\n") { it.canonicalPath }, Charsets.UTF_8)
-        }.onFailure { return }
-
-        val ownExe = System.getProperty("jpackage.app-path")?.takeIf {
-            it.endsWith(".exe", ignoreCase = true)
-        }.orEmpty()
-
-        fun quote(s: String) = "'" + s.replace("'", "''") + "'"
-        val d = "${'$'}"
-        val script = """
-            ${d}ErrorActionPreference = 'SilentlyContinue'
-            ${d}ws = New-Object -ComObject WScript.Shell
-            ${d}exe = ${quote(ownExe)}
-            ${d}ico = ${quote(icoFile.canonicalPath)}
-            foreach (${d}p in (Get-Content -LiteralPath ${quote(listFile.canonicalPath)} -Encoding UTF8)) {
-                if (-not ${d}p) { continue }
-                try {
-                    ${d}l = ${d}ws.CreateShortcut(${d}p)
-                    ${d}t = ${d}l.TargetPath
-                    if (-not ${d}t) { continue }
-                    ${d}hit = ${d}false
-                    if (${d}exe -and (${d}t -ieq ${d}exe)) { ${d}hit = ${d}true }
-                    elseif ([System.IO.Path]::GetFileName(${d}t) -ieq '$WINDOWS_EXE') { ${d}hit = ${d}true }
-                    if (${d}hit) {
-                        ${d}l.IconLocation = ${d}ico + ',0'
-                        ${d}l.Save()
-                    }
-                } catch {}
-            }
-        """.trimIndent()
-
-        runCatching {
-            ProcessBuilder(
-                "powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-                "-Command", script
-            ).apply { redirectErrorStream(true) }.start().waitFor()
-        }.onFailure { println("[AppIconInstaller] PowerShell shortcut update failed: ${it.message}") }
-        runCatching { listFile.delete() }
-    }
-
-    /**
-     * Cheap pre-filter so the PowerShell pass only opens a handful of shortcuts instead of
-     * every .lnk in the Start Menu: a .lnk embeds its target path, so the launcher name shows
-     * up in the raw bytes as ASCII, UTF-16 or both.
-     */
     private fun mentionsOurLauncher(lnk: File): Boolean {
+        if (lnk.name.contains("KittyTune", ignoreCase = true) || lnk.name.contains("Kitty Tune", ignoreCase = true)) {
+            return true
+        }
         val bytes = runCatching {
             if (lnk.length() > 512 * 1024) return false
             lnk.readBytes()
@@ -416,62 +384,33 @@ object AppIconInstaller {
 
     // ------------------------------------------------------------------ macos
 
-    /**
-     * Replaces the .icns inside the running .app bundle. Finder, Launchpad, the Dock's
-     * not-running tile and the Cmd-Tab switcher all read the bundle, not the window, so this
-     * is the persistent half; [AppIconRuntime] handles the Dock while the app is running.
-     */
     private fun applyMacOs(variantKey: String) {
-        try {
-            val bundle = locateMacAppBundle() ?: run {
-                // Running from Gradle or a bare JAR: there is no bundle to rewrite, and the
-                // live Dock icon is already handled elsewhere.
-                println("[AppIconInstaller] Not running from an .app bundle; skipping bundle icon")
-                return
+        val bundle = locateMacAppBundle() ?: return
+        val source = variantPng(variantKey)?.let(IconEncoders::decode) ?: return
+        runCatching {
+            val icon = Files.createTempFile("kittytune-icon-", ".icns")
+            try {
+                Files.write(icon, IconEncoders.icns(source))
+                val process = ProcessBuilder(
+                    "/usr/bin/osascript", "-l", "JavaScript", "-e", """
+                        ObjC.import("AppKit");
+                        function run(argv) {
+                            const image = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
+                            if (!$.NSWorkspace.sharedWorkspace.setIconForFileOptions(image, argv[1], 0)) {
+                                throw Error("Unable to set the Finder icon");
+                            }
+                        }
+                    """.trimIndent(), icon.toString(), bundle.absolutePath
+                ).redirectErrorStream(true).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }
+                check(process.waitFor() == 0) { output.trim() }
+            } finally {
+                Files.deleteIfExists(icon)
             }
-            val pngBytes = variantPng(variantKey) ?: return
-            val source = IconEncoders.decode(pngBytes) ?: return
-
-            val resources = File(bundle, "Contents/Resources")
-            if (!resources.isDirectory && !resources.mkdirs()) return
-            val plist = File(bundle, "Contents/Info.plist")
-
-            val icnsName = bundleIconName(plist, resources)
-            val target = File(resources, icnsName)
-            if (!target.canWrite() && target.exists() && !target.setWritable(true)) {
-                println("[AppIconInstaller] $icnsName is not writable; skipping bundle icon")
-                return
-            }
-            target.writeBytes(IconEncoders.icns(source))
-
-            if (plist.isFile && !plist.readText().contains("CFBundleIconFile")) {
-                addPlistIconKey(plist, icnsName)
-            }
-
-            // Finder decides whether to re-read a bundle from its modification date, and
-            // LaunchServices keeps its own copy keyed on the bundle path.
-            val now = System.currentTimeMillis()
-            listOf(resources, File(bundle, "Contents"), bundle).forEach {
-                runCatching { it.setLastModified(now) }
-            }
-            listOf(
-                listOf(LSREGISTER, "-f", bundle.absolutePath),
-                // The Dock caches the tile image in memory; it comes back within a second and
-                // nothing is lost, which is the same trade as kbuildsycoca on KDE.
-                listOf("killall", "-HUP", "Dock")
-            ).forEach { cmd ->
-                runCatching {
-                    ProcessBuilder(cmd).redirectErrorStream(true).start().waitFor()
-                }
-            }
-        } catch (e: Throwable) {
-            println("[AppIconInstaller] Failed to update macOS bundle icon: ${e.message}")
+        }.onFailure {
+            println("[AppIconInstaller] Failed to update Finder icon: ${it.message}")
         }
     }
-
-    private const val LSREGISTER =
-        "/System/Library/Frameworks/CoreServices.framework/Frameworks/" +
-            "LaunchServices.framework/Support/lsregister"
 
     /**
      * Finds the .app we are executing from. jpackage passes the launcher path in
@@ -491,33 +430,4 @@ object AppIconInstaller {
         }
         return null
     }
-
-    /** CFBundleIconFile if the plist names one, else any existing .icns, else the bundle name. */
-    private fun bundleIconName(plist: File, resources: File): String {
-        val declared = runCatching {
-            Regex(
-                "<key>CFBundleIconFile</key>\\s*<string>([^<]+)</string>",
-                RegexOption.IGNORE_CASE
-            ).find(plist.readText())?.groupValues?.get(1)?.trim()
-        }.getOrNull()
-
-        val name = declared?.takeIf { it.isNotEmpty() }
-            ?: resources.listFiles { f -> f.isFile && f.extension.equals("icns", true) }
-                ?.firstOrNull()?.name
-            ?: "KittyTune"
-
-        return if (name.endsWith(".icns", ignoreCase = true)) name else "$name.icns"
-    }
-
-    private fun addPlistIconKey(plist: File, icnsName: String) {
-        runCatching {
-            val text = plist.readText()
-            val marker = "<dict>"
-            val at = text.indexOf(marker)
-            if (at < 0) return
-            val insertion = "\n  <key>CFBundleIconFile</key>\n  <string>$icnsName</string>"
-            plist.writeText(text.substring(0, at + marker.length) + insertion + text.substring(at + marker.length))
-        }
-    }
 }
-

@@ -1,5 +1,6 @@
 package com.alananasss.kittytune.data.cover
 
+import com.alananasss.kittytune.core.BoundedCache
 import com.alananasss.kittytune.utils.Logger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -33,12 +34,14 @@ object AppleMusicArtistBackgroundProvider {
         val expiresAtMs: Long,
     )
 
-    private val cache = ConcurrentHashMap<String, CacheEntry>()
-    private val negativeCache = ConcurrentHashMap<String, Long>()
+    // Bounded LRU caches (audit Phase 2 RAM gain).
+    private val cache = BoundedCache<String, CacheEntry>(256)
+    private val negativeCache = BoundedCache<String, Long>(256)
     private const val CACHE_TTL_MS = 24 * 60 * 60 * 1000L // 24 hours
     private const val NEGATIVE_CACHE_TTL_MS = 10 * 60 * 1000L // 10 minutes
 
-    private val http = OkHttpClient.Builder()
+    // Shares ProxyManager's pool and dispatcher; only the timeouts are this provider's own.
+    private val http = com.alananasss.kittytune.data.network.ProxyManager.getOkHttpClient().newBuilder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .build()

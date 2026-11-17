@@ -7,10 +7,13 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import com.alananasss.kittytune.ui.icons.Icon
@@ -38,6 +41,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.TextStyle
 import java.util.Locale
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 
 /** The full lists the summary opens. */
 internal enum class StatsList { NONE, PLAYS, TRACKS, ARTISTS }
@@ -63,6 +68,9 @@ fun ListeningStatsScreen(
     onBackClick: () -> Unit,
     onTrackClick: (trackId: Long) -> Unit,
     onArtistClick: (ReportArtist) -> Unit,
+    onOpenRecap: (String) -> Unit = {},
+    onOpenRecaps: () -> Unit = {},
+    onOpenPassport: () -> Unit = {},
 ) {
     // Built through an explicit initializer: the default factory route throws on desktop (issue #33).
     val viewModel: ListeningStatsViewModel = viewModel { ListeningStatsViewModel() }
@@ -87,8 +95,14 @@ fun ListeningStatsScreen(
         StatsHeader(
             report = report,
             period = viewModel.period,
+            periodOffset = viewModel.periodOffset,
+            canGoBack = viewModel.canGoBack,
+            canGoForward = viewModel.canGoForward,
             style = style,
             onSelect = viewModel::selectPeriod,
+            onPrevious = viewModel::previousPeriod,
+            onNext = viewModel::nextPeriod,
+            onReset = viewModel::resetToCurrentPeriod,
             onStyle = {
                 style = it
                 Prefs.putString(KEY_STATS_STYLE, it.name)
@@ -99,19 +113,34 @@ fun ListeningStatsScreen(
         AnimatedContent(
             targetState = report?.takeIf { !viewModel.isLoading }?.let { it to style },
             transitionSpec = { fadeIn(tween(220, delayMillis = 60)) togetherWith fadeOut(tween(90)) },
-            contentKey = { it?.let { (r, s) -> r.window to s } },
+            // Keyed on where the span starts, not on the whole window: a window runs up to "now", so every
+            // listen that finished while the screen was open gave it a new key, and the whole page was built
+            // again under the pointer, hover lost and charts growing in from zero (issue #66).
+            contentKey = { it?.let { (r, s) -> r.window.startMs to s } },
             modifier = Modifier.fillMaxSize(),
             label = "statsBody",
         ) { shown ->
             val (shownReport, shownStyle) = shown ?: (null to style)
+            val recaps: @Composable () -> Unit = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    com.alananasss.kittytune.ui.profile.passport.MusicPassportButton(
+                        onClick = onOpenPassport,
+                    )
+                    com.alananasss.kittytune.ui.profile.recap.RecapCarouselSection(
+                        onOpenRecap = onOpenRecap,
+                        onSeeAll = onOpenRecaps,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
+                }
+            }
             when {
                 shownReport == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     ContainedLoadingIndicator()
                 }
                 !shownReport.hasData -> EmptyStats()
-                shownStyle == StatsStyle.OVERVIEW -> OverviewStats(shownReport, viewModel.period, { openList = it }, onTrackClick, onArtistClick)
-                shownStyle == StatsStyle.COMPACT -> CompactStats(shownReport, viewModel.period, { openList = it }, onTrackClick, onArtistClick)
-                else -> StoryStats(shownReport, viewModel.period, { openList = it }, onTrackClick, onArtistClick)
+                shownStyle == StatsStyle.OVERVIEW -> OverviewStats(shownReport, viewModel.period, { openList = it }, onTrackClick, onArtistClick, header = recaps)
+                shownStyle == StatsStyle.COMPACT -> CompactStats(shownReport, viewModel.period, { openList = it }, onTrackClick, onArtistClick, header = recaps)
+                else -> StoryStats(shownReport, viewModel.period, { openList = it }, onTrackClick, onArtistClick, header = recaps)
             }
         }
     }
@@ -121,8 +150,14 @@ fun ListeningStatsScreen(
 private fun StatsHeader(
     report: ListeningReport?,
     period: ReportPeriod,
+    periodOffset: Int,
+    canGoBack: Boolean,
+    canGoForward: Boolean,
     style: StatsStyle,
     onSelect: (ReportPeriod) -> Unit,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onReset: () -> Unit,
     onStyle: (StatsStyle) -> Unit,
     onPrivacy: () -> Unit,
 ) {
@@ -146,11 +181,11 @@ private fun StatsHeader(
             }
             Box {
                 if (isNarrow) {
-                    FilledTonalIconButton(onClick = { styleMenu = true }) {
+                    FilledTonalIconButton(shapes = IconButtonDefaults.shapes(), onClick = { styleMenu = true }) {
                         Icon(style.icon, contentDescription = str(style.labelKey), modifier = Modifier.size(20.dp))
                     }
                 } else {
-                    FilledTonalButton(onClick = { styleMenu = true }, contentPadding = PaddingValues(horizontal = 14.dp)) {
+                    FilledTonalButton(shapes = ButtonDefaults.shapes(), onClick = { styleMenu = true }, contentPadding = PaddingValues(horizontal = 14.dp)) {
                         Icon(style.icon, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(str(style.labelKey))
@@ -177,7 +212,7 @@ private fun StatsHeader(
                     }
                 }
             }
-            IconButton(onClick = onPrivacy) {
+            IconButton(shapes = IconButtonDefaults.shapes(), onClick = onPrivacy) {
                 Icon(Icons.Rounded.Tune, contentDescription = str("pref_privacy_title"))
             }
         }
@@ -205,6 +240,86 @@ private fun StatsHeader(
                 )
             },
         )
+
+        if (period != ReportPeriod.ALL_TIME) {
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .widthIn(max = 560.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerLow)
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                FilledTonalIconButton(
+                    onClick = onPrevious,
+                    enabled = canGoBack,
+                    shapes = IconButtonDefaults.shapes(),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        disabledContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f)
+                    ),
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Rounded.ArrowBack,
+                        contentDescription = str("listening_stats_previous_period"),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .then(if (periodOffset != 0) Modifier.clickable { onReset() } else Modifier)
+                        .padding(vertical = 2.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    val headline = if (report != null) periodHeadline(period, periodOffset, report) else ""
+                    val subtitle = if (report != null && periodOffset != 0) spanLabel(period, report) else null
+                    Text(
+                        text = headline,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = TextAlign.Center
+                    )
+                    if (subtitle != null) {
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+
+                FilledTonalIconButton(
+                    onClick = onNext,
+                    enabled = canGoForward,
+                    shapes = IconButtonDefaults.shapes(),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        disabledContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f)
+                    ),
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Rounded.ArrowForward,
+                        contentDescription = str("listening_stats_next_period"),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
     }
     }
 }
@@ -249,7 +364,7 @@ private fun PrivacyDialog(onDismiss: () -> Unit) {
                 Text(str("listening_stats_disclaimer"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(str("btn_close")) } },
+        confirmButton = { TextButton(shapes = ButtonDefaults.shapes(), onClick = onDismiss) { Text(str("btn_close")) } },
     )
 }
 
@@ -285,7 +400,7 @@ internal fun StatsCard(
                     }
                 }
                 if (action != null) {
-                    TextButton(onClick = action) { Text(str("listening_stats_show_all")) }
+                    TextButton(shapes = ButtonDefaults.shapes(), onClick = action) { Text(str("listening_stats_show_all")) }
                 }
             }
             Spacer(Modifier.height(12.dp))
@@ -336,11 +451,42 @@ internal fun spanLabel(period: ReportPeriod, report: ListeningReport): String {
     val start = Instant.ofEpochMilli(report.window.startMs).atZone(zone).toLocalDate()
     val end = Instant.ofEpochMilli(report.window.endMs).atZone(zone).toLocalDate().minusDays(1)
     val loc = statsLocale()
+    val currentYear = java.time.LocalDate.now(zone).year
     return when (period) {
-        ReportPeriod.WEEK -> "${start.dayOfMonth} ${start.month.getDisplayName(TextStyle.SHORT, loc)} – ${end.dayOfMonth} ${end.month.getDisplayName(TextStyle.SHORT, loc)}"
+        ReportPeriod.WEEK -> {
+            val startStr = "${start.dayOfMonth} ${start.month.getDisplayName(TextStyle.SHORT, loc)}"
+            val endStr = "${end.dayOfMonth} ${end.month.getDisplayName(TextStyle.SHORT, loc)}"
+            if (end.year != currentYear) {
+                "$startStr – $endStr ${end.year}"
+            } else {
+                "$startStr – $endStr"
+            }
+        }
         ReportPeriod.MONTH -> "${start.month.getDisplayName(TextStyle.FULL_STANDALONE, loc).replaceFirstChar { it.titlecase(loc) }} ${start.year}"
         ReportPeriod.YEAR -> start.year.toString()
         ReportPeriod.ALL_TIME -> str("listening_stats_since", "${start.month.getDisplayName(TextStyle.FULL_STANDALONE, loc)} ${start.year}")
+    }
+}
+
+@Composable
+internal fun periodHeadline(period: ReportPeriod, offset: Int, report: ListeningReport): String {
+    if (period == ReportPeriod.ALL_TIME) {
+        return str("listening_stats_period_all")
+    }
+    return when (offset) {
+        0 -> when (period) {
+            ReportPeriod.WEEK -> str("listening_stats_period_week_current")
+            ReportPeriod.MONTH -> str("listening_stats_period_month_current")
+            ReportPeriod.YEAR -> str("listening_stats_period_year_current")
+            ReportPeriod.ALL_TIME -> str("listening_stats_period_all")
+        }
+        -1 -> when (period) {
+            ReportPeriod.WEEK -> str("listening_stats_period_week_last")
+            ReportPeriod.MONTH -> str("listening_stats_period_month_last")
+            ReportPeriod.YEAR -> str("listening_stats_period_year_last")
+            ReportPeriod.ALL_TIME -> str("listening_stats_period_all")
+        }
+        else -> spanLabel(period, report)
     }
 }
 

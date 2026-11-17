@@ -1,11 +1,13 @@
-package com.alananasss.kittytune.data
+﻿package com.alananasss.kittytune.data
 
 import com.alananasss.kittytune.audio.AudioEngine
 import com.alananasss.kittytune.domain.Track
 import com.alananasss.kittytune.ui.player.AudioEffectsState
+import com.alananasss.kittytune.ui.player.EqualizerState
 import com.alananasss.kittytune.ui.player.PlaybackContext
 import com.alananasss.kittytune.utils.Config
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,6 +38,9 @@ object MusicManager {
     val player = com.alananasss.kittytune.media.Player()
 
     var currentTrack: Track? = null
+
+    /** Real-time beat tracking of what plays (the kitty pet dances on it). */
+    val liveBeat: com.alananasss.kittytune.audio.beat.LiveBeatTracker get() = player.liveBeat
 
     // --- DRM token cache (kept for API compatibility; playback via CEF is a later TODO) ---
     /** One short token per track, bounded so it does not accumulate for a whole session (issue #33). */
@@ -80,9 +85,32 @@ object MusicManager {
 
     private var rainPlayer: RainPlayer? = null
     private val tokenManager = TokenManager
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     @Volatile private var initialized = false
+
+    val isLoadingTrackFlow = MutableStateFlow(false)
+    var isLoadingTrack: Boolean
+        get() = isLoadingTrackFlow.value
+        set(value) {
+            isLoadingTrackFlow.value = value
+        }
+
+    val playWhenReadyRequestedFlow = MutableStateFlow(false)
+    var playWhenReadyRequested: Boolean
+        get() = playWhenReadyRequestedFlow.value
+        set(value) {
+            if (playWhenReadyRequestedFlow.value == value) return
+            playWhenReadyRequestedFlow.value = value
+            if (!value) {
+                try {
+                    if (player.playWhenReady) {
+                        player.playWhenReady = false
+                        player.pause()
+                    }
+                } catch (_: Exception) {}
+            }
+        }
 
     // --- observable playback state (the ViewModel mirrors these into Compose state) ------
     val isPlaying: Boolean get() = player.isPlaying
@@ -100,6 +128,18 @@ object MusicManager {
         _contextFlow.value = prefs.getLastContext()
 
         com.alananasss.kittytune.audio.automix.AutomixManager.init()
+        // Every engine reads these, including the decks a crossfade creates later.
+        com.alananasss.kittytune.audio.silence.SkipSilence.applySettings(prefs)
+
+        // Content filtering (issue #41): warm the block cache and load the
+        // ArtifactNet model if already downloaded (mirrors PlaybackService.onCreate).
+        // Model load is off the main thread: mmap + XNNPACK delegate init is seconds.
+        BlockManager.init()
+        scope.launch(Dispatchers.IO) {
+            com.alananasss.kittytune.audio.ai.AiDetectionManager.init(
+                loadModel = com.alananasss.kittytune.audio.ai.AiDetectionManager.isDetectionWanted()
+            )
+        }
 
         // The saved level has to be applied here rather than from the ViewModel: AppBootstrap
         // calls init() before any ViewModel exists, and plenty of code drives playback through
@@ -142,7 +182,7 @@ object MusicManager {
                 player.activeEngine.clearTrackLoudness()
                 TrackLoudnessRepository.scanTrackAsync(track, url, headers) { scanned ->
                     if (currentTrack?.id == track.id) {
-                        player.activeEngine.setTrackLoudness(scanned.integratedLufs, scanned.truePeakDb)
+                        player.activeEngine.updateTrackLoudness(scanned.integratedLufs, scanned.truePeakDb)
                     }
                 }
             }
@@ -175,6 +215,7 @@ object MusicManager {
     fun setTrackGainDb(db: Float) { player.trackGainDb = db }
     fun getVolume(): Float = player.volume
     fun stop() = player.stop()
+    fun cancelCrossfade() = player.cancelCrossfade()
 
     val isCrossfadingOut: Boolean get() = player.isCrossfadingOut
 
@@ -194,9 +235,10 @@ object MusicManager {
         item: com.alananasss.kittytune.media.MediaItem,
         startPositionMs: Long,
         crossfadeDurationMs: Long,
-        automixPlan: com.alananasss.kittytune.audio.automix.AutomixPlan? = null
+        automixPlan: com.alananasss.kittytune.audio.automix.AutomixPlan? = null,
+        pairPlan: com.alananasss.kittytune.audio.automix.TransitionPlan? = null,
     ) {
-        player.crossfadeToMediaItem(item, startPositionMs, crossfadeDurationMs, automixPlan)
+        player.crossfadeToMediaItem(item, startPositionMs, crossfadeDurationMs, automixPlan, pairPlan)
     }
 
     fun applyEffects(state: AudioEffectsState) {
@@ -204,6 +246,14 @@ object MusicManager {
         rainPlayer?.setAmbientType(state.ambientType)
         rainPlayer?.setEnabled(state.isRainEnabled)
         rainPlayer?.setVolume(state.rainVolume)
+    }
+
+    fun applyEqualizer(state: EqualizerState) {
+        player.applyEqualizer(state)
+    }
+
+    fun onKaraokeStemReady(trackId: Long) {
+        player.onKaraokeStemReady(trackId)
     }
 
     fun hotSwapDevice() {

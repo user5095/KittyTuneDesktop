@@ -11,7 +11,6 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -30,16 +29,20 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.Density
+import com.alananasss.kittytune.ui.theme.withUiScale
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -87,6 +90,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -109,11 +113,14 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Window
+import androidx.compose.ui.awt.SwingWindow
+import androidx.compose.ui.window.WindowDecoration
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.rememberWindowState
 import coil3.compose.AsyncImage
 import com.alananasss.kittytune.core.str
+import com.alananasss.kittytune.data.local.MiniPlayerContentMode
 import com.alananasss.kittytune.data.local.MiniPlayerStyle
 import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.ui.common.Tip
@@ -121,29 +128,34 @@ import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.ui.player.lyrics.LyricLine
 import com.alananasss.kittytune.ui.player.lyrics.LyricWord
 import com.alananasss.kittytune.ui.player.lyrics.LyricsUtils
+import com.alananasss.kittytune.core.LinuxWindowHelper
 import com.alananasss.kittytune.ui.theme.KittyTuneTheme
 import java.awt.Cursor
 
-private class WindowDragHandler(
+internal class WindowDragHandler(
     private val window: java.awt.Window,
     private val onDragStart: () -> Unit,
     private val onDragEnd: () -> Unit,
 ) {
+    internal val isDragging: Boolean get() = isDraggingInternal
+
     private var dragStartMouseX = 0
     private var dragStartMouseY = 0
     private var windowStartX = 0
     private var windowStartY = 0
     private var isDraggingInternal = false
+    private var isNativeMoveActive = false
+    private var pendingMoveX = 0
+    private var pendingMoveY = 0
+    private var lastManualMoveNs = 0L
 
     private val dragMotionListener = object : java.awt.event.MouseMotionAdapter() {
         override fun mouseDragged(e: java.awt.event.MouseEvent) {
-            val dx = e.xOnScreen - dragStartMouseX
-            val dy = e.yOnScreen - dragStartMouseY
-            val newX = windowStartX + dx
-            val newY = windowStartY + dy
-            if (window.x != newX || window.y != newY) {
-                window.setLocation(newX, newY)
-            }
+            if (isNativeMoveActive) return
+            val curPointer = java.awt.MouseInfo.getPointerInfo()?.location
+            val curX = curPointer?.x ?: e.xOnScreen
+            val curY = curPointer?.y ?: e.yOnScreen
+            onPointerMove(curX, curY)
         }
     }
 
@@ -165,10 +177,16 @@ private class WindowDragHandler(
     }
 
     fun startDrag(xRoot: Int, yRoot: Int) {
-        if (isDraggingInternal) return
+        // A fresh primary press proves any previous button is up: a missed release
+        // (eaten by a native move loop, lost focus dance) must never latch dragging
+        // on forever — that wedged state read as "can't drag, click or move at all".
+        if (isDraggingInternal) stopDrag()
         isDraggingInternal = true
         dragStartMouseX = xRoot
         dragStartMouseY = yRoot
+        pendingMoveX = xRoot
+        pendingMoveY = yRoot
+        lastManualMoveNs = 0L
         windowStartX = window.x
         windowStartY = window.y
         onDragStart()
@@ -176,15 +194,50 @@ private class WindowDragHandler(
         window.addMouseListener(dragMouseListener)
         window.addWindowFocusListener(focusListener)
 
-        val nativeStarted = com.alananasss.kittytune.core.LinuxWindowHelper.startNativeMove(window, xRoot, yRoot)
+        // Windows moves it by hand: the system's own move loop swallowed the release and the pointer events with it.
+        val nativeStarted = !isWindows && com.alananasss.kittytune.core.LinuxWindowHelper.startNativeMove(window, xRoot, yRoot)
+        isNativeMoveActive = nativeStarted
+        if (!loggedDragPath) {
+            loggedDragPath = true
+            println(
+                "MiniPlayer: drag via " +
+                    (if (nativeStarted) "native WM move" else "manual fallback") +
+                    " (wayland=${com.alananasss.kittytune.core.LinuxWindowHelper.isWayland})"
+            )
+        }
         if (!nativeStarted) {
             window.addMouseMotionListener(dragMotionListener)
         }
     }
 
+    fun onPointerMove(xRoot: Int, yRoot: Int) {
+        if (!isDraggingInternal || isNativeMoveActive) return
+        pendingMoveX = xRoot
+        pendingMoveY = yRoot
+        // Frame-paced placements: motion events (Compose loop + AWT listener) arrive by
+        // the hundred per second, and every setLocation is a compositor round-trip that
+        // re-targets its move animation. Flushing at most once per frame with the latest
+        // position keeps tracking 1:1 instead of swimming around the cursor.
+        val now = System.nanoTime()
+        if (now - lastManualMoveNs < MANUAL_MOVE_MIN_INTERVAL_NS) return
+        lastManualMoveNs = now
+        flushPendingMove()
+    }
+
+    private fun flushPendingMove() {
+        val newX = windowStartX + (pendingMoveX - dragStartMouseX)
+        val newY = windowStartY + (pendingMoveY - dragStartMouseY)
+        if (window.x != newX || window.y != newY) {
+            window.setLocation(newX, newY)
+        }
+    }
+
     fun stopDrag() {
         if (!isDraggingInternal) return
+        // Land exactly under the cursor: the throttle above may hold back the tail.
+        if (!isNativeMoveActive) flushPendingMove()
         isDraggingInternal = false
+        isNativeMoveActive = false
         window.removeMouseListener(dragMouseListener)
         window.removeMouseMotionListener(dragMotionListener)
         window.removeWindowFocusListener(focusListener)
@@ -195,6 +248,13 @@ private class WindowDragHandler(
         stopDrag()
     }
 }
+
+private var loggedDragPath = false
+
+private val isWindows = System.getProperty("os.name").lowercase().contains("win")
+
+/** At most one manual placement per frame: faster only churns the compositor. */
+private const val MANUAL_MOVE_MIN_INTERVAL_NS = 16_000_000L
 
 /**
  * A floating mini-player for lyrics that stays on top of windows.
@@ -212,6 +272,7 @@ fun MiniLyricsPlayerWindow(
 ) {
     val prefs = remember { PlayerPreferences() }
     val miniPlayerStyle by prefs.miniPlayerStyleFlow().collectAsState(initial = prefs.getMiniPlayerStyle())
+    val contentMode by prefs.miniPlayerContentModeFlow().collectAsState(initial = prefs.getMiniPlayerContentMode())
     val transparentBg by prefs.miniPlayerTransparentBgFlow().collectAsState(initial = prefs.getMiniPlayerTransparentBg())
     val isElongated = miniPlayerStyle == MiniPlayerStyle.ELONGATED
 
@@ -267,7 +328,8 @@ fun MiniLyricsPlayerWindow(
         }
     }
 
-    val closeMiniPlayer = {
+    val closeMiniPlayer = { reason: String ->
+        println("MiniPlayer: closing (reason=$reason)")
         val pos = windowState.position
         val curX = if (isElongated) prefs.getMiniPlayerElongatedX() else prefs.getMiniPlayerX()
         val curY = if (isElongated) prefs.getMiniPlayerElongatedY() else prefs.getMiniPlayerY()
@@ -280,44 +342,89 @@ fun MiniLyricsPlayerWindow(
         } else {
             viewModel.saveMiniPlayerBounds(x, y, w, h)
         }
-        com.alananasss.kittytune.core.Prefs.flush(force = true)
         viewModel.toggleMiniPlayer(false)
     }
 
     // Out of the way while the app is full screen, like any overlay.
     val isFullScreen = isAppFullScreen || com.alananasss.kittytune.core.AppWindowState.fullScreen
 
-    Window(
-        onCloseRequest = closeMiniPlayer,
+    // Opaque on machines where a transparent window froze the app (RTSS); see FloatingWindowCompat. The
+    // transparency of a shown window cannot change, so switching the mode builds the window again.
+    val compat = com.alananasss.kittytune.core.FloatingWindowCompat.opaque
+    androidx.compose.runtime.key(compat) {
+    // Marks the opening on disk: if it freezes the app, the next launch opens it in compatibility mode.
+    remember { com.alananasss.kittytune.core.FloatingWindowCompat.opening() }
+    // Starts hidden: the type and transparency are set before the first map, so tiling
+    // compositors (Hyprland) manage the window as a floating utility from the start
+    // instead of tiling a briefly-NORMAL window that can never be dragged afterwards.
+    // Inside the key, so a window built again is set up again before it shows.
+    var windowReady by remember { mutableStateOf(false) }
+
+    SwingWindow(
+        onCloseRequest = { closeMiniPlayer("os-close-request") },
         state = windowState,
-        visible = !isFullScreen,
+        visible = !isFullScreen && windowReady,
         alwaysOnTop = isPinned,
-        undecorated = true,
-        transparent = true,
-        resizable = true,
+        decoration = WindowDecoration.Undecorated(),
+        transparent = !compat,
+        // Native live resize can ignore AWT maximumSize. Use the bounded handles below.
+        resizable = false,
         title = "KittyTune Mini Player",
+        init = { window ->
+            if (LinuxWindowHelper.isLinux) LinuxWindowHelper.configureUtilityWindow(window)
+            else window.type = java.awt.Window.Type.UTILITY
+        },
     ) {
+        // Pre-map setup while the window is still hidden (see windowReady above):
+        // type, transparency and show-time styling land before the compositor ever
+        // maps the window, which is what makes tiling WMs float it as a utility.
+        DisposableEffect(window) {
+            val shownListener = object : java.awt.event.ComponentAdapter() {
+                override fun componentShown(e: java.awt.event.ComponentEvent?) {
+                    if (com.alananasss.kittytune.data.theme.WindowsFullScreen.isWindows) {
+                        com.alananasss.kittytune.core.ToolWindowStyle.apply(window)
+                    }
+                }
+            }
+            // Restyled while still hidden: nothing to hide and re-show later, which is what froze the window.
+            if (com.alananasss.kittytune.data.theme.WindowsFullScreen.isWindows) com.alananasss.kittytune.core.ToolWindowStyle.apply(window)
+            window.addComponentListener(shownListener)
+            windowReady = true
+            onDispose { window.removeComponentListener(shownListener) }
+        }
+
         val density = LocalDensity.current
         val uiScale by prefs.uiScaleFlow().collectAsState(initial = prefs.getUiScale())
         val customDensity = remember(density, uiScale) {
-            Density(
-                density = density.density * uiScale,
-                fontScale = density.fontScale * uiScale
-            )
+            density.withUiScale(uiScale)
         }
 
-        // Exact physical pixel limits for window sizing and OS window manager hints
-        val minWidthPx = with(density) { minW.dp.roundToPx() }
-        val maxWidthPx = with(density) { maxW.dp.roundToPx() }
-        val minHeightPx = with(density) { minH.dp.roundToPx() }
-        val maxHeightPx = with(density) { maxH.dp.roundToPx() }
+        // Opaque mode: the card's corners (10 dp elongated, 22 dp otherwise) are cut by the window's shape.
+        if (compat) {
+            DisposableEffect(window, uiScale, isElongated) {
+                val radius = if (isElongated) 10.0 else 22.0
+                val remove = com.alananasss.kittytune.core.FloatingWindowCompat.keepRoundedShape(window) { radius * uiScale }
+                onDispose { remove() }
+            }
+        }
+        // Up and drawing for a few seconds: the opening did not freeze anything.
+        LaunchedEffect(window) {
+            kotlinx.coroutines.delay(4_000)
+            com.alananasss.kittytune.core.FloatingWindowCompat.opened()
+        }
 
-        val saveCurrentBounds: () -> Unit = remember(window, isElongated, density, minW, maxW, minH, maxH) {
+        // AWT bounds and MouseInfo use logical screen coordinates.
+        val widthRange = minW..maxW
+        val heightRange = minH..maxH
+        val resizeEdge = 6.dp
+        val gripSize = if (isElongated) 14.dp else 20.dp
+
+        val saveCurrentBounds: () -> Unit = remember(window, isElongated, widthRange, heightRange) {
             {
-                val x = (window.x / density.density).toInt()
-                val y = (window.y / density.density).toInt()
-                val w = (window.width / density.density).toInt().coerceIn(minW, maxW)
-                val h = (window.height / density.density).toInt().coerceIn(minH, maxH)
+                val x = window.x
+                val y = window.y
+                val w = window.width.coerceIn(minW, maxW)
+                val h = window.height.coerceIn(minH, maxH)
                 if (isElongated) {
                     viewModel.saveMiniPlayerElongatedBounds(x, y, w, h)
                 } else {
@@ -332,10 +439,10 @@ fun MiniLyricsPlayerWindow(
                 val prevStyle = lastAppliedStyle
                 lastAppliedStyle = miniPlayerStyle
 
-                val curX = (window.x / density.density).toInt()
-                val curY = (window.y / density.density).toInt()
-                val curW = (window.width / density.density).toInt()
-                val curH = (window.height / density.density).toInt()
+                val curX = window.x
+                val curY = window.y
+                val curW = window.width
+                val curH = window.height
 
                 if (prevStyle == MiniPlayerStyle.ELONGATED) {
                     viewModel.saveMiniPlayerElongatedBounds(
@@ -356,16 +463,16 @@ fun MiniLyricsPlayerWindow(
                     val ey = prefs.getMiniPlayerElongatedY()
                     val ew = prefs.getMiniPlayerElongatedWidth()
                     val eh = prefs.getMiniPlayerElongatedHeight()
-                    val newMinW = with(density) { PlayerPreferences.MINI_PLAYER_ELONGATED_MIN_WIDTH.dp.roundToPx() }
-                    val newMaxW = with(density) { PlayerPreferences.MINI_PLAYER_ELONGATED_MAX_WIDTH.dp.roundToPx() }
-                    val newMinH = with(density) { PlayerPreferences.MINI_PLAYER_ELONGATED_MIN_HEIGHT.dp.roundToPx() }
-                    val newMaxH = with(density) { PlayerPreferences.MINI_PLAYER_ELONGATED_MAX_HEIGHT.dp.roundToPx() }
+                    val newMinW = PlayerPreferences.MINI_PLAYER_ELONGATED_MIN_WIDTH
+                    val newMaxW = PlayerPreferences.MINI_PLAYER_ELONGATED_MAX_WIDTH
+                    val newMinH = PlayerPreferences.MINI_PLAYER_ELONGATED_MIN_HEIGHT
+                    val newMaxH = PlayerPreferences.MINI_PLAYER_ELONGATED_MAX_HEIGHT
                     runCatching {
                         window.minimumSize = java.awt.Dimension(newMinW, newMinH)
                         window.maximumSize = java.awt.Dimension(newMaxW, newMaxH)
-                        window.setSize((ew * density.density).toInt(), (eh * density.density).toInt())
+                        window.setSize(ew, eh)
                         if (ex != null && ey != null) {
-                            window.setLocation((ex * density.density).toInt(), (ey * density.density).toInt())
+                            window.setLocation(ex, ey)
                             windowState.position = WindowPosition(ex.dp, ey.dp)
                         }
                     }
@@ -375,16 +482,16 @@ fun MiniLyricsPlayerWindow(
                     val sy = prefs.getMiniPlayerY()
                     val sw = prefs.getMiniPlayerWidth()
                     val sh = prefs.getMiniPlayerHeight()
-                    val newMinW = with(density) { PlayerPreferences.MINI_PLAYER_MIN_WIDTH.dp.roundToPx() }
-                    val newMaxW = with(density) { PlayerPreferences.MINI_PLAYER_MAX_WIDTH.dp.roundToPx() }
-                    val newMinH = with(density) { PlayerPreferences.MINI_PLAYER_MIN_HEIGHT.dp.roundToPx() }
-                    val newMaxH = with(density) { PlayerPreferences.MINI_PLAYER_MAX_HEIGHT.dp.roundToPx() }
+                    val newMinW = PlayerPreferences.MINI_PLAYER_MIN_WIDTH
+                    val newMaxW = PlayerPreferences.MINI_PLAYER_MAX_WIDTH
+                    val newMinH = PlayerPreferences.MINI_PLAYER_MIN_HEIGHT
+                    val newMaxH = PlayerPreferences.MINI_PLAYER_MAX_HEIGHT
                     runCatching {
                         window.minimumSize = java.awt.Dimension(newMinW, newMinH)
                         window.maximumSize = java.awt.Dimension(newMaxW, newMaxH)
-                        window.setSize((sw * density.density).toInt(), (sh * density.density).toInt())
+                        window.setSize(sw, sh)
                         if (sx != null && sy != null) {
-                            window.setLocation((sx * density.density).toInt(), (sy * density.density).toInt())
+                            window.setLocation(sx, sy)
                             windowState.position = WindowPosition(sx.dp, sy.dp)
                         }
                     }
@@ -399,35 +506,38 @@ fun MiniLyricsPlayerWindow(
             if (isFullScreen) return@LaunchedEffect
             if (com.alananasss.kittytune.data.theme.WindowsFullScreen.isWindows) {
                 com.alananasss.kittytune.core.ToolWindowStyle.apply(window)
-            } else {
-                com.alananasss.kittytune.core.LinuxWindowHelper.configureUtilityWindow(window)
             }
         }
 
         // Moved by the window manager itself where it can (smooth at the monitor's refresh rate), by hand otherwise.
+        val saveLatestBounds by rememberUpdatedState(saveCurrentBounds)
         val dragHandler = remember(window) {
             WindowDragHandler(
                 window = window,
                 onDragStart = { isDragging = true },
                 onDragEnd = {
                     isDragging = false
-                    saveCurrentBounds()
-                    com.alananasss.kittytune.core.Prefs.flush()
+                    runCatching {
+                        // The window's own coordinates are the units a Window position is in. Dividing by this
+                        // composition's density put the window somewhere else on a monitor with another scale,
+                        // which read as a mini player that cannot be moved to the second screen (issue #66).
+                        windowState.position = WindowPosition(window.x.dp, window.y.dp)
+                    }
+                    saveLatestBounds()
                 }
             )
         }
 
         DisposableEffect(window, isElongated) {
             runCatching {
-                window.background = java.awt.Color(0, 0, 0, 0)
                 window.isAlwaysOnTop = isPinned
-                window.minimumSize = java.awt.Dimension(minWidthPx, minHeightPx)
-                window.maximumSize = java.awt.Dimension(maxWidthPx, maxHeightPx)
+                window.minimumSize = java.awt.Dimension(minW, minH)
+                window.maximumSize = java.awt.Dimension(maxW, maxH)
             }
             val listener = object : java.awt.event.ComponentAdapter() {
                 override fun componentResized(e: java.awt.event.ComponentEvent) {
-                    val clampedW = window.width.coerceIn(minWidthPx, maxWidthPx)
-                    val clampedH = window.height.coerceIn(minHeightPx, maxHeightPx)
+                    val clampedW = window.width.coerceIn(minW, maxW)
+                    val clampedH = window.height.coerceIn(minH, maxH)
                     if (window.width != clampedW || window.height != clampedH) {
                         window.setSize(clampedW, clampedH)
                     }
@@ -441,11 +551,16 @@ fun MiniLyricsPlayerWindow(
                 dragHandler.cleanup()
                 window.removeComponentListener(listener)
                 saveCurrentBounds()
-                com.alananasss.kittytune.core.Prefs.flush(force = true)
             }
         }
 
-        CompositionLocalProvider(LocalDensity provides customDensity) {
+        // Its own window, so its own "can anyone see this": a mini player left behind a full-screen app, or
+        // hidden while the full player shows, must not keep animating for nobody (see LocalWindowSeen).
+        val windowSeen = com.alananasss.kittytune.core.rememberWindowSeen(window)
+        CompositionLocalProvider(
+            LocalDensity provides customDensity,
+            com.alananasss.kittytune.core.LocalWindowSeen provides windowSeen,
+        ) {
             KittyTuneTheme {
                 val prefsSnapshot by Prefs.flow.collectAsState()
                 val showCover = remember(prefsSnapshot) { prefs.getMiniPlayerShowCover() }
@@ -462,7 +577,9 @@ fun MiniLyricsPlayerWindow(
 
                 val surfaceAlpha by animateFloatAsState(
                     targetValue = when {
-                        transparentBg && (!hoverIllumination || !isEffectivelyHovered) -> 0.0f
+                        // Never fully clear: a pixel with no opacity at all is click-through on Windows, so the transparent look
+                    // could not be grabbed anywhere but on its words.
+                    transparentBg && (!hoverIllumination || !isEffectivelyHovered) -> 0.02f
                         transparentBg -> 0.35f
                         !hoverIllumination -> if (hoverEffect) 0.82f else 0.96f
                         !hoverEffect || isEffectivelyHovered -> 0.96f
@@ -471,10 +588,24 @@ fun MiniLyricsPlayerWindow(
                     animationSpec = tween(200)
                 )
 
-                val surfaceColor = if (transparentBg && surfaceAlpha == 0.0f) {
-                    Color.Transparent
-                } else {
-                    MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = surfaceAlpha)
+                // Nothing shows through an opaque window: a see-through surface would only show black behind it.
+                val surfaceColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(
+                    alpha = if (compat) 1f else surfaceAlpha
+                )
+                if (compat) {
+                    DisposableEffect(window, surfaceColor) {
+                        // During a resize AWT can clear the newly exposed area before Skia
+                        // presents a frame. Its window and canvas must clear to the card color.
+                        val background = java.awt.Color(surfaceColor.toArgb())
+                        fun applyBackground(component: java.awt.Component) {
+                            component.background = background
+                            if (component is java.awt.Container) {
+                                component.components.forEach(::applyBackground)
+                            }
+                        }
+                        applyBackground(window)
+                        onDispose { }
+                    }
                 }
 
                 val surfaceBorder = when {
@@ -495,7 +626,7 @@ fun MiniLyricsPlayerWindow(
                 // through the translucent surface. The border does the separating instead.
                 val shadowElevation = 0.dp
 
-                Box(Modifier.fillMaxSize()) {
+                Box(Modifier.fillMaxSize().background(if (compat) surfaceColor else Color.Transparent)) {
                     Surface(
                         shape = surfaceShape,
                         color = surfaceColor,
@@ -504,24 +635,7 @@ fun MiniLyricsPlayerWindow(
                         modifier = Modifier
                             .fillMaxSize()
                             .hoverable(windowInteractionSource)
-                            .pointerInput(Unit) {
-                                awaitEachGesture {
-                                    val down = awaitFirstDown(requireUnconsumed = true)
-                                    if (down.type == PointerType.Mouse && currentEvent.buttons.isPrimaryPressed) {
-                                        val awtEvent = currentEvent.nativeEvent as? java.awt.event.MouseEvent
-                                        val xRoot = awtEvent?.xOnScreen ?: (window.x + down.position.x.toInt())
-                                        val yRoot = awtEvent?.yOnScreen ?: (window.y + down.position.y.toInt())
-                                        dragHandler.startDrag(xRoot, yRoot)
-                                        while (true) {
-                                            val event = awaitPointerEvent()
-                                            if (event.changes.all { !it.pressed }) {
-                                                dragHandler.stopDrag()
-                                                break
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            .dragsWindow(window, dragHandler, resizeEdge, gripSize)
                     ) {
                         // Context menu state: opened by right-click anywhere on the mini player
                         var contextMenuVisible by remember { mutableStateOf(false) }
@@ -545,6 +659,7 @@ fun MiniLyricsPlayerWindow(
                                 MiniLyricsElongatedContent(
                                     viewModel = viewModel,
                                     windowHeight = windowState.size.height,
+                                    contentMode = contentMode,
                                     showCover = showCover,
                                     showPlayback = showPlayback,
                                     showAdditional = showAdditional,
@@ -557,6 +672,7 @@ fun MiniLyricsPlayerWindow(
                                 MiniLyricsContent(
                                     viewModel = viewModel,
                                     windowHeight = windowState.size.height,
+                                    contentMode = contentMode,
                                     showCover = showCover,
                                     showPlayback = showPlayback,
                                     showAdditional = showAdditional,
@@ -614,91 +730,39 @@ fun MiniLyricsPlayerWindow(
                                         danger = true,
                                         onClick = {
                                             contextMenuVisible = false
-                                            closeMiniPlayer()
+                                            closeMiniPlayer("context-menu-hide")
                                         },
                                     )
                                 }
                             }
                             if (settingsVisible) {
-                                MiniPlayerSettingsWindow(onClose = { settingsVisible = false })
+                                MiniPlayerSettingsWindow(onClose = { settingsVisible = false }, nearWindow = window)
                             }
 
-                            // Right edge resize handle
                             Box(
-                                modifier = Modifier
-                                    .align(Alignment.CenterEnd)
-                                    .fillMaxHeight()
-                                    .width(6.dp)
+                                Modifier.align(Alignment.CenterEnd).fillMaxHeight().width(resizeEdge)
                                     .pointerHoverIcon(PointerIcon(Cursor(Cursor.E_RESIZE_CURSOR)))
-                                    .pointerInput(Unit) {
-                                        awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
-                                    }
-                                    .pointerInput(minWidthPx, maxWidthPx) {
-                                        detectDragGestures(
-                                            onDragEnd = { saveCurrentBounds() },
-                                            onDrag = { change, dragAmount ->
-                                                change.consume()
-                                                val newW = (window.width + dragAmount.x.toInt()).coerceIn(minWidthPx, maxWidthPx)
-                                                window.setSize(newW, window.height)
-                                            }
-                                        )
-                                    }
+                                    .resizesWindow(window, widthRange, null, saveCurrentBounds)
                             )
-
-                            // Bottom edge resize handle
                             Box(
-                                modifier = Modifier
-                                    .align(Alignment.BottomCenter)
-                                    .fillMaxWidth()
-                                    .height(6.dp)
+                                Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(resizeEdge)
                                     .pointerHoverIcon(PointerIcon(Cursor(Cursor.S_RESIZE_CURSOR)))
-                                    .pointerInput(Unit) {
-                                        awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
-                                    }
-                                    .pointerInput(minHeightPx, maxHeightPx) {
-                                        detectDragGestures(
-                                            onDragEnd = { saveCurrentBounds() },
-                                            onDrag = { change, dragAmount ->
-                                                change.consume()
-                                                val newH = (window.height + dragAmount.y.toInt()).coerceIn(minHeightPx, maxHeightPx)
-                                                window.setSize(window.width, newH)
-                                            }
-                                        )
-                                    }
+                                    .resizesWindow(window, null, heightRange, saveCurrentBounds)
                             )
 
-                            // Bottom-right corner resize grip
-                            var isGripHovered by remember { mutableStateOf(false) }
+                            var isGripDragging by remember { mutableStateOf(false) }
                             val gripInteraction = remember { MutableInteractionSource() }
-                            val isHoveredByState by gripInteraction.collectIsHoveredAsState()
-                            val gripActive = isGripHovered || isHoveredByState
+                            val isGripHovered by gripInteraction.collectIsHoveredAsState()
+                            val gripActive = isGripDragging || isGripHovered
 
                             Box(
                                 modifier = Modifier
                                     .align(Alignment.BottomEnd)
-                                    .size(if (isElongated) 14.dp else 20.dp)
+                                    .size(gripSize)
                                     .hoverable(gripInteraction)
                                     .pointerHoverIcon(PointerIcon(Cursor(Cursor.SE_RESIZE_CURSOR)))
-                                    .pointerInput(Unit) {
-                                        awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
-                                    }
-                                    .pointerInput(minWidthPx, maxWidthPx, minHeightPx, maxHeightPx) {
-                                        detectDragGestures(
-                                            onDragEnd = {
-                                                isGripHovered = false
-                                                saveCurrentBounds()
-                                            },
-                                            onDragCancel = {
-                                                isGripHovered = false
-                                            },
-                                            onDrag = { change, dragAmount ->
-                                                change.consume()
-                                                isGripHovered = true
-                                                val newW = (window.width + dragAmount.x.toInt()).coerceIn(minWidthPx, maxWidthPx)
-                                                val newH = (window.height + dragAmount.y.toInt()).coerceIn(minHeightPx, maxHeightPx)
-                                                window.setSize(newW, newH)
-                                            }
-                                        )
+                                    .resizesWindow(window, widthRange, heightRange, saveCurrentBounds) {
+                                        isGripDragging = it
                                     },
                                 contentAlignment = Alignment.BottomEnd
                             ) {
@@ -733,12 +797,14 @@ fun MiniLyricsPlayerWindow(
             }
         }
     }
+    }
 }
 
 @Composable
 private fun MiniLyricsContent(
     viewModel: PlayerViewModel,
     windowHeight: Dp = 82.dp,
+    contentMode: MiniPlayerContentMode = MiniPlayerContentMode.AUTO,
     showCover: Boolean = true,
     showPlayback: Boolean = true,
     showAdditional: Boolean = true,
@@ -747,21 +813,36 @@ private fun MiniLyricsContent(
     transparentBg: Boolean = false,
     isDragging: Boolean = false,
 ) {
-    val track = viewModel.currentTrack
-    val isPlaying = viewModel.isPlaying
+    val track = viewModel.uiCurrentTrack
+    val isPlaying = viewModel.uiIsPlaying
     val lyrics = viewModel.lyricsLines
-    val rawPosition = viewModel.currentPosition
+    // positionMs is a lambda so this composable doesn't recompose on every position tick (4–5×/sec).
+    // The smooth position is read via State<Float> in the draw phase only (audit Phase 3 CPU gain).
     val smoothPosition = com.alananasss.kittytune.ui.player.lyrics.rememberSmoothPosition(
-        positionMs = rawPosition,
+        positionMs = { viewModel.uiCurrentPosition },
         isPlaying = isPlaying,
         speed = 1.0f,
     )
-    val adjustedPosition = smoothPosition + viewModel.lyricsOffset
 
-    val activeIndex = remember(adjustedPosition, lyrics) {
-        if (lyrics.isEmpty()) -1 else LyricsUtils.activeLineIndex(lyrics, adjustedPosition.toLong())
+    // Derived: the frame-clock position is recomputed every frame but observed only when the
+    // active line index actually changes. Computing the index from a per-frame value — as the
+    // `remember(adjustedPosition, lyrics)` this replaces did — recomposed the whole mini-player
+    // sixty times a second for the whole song.
+    val wantsLyrics = contentMode != MiniPlayerContentMode.TITLE_AND_ARTIST
+    val activeIndex by remember(lyrics, viewModel.lyricsOffset, wantsLyrics) {
+        derivedStateOf {
+            if (!wantsLyrics || lyrics.isEmpty()) -1 else LyricsUtils.activeLineIndex(lyrics, (smoothPosition.value + viewModel.lyricsOffset).toLong())
+        }
     }
     val activeLine = lyrics.getOrNull(activeIndex)
+    val lyricLine = activeLine?.takeIf { it.text.isNotBlank() }
+    val textPlan = remember(contentMode, lyricLine != null) {
+        resolveMiniPlayerTextPlan(contentMode, lyricLine != null)
+    }
+    val trackInfo = track?.let {
+        val artist = it.displayArtist.ifBlank { it.user?.username.orEmpty() }
+        if (artist.isNotBlank()) "${it.title.orEmpty()} • $artist" else it.title.orEmpty()
+    }.orEmpty()
 
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
@@ -828,46 +909,69 @@ private fun MiniLyricsContent(
                 val maxChars = remember(maxWidth) {
                     (maxWidth.value / 9.2f).toInt().coerceIn(18, 90)
                 }
-                if (track != null && activeLine != null && activeLine.text.isNotBlank()) {
-                    MiniLyricDisplay(
-                        line = activeLine,
-                        positionMs = adjustedPosition,
-                        wordSync = viewModel.isWordSyncEnabled,
-                        fillEffect = viewModel.isAppleMusicEffectEnabled,
-                        maxChunkChars = maxChars,
-                        textShadow = textShadow,
-                    )
-                } else if (track != null) {
-                    Column(verticalArrangement = Arrangement.Center) {
-                        Text(
-                            text = track.title ?: "",
-                            style = MaterialTheme.typography.titleMedium.copy(shadow = textShadow),
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = track.displayArtist.ifBlank { track.user?.username.orEmpty() }.ifBlank { str("mini_player_instrumental") },
-                            style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                when {
+                    track == null -> {
+                        Column(verticalArrangement = Arrangement.Center) {
+                            Text(
+                                text = "KittyTune",
+                                style = MaterialTheme.typography.titleMedium.copy(shadow = textShadow),
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = str("mini_player_no_track"),
+                                style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    lyricLine != null && textPlan.showLyrics && textPlan.showTrackInfo -> {
+                        Column(verticalArrangement = Arrangement.Center) {
+                            MiniLyricDisplay(
+                                line = lyricLine,
+                                positionMs = { smoothPosition.value + viewModel.lyricsOffset },
+                                wordSync = viewModel.isWordSyncEnabled,
+                                fillEffect = viewModel.isAppleMusicEffectEnabled,
+                                maxChunkChars = maxChars,
+                                textShadow = textShadow,
+                            )
+                            Text(
+                                text = trackInfo,
+                                style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    lyricLine != null && textPlan.showLyrics -> {
+                        MiniLyricDisplay(
+                            line = lyricLine,
+                            positionMs = { smoothPosition.value + viewModel.lyricsOffset },
+                            wordSync = viewModel.isWordSyncEnabled,
+                            fillEffect = viewModel.isAppleMusicEffectEnabled,
+                            maxChunkChars = maxChars,
+                            textShadow = textShadow,
                         )
                     }
-                } else {
-                    Column(verticalArrangement = Arrangement.Center) {
-                        Text(
-                            text = "KittyTune",
-                            style = MaterialTheme.typography.titleMedium.copy(shadow = textShadow),
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
-                            text = str("mini_player_no_track"),
-                            style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    else -> {
+                        Column(verticalArrangement = Arrangement.Center) {
+                            Text(
+                                text = track.title ?: "",
+                                style = MaterialTheme.typography.titleMedium.copy(shadow = textShadow),
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = track.displayArtist.ifBlank { track.user?.username.orEmpty() }.ifBlank { str("mini_player_instrumental") },
+                                style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }
@@ -891,9 +995,9 @@ private fun MiniLyricsContent(
                                     shapes = IconButtonDefaults.shapes()
                                 ) {
                                     Icon(
-                                        imageVector = if (viewModel.isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                                        imageVector = if (viewModel.uiIsLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
                                         contentDescription = "Like",
-                                        tint = if (viewModel.isLiked) MaterialTheme.colorScheme.primary
+                                        tint = if (viewModel.uiIsLiked) MaterialTheme.colorScheme.primary
                                                else MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.size(18.dp)
                                     )
@@ -955,10 +1059,11 @@ private fun MiniLyricsContent(
         }
 
         // Progress bar along the bottom edge
-        if (showProgress && viewModel.duration > 0) {
-            val progress = (adjustedPosition / viewModel.duration).coerceIn(0f, 1f)
+        if (showProgress && viewModel.uiDuration > 0) {
             LinearProgressIndicator(
-                progress = { progress },
+                // Read inside the indicator's draw phase: the per-frame interpolated position
+                // redraws the hairline without recomposing the mini-player around it.
+                progress = { viewModel.progressOf(smoothPosition.value + viewModel.lyricsOffset) },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
@@ -985,6 +1090,7 @@ private fun MiniLyricsContent(
 private fun MiniLyricsElongatedContent(
     viewModel: PlayerViewModel,
     windowHeight: Dp = 38.dp,
+    contentMode: MiniPlayerContentMode = MiniPlayerContentMode.AUTO,
     showCover: Boolean = true,
     showPlayback: Boolean = true,
     showAdditional: Boolean = true,
@@ -993,21 +1099,40 @@ private fun MiniLyricsElongatedContent(
     transparentBg: Boolean = false,
     isDragging: Boolean = false,
 ) {
-    val track = viewModel.currentTrack
-    val isPlaying = viewModel.isPlaying
+    val track = viewModel.uiCurrentTrack
+    val isPlaying = viewModel.uiIsPlaying
     val lyrics = viewModel.lyricsLines
-    val rawPosition = viewModel.currentPosition
+    // positionMs is a lambda so this composable doesn't recompose on every position tick (4–5×/sec).
+    // The smooth position is read via State<Float> in the draw phase only (audit Phase 3 CPU gain).
     val smoothPosition = com.alananasss.kittytune.ui.player.lyrics.rememberSmoothPosition(
-        positionMs = rawPosition,
+        positionMs = { viewModel.uiCurrentPosition },
         isPlaying = isPlaying,
         speed = 1.0f,
     )
-    val adjustedPosition = smoothPosition + viewModel.lyricsOffset
 
-    val activeIndex = remember(adjustedPosition, lyrics) {
-        if (lyrics.isEmpty()) -1 else LyricsUtils.activeLineIndex(lyrics, adjustedPosition.toLong())
+    // Derived: the frame-clock position is recomputed every frame but observed only when the
+    // active line index actually changes. Computing the index from a per-frame value — as the
+    // `remember(adjustedPosition, lyrics)` this replaces did — recomposed the whole mini-player
+    // sixty times a second for the whole song.
+    val wantsLyrics = contentMode != MiniPlayerContentMode.TITLE_AND_ARTIST
+    val activeIndex by remember(lyrics, viewModel.lyricsOffset, wantsLyrics) {
+        derivedStateOf {
+            if (!wantsLyrics || lyrics.isEmpty()) -1 else LyricsUtils.activeLineIndex(lyrics, (smoothPosition.value + viewModel.lyricsOffset).toLong())
+        }
     }
     val activeLine = lyrics.getOrNull(activeIndex)
+    val lyricLine = activeLine?.takeIf { it.text.isNotBlank() }
+    val textPlan = remember(contentMode, lyricLine != null) {
+        resolveMiniPlayerTextPlan(contentMode, lyricLine != null)
+    }
+    val trackInfo = remember(track?.title, track?.displayArtist, track?.user?.username) {
+        val current = track
+        if (current == null) "" else {
+            val artist = current.displayArtist.ifBlank { current.user?.username.orEmpty() }
+            val title = current.title.orEmpty()
+            if (artist.isNotBlank()) "$title • $artist" else title
+        }
+    }
 
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
@@ -1069,47 +1194,76 @@ private fun MiniLyricsElongatedContent(
                 modifier = Modifier.weight(1f),
                 contentAlignment = Alignment.CenterStart
             ) {
-                val maxChars = remember(maxWidth) {
-                    (maxWidth.value / 8.5f).toInt().coerceIn(20, 140)
+                val availableWidth = maxWidth
+                val maxChars = remember(availableWidth) {
+                    (availableWidth.value / 8.5f).toInt().coerceIn(20, 140)
                 }
 
-                if (track != null && activeLine != null && activeLine.text.isNotBlank()) {
-                    MiniLyricDisplay(
-                        line = activeLine,
-                        positionMs = adjustedPosition,
-                        wordSync = viewModel.isWordSyncEnabled,
-                        fillEffect = viewModel.isAppleMusicEffectEnabled,
-                        maxChunkChars = maxChars,
-                        textShadow = textShadow,
-                        compact = true,
-                    )
-                } else if (track != null) {
-                    val trackInfo = remember(track.title, track.displayArtist, track.user?.username) {
-                        val artist = track.displayArtist.ifBlank { track.user?.username.orEmpty() }
-                        val title = track.title.orEmpty()
-                        if (artist.isNotBlank()) "$title • $artist" else title
+                when {
+                    track == null -> {
+                        Text(
+                            text = "KittyTune",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                shadow = textShadow,
+                            ),
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-                    Text(
-                        text = trackInfo,
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            shadow = textShadow,
-                        ),
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                } else {
-                    Text(
-                        text = "KittyTune",
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            shadow = textShadow,
-                        ),
-                        color = MaterialTheme.colorScheme.primary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    lyricLine != null && textPlan.showLyrics && textPlan.showTrackInfo -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = trackInfo,
+                                style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.widthIn(max = availableWidth * 0.42f)
+                            )
+                            Text(
+                                text = "  ·  ",
+                                style = MaterialTheme.typography.bodySmall.copy(shadow = textShadow),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                maxLines = 1
+                            )
+                            Box(modifier = Modifier.weight(1f)) {
+                                MiniLyricDisplay(
+                                    line = lyricLine,
+                                    positionMs = { smoothPosition.value + viewModel.lyricsOffset },
+                                    wordSync = viewModel.isWordSyncEnabled,
+                                    fillEffect = viewModel.isAppleMusicEffectEnabled,
+                                    maxChunkChars = maxChars,
+                                    textShadow = textShadow,
+                                    compact = true,
+                                )
+                            }
+                        }
+                    }
+                    lyricLine != null && textPlan.showLyrics -> {
+                        MiniLyricDisplay(
+                            line = lyricLine,
+                            positionMs = { smoothPosition.value + viewModel.lyricsOffset },
+                            wordSync = viewModel.isWordSyncEnabled,
+                            fillEffect = viewModel.isAppleMusicEffectEnabled,
+                            maxChunkChars = maxChars,
+                            textShadow = textShadow,
+                            compact = true,
+                        )
+                    }
+                    else -> {
+                        Text(
+                            text = trackInfo,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                shadow = textShadow,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
 
@@ -1131,9 +1285,9 @@ private fun MiniLyricsElongatedContent(
                                 shapes = IconButtonDefaults.shapes()
                             ) {
                                 Icon(
-                                    imageVector = if (viewModel.isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                                    imageVector = if (viewModel.uiIsLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
                                     contentDescription = "Like",
-                                    tint = if (viewModel.isLiked) MaterialTheme.colorScheme.primary
+                                    tint = if (viewModel.uiIsLiked) MaterialTheme.colorScheme.primary
                                            else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(15.dp)
                                 )
@@ -1194,10 +1348,11 @@ private fun MiniLyricsElongatedContent(
         }
 
         // Hairline progress bar along the bottom edge
-        if (showProgress && viewModel.duration > 0) {
-            val progress = (adjustedPosition / viewModel.duration).coerceIn(0f, 1f)
+        if (showProgress && viewModel.uiDuration > 0) {
             LinearProgressIndicator(
-                progress = { progress },
+                // Read inside the indicator's draw phase: the per-frame interpolated position
+                // redraws the hairline without recomposing the mini-player around it.
+                progress = { viewModel.progressOf(smoothPosition.value + viewModel.lyricsOffset) },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
@@ -1225,7 +1380,7 @@ private fun MiniLyricsElongatedContent(
 @Composable
 private fun MiniLyricDisplay(
     line: LyricLine,
-    positionMs: Float,
+    positionMs: () -> Float,
     wordSync: Boolean,
     fillEffect: Boolean,
     maxChunkChars: Int = 36,
@@ -1242,9 +1397,10 @@ private fun MiniLyricDisplay(
         splitIntoChunks(fullText, words, maxChunkChars = maxChunkChars)
     }
 
-    // Determine which chunk is active based on current playback progress
-    val activeChunkIndex = remember(chunks, positionMs) {
-        resolveActiveChunk(chunks, positionMs)
+    // Determine which chunk is active based on current playback progress. Derived, so the chunk
+    // switch is what recomposes this display, not the per-frame position underneath it.
+    val activeChunkIndex by remember(chunks, positionMs) {
+        derivedStateOf { resolveActiveChunk(chunks, positionMs()) }
     }
     val currentChunk = chunks.getOrElse(activeChunkIndex) { chunks.first() }
 
@@ -1265,7 +1421,38 @@ private fun MiniLyricDisplay(
             MaterialTheme.typography.titleMedium.copy(shadow = textShadow)
         }
 
-        if (chunkWords.isEmpty() || !wordSync) {
+        val sweepPrefs = remember { com.alananasss.kittytune.data.local.PlayerPreferences() }
+        val sweepEnabled by remember { sweepPrefs.lyricsSweepEnabledFlow() }
+            .collectAsState(initial = sweepPrefs.getLyricsSweepEnabled())
+        if ((chunkWords.isEmpty() || !wordSync) && sweepEnabled && line.endTime > line.startTime) {
+            // The Sweep line animation (Android PR #83): the line fills top to bottom as it is sung. Read in the
+            // draw phase, so the per-frame position redraws the line without recomposing it.
+            val bright = MaterialTheme.colorScheme.onSurface
+            val dim = bright.copy(alpha = 0.45f)
+            Text(
+                text = chunkText,
+                style = baseStyle.copy(fontWeight = if (compact) FontWeight.SemiBold else FontWeight.Bold),
+                color = bright,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.drawWithContent {
+                    val progress = ((positionMs() - line.startTime) / (line.endTime - line.startTime).toFloat()).coerceIn(0f, 1f)
+                    drawContent()
+                    if (progress < 1f) {
+                        val band = progress * size.height
+                        // Dim what the band has not reached yet; above it the line keeps its full colour.
+                        drawRect(
+                            brush = androidx.compose.ui.graphics.Brush.verticalGradient(
+                                colors = listOf(androidx.compose.ui.graphics.Color.Transparent, androidx.compose.ui.graphics.Color.Black.copy(alpha = 1f - dim.alpha)),
+                                startY = band - 6f,
+                                endY = band + 6f,
+                            ),
+                            blendMode = androidx.compose.ui.graphics.BlendMode.DstOut,
+                        )
+                    }
+                }.graphicsLayer { compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen },
+            )
+        } else if (chunkWords.isEmpty() || !wordSync) {
             Text(
                 text = chunkText,
                 style = baseStyle.copy(fontWeight = if (compact) FontWeight.SemiBold else FontWeight.Bold),
@@ -1292,11 +1479,16 @@ private fun MiniLyricDisplay(
             val style = baseStyle.copy(fontWeight = if (compact) FontWeight.Bold else FontWeight.ExtraBold)
 
             if (!fillEffect) {
-                val coloured = buildAnnotatedString {
-                    for (word in chunkWords) {
-                        val reached = positionMs >= word.startTime
-                        withStyle(SpanStyle(color = if (reached) activeColor else unsungColor)) {
-                            append(word.text)
+                // Derived: the string only changes when a word flips from unsung to sung, not per frame.
+                val coloured by remember(chunkWords, activeColor, unsungColor, positionMs) {
+                    derivedStateOf {
+                        buildAnnotatedString {
+                            for (word in chunkWords) {
+                                val reached = positionMs() >= word.startTime
+                                withStyle(SpanStyle(color = if (reached) activeColor else unsungColor)) {
+                                    append(word.text)
+                                }
+                            }
                         }
                     }
                 }
@@ -1308,11 +1500,6 @@ private fun MiniLyricDisplay(
                 )
             } else {
                 var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-                val position = if (line.endTime > line.startTime) {
-                    positionMs.coerceAtMost(line.endTime.toFloat())
-                } else {
-                    positionMs
-                }
 
                 Box {
                     Text(
@@ -1329,6 +1516,14 @@ private fun MiniLyricDisplay(
                         maxLines = 1,
                         modifier = Modifier.drawWithContent {
                             val res = layout ?: return@drawWithContent
+                            // Read in the draw phase: the per-frame position invalidates the draw
+                            // only, clamped to the line's end so the fill completes, never overruns.
+                            val rawPosition = positionMs()
+                            val position = if (line.endTime > line.startTime) {
+                                rawPosition.coerceAtMost(line.endTime.toFloat())
+                            } else {
+                                rawPosition
+                            }
                             clipPath(sungPath(res, chunkWords, ranges, chunkText.length, position)) {
                                 this@drawWithContent.drawContent()
                             }
@@ -1338,6 +1533,32 @@ private fun MiniLyricDisplay(
             }
         }
     }
+}
+
+/** Which pieces of text the mini player shows for the chosen [MiniPlayerContentMode]. */
+internal data class MiniPlayerTextPlan(
+    val showLyrics: Boolean,
+    val showTrackInfo: Boolean,
+)
+
+/**
+ * Decides the mini player's text for a track that has lyrics or not.
+ *
+ * [MiniPlayerContentMode.LYRICS] and [MiniPlayerContentMode.BOTH] fall back to the title and
+ * artist when no lyric line is available, so the player never turns into an empty bar during an
+ * intro, an instrumental track or a track whose lyrics could not be loaded.
+ */
+internal fun resolveMiniPlayerTextPlan(
+    mode: MiniPlayerContentMode,
+    hasLyrics: Boolean,
+): MiniPlayerTextPlan = when (mode) {
+    MiniPlayerContentMode.AUTO ->
+        if (hasLyrics) MiniPlayerTextPlan(true, false) else MiniPlayerTextPlan(false, true)
+    MiniPlayerContentMode.TITLE_AND_ARTIST -> MiniPlayerTextPlan(false, true)
+    MiniPlayerContentMode.LYRICS ->
+        if (hasLyrics) MiniPlayerTextPlan(true, false) else MiniPlayerTextPlan(false, true)
+    MiniPlayerContentMode.BOTH ->
+        MiniPlayerTextPlan(showLyrics = hasLyrics, showTrackInfo = true)
 }
 
 internal data class LyricChunk(
@@ -1439,4 +1660,101 @@ private fun sungPath(
         }
     }
     return path
+}
+
+/** Resize from the initial window size and mouse displacement in AWT screen coordinates. */
+private fun Modifier.resizesWindow(
+    window: java.awt.Window,
+    widthRange: IntRange?,
+    heightRange: IntRange?,
+    saveBounds: () -> Unit,
+    onResizing: (Boolean) -> Unit = {},
+): Modifier = pointerInput(window, widthRange, heightRange) {
+    awaitEachGesture {
+        val down = awaitFirstDown()
+        if (down.type != PointerType.Mouse || !currentEvent.buttons.isPrimaryPressed) return@awaitEachGesture
+        val start = java.awt.MouseInfo.getPointerInfo()?.location ?: return@awaitEachGesture
+        val initialSize = window.size
+        var pendingWidth = initialSize.width
+        var pendingHeight = initialSize.height
+        var lastResizeNanos = 0L
+        fun applySize() {
+            if (window.width != pendingWidth || window.height != pendingHeight) {
+                window.setSize(pendingWidth, pendingHeight)
+            }
+        }
+        down.consume()
+        onResizing(true)
+        try {
+            while (true) {
+                val event = awaitPointerEvent()
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                if (change.isConsumed) break
+                change.consume()
+                java.awt.MouseInfo.getPointerInfo()?.location?.let { pointer ->
+                    pendingWidth = widthRange?.let { (initialSize.width + pointer.x - start.x).coerceIn(it) } ?: initialSize.width
+                    pendingHeight = heightRange?.let { (initialSize.height + pointer.y - start.y).coerceIn(it) } ?: initialSize.height
+                }
+                if (!change.pressed) {
+                    applySize()
+                    break
+                }
+                // Leave time for the renderer to present before issuing another native resize.
+                val now = System.nanoTime()
+                if (now - lastResizeNanos >= MANUAL_MOVE_MIN_INTERVAL_NS) {
+                    applySize()
+                    lastResizeNanos = now
+                }
+            }
+        } finally {
+            onResizing(false)
+            if (window.size != initialSize) saveBounds()
+        }
+    }
+}
+
+/**
+ * Moves [window] when the pointer is pressed on this and dragged, wherever the press lands: on the words, a button or
+ * an empty pixel alike.
+ *
+ * The press is watched on the way down, before the buttons and the text see it, and only once the pointer has gone
+ * past a few pixels is it taken as a drag and claimed, so a plain click still reaches what was clicked. The pointer is
+ * read in screen coordinates: the window moves under it, so a position relative to the window would chase itself.
+ * The strips along the right and bottom edge and the corner belong to the resize handles and are left to them.
+ */
+internal fun Modifier.dragsWindow(
+    window: java.awt.Window,
+    handler: WindowDragHandler,
+    resizeEdge: Dp = 10.dp,
+    resizeCorner: Dp = 0.dp,
+): Modifier = pointerInput(window, handler, resizeEdge, resizeCorner) {
+    val slopPx = viewConfiguration.touchSlop
+    val edgePx = resizeEdge.toPx()
+    val cornerPx = resizeCorner.toPx()
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+        val fromRight = size.width - down.position.x
+        val fromBottom = size.height - down.position.y
+        val onResizeHandle = fromRight <= edgePx || fromBottom <= edgePx ||
+            (fromRight <= cornerPx && fromBottom <= cornerPx)
+        if (down.type != PointerType.Mouse || !currentEvent.buttons.isPrimaryPressed || onResizeHandle) return@awaitEachGesture
+        val start = java.awt.MouseInfo.getPointerInfo()?.location ?: return@awaitEachGesture
+        var dragging = false
+        while (true) {
+            val event = awaitPointerEvent(PointerEventPass.Initial)
+            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+            if (!change.pressed) {
+                if (dragging) handler.stopDrag()
+                break
+            }
+            val now = java.awt.MouseInfo.getPointerInfo()?.location ?: continue
+            if (!dragging) {
+                if (kotlin.math.hypot((now.x - start.x).toFloat(), (now.y - start.y).toFloat()) < slopPx) continue
+                dragging = true
+                handler.startDrag(start.x, start.y)
+            }
+            change.consume()
+            handler.onPointerMove(now.x, now.y)
+        }
+    }
 }

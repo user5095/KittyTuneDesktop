@@ -1,9 +1,12 @@
 package com.alananasss.kittytune.audio
 
+import com.alananasss.kittytune.data.local.PlayerPreferences
 import com.alananasss.kittytune.ui.player.AudioEffectsState
+import com.alananasss.kittytune.ui.player.EqualizerState
 import com.alananasss.kittytune.utils.Logger
 import com.alananasss.kittytune.utils.SignedUrl
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -13,10 +16,8 @@ import org.bytedeco.javacv.FrameGrabber
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.ShortBuffer
-import javax.sound.sampled.AudioSystem
-import javax.sound.sampled.DataLine
+import java.util.concurrent.atomic.AtomicReference
 import javax.sound.sampled.FloatControl
-import javax.sound.sampled.Mixer
 import javax.sound.sampled.SourceDataLine
 import kotlin.concurrent.thread
 import javax.sound.sampled.AudioFormat as JavaAudioFormat
@@ -31,12 +32,27 @@ import javax.sound.sampled.AudioFormat as JavaAudioFormat
 const val TRACK_GAIN_MIN_DB = -12f
 const val TRACK_GAIN_MAX_DB = 6f
 
-class AudioEngine {
+/**
+ * @param isolated a deck that plays outside the player (the transition editor's preview): it never touches the
+ *   app-wide state the playing track owns, so no AI-detection tap, no AI verdict reset, no karaoke hand-over.
+ */
+class AudioEngine(private val isolated: Boolean = false) {
 
     enum class State { IDLE, BUFFERING, READY, ENDED }
 
     var onStateChanged: ((State) -> Unit)? = null
     var onPlayingChanged: ((Boolean) -> Unit)? = null
+
+    /** Called on the decoder thread whenever a stream is opened, with what it actually carries. */
+    var onSourceFormat: ((SourceAudioFormat?) -> Unit)? = null
+
+    /** What the open stream carries (codec, rate, depth...), or null before one is opened. */
+    @Volatile
+    var sourceFormat: SourceAudioFormat? = null
+        private set
+
+    /** The rate every stream is converted to before the effects and the output line. */
+    val outputRateHz: Int get() = outputSampleRate
     var onCompletion: (() -> Unit)? = null
     var onError: ((Throwable) -> Unit)? = null
 
@@ -49,8 +65,9 @@ class AudioEngine {
         private set
 
     @Volatile
-    var positionMs: Long = 0L
-        private set
+    private var decodedPositionMs = 0L
+
+    val positionMs: Long get() = seekRequest.get()?.positionMs ?: decodedPositionMs
 
     @Volatile
     var durationMs: Long = 0L
@@ -60,6 +77,7 @@ class AudioEngine {
     private val outputChannels = 2
 
     private val fx = FxAudioProcessor()
+    private val equalizer = EqualizerAudioProcessor()
     private val reverb = ReverbAudioProcessor()
     private val eightD = EightDAudioProcessor()
     private val earrape = EarrapeAudioProcessor()
@@ -93,9 +111,45 @@ class AudioEngine {
     private val nightDrive = NightDriveAudioProcessor()
     val automixDuck = com.alananasss.kittytune.audio.automix.AutomixDuckAudioProcessor()
 
-    private val chain: List<AudioProcessor> = listOf(
+    /** The Mix transitions' sweep filter (RISE high-pass, WAVE band-pass, a Custom seam's filter legs). */
+    val mixSweep = com.alananasss.kittytune.audio.automix.MixSweepAudioProcessor()
+
+    /** The transition editor preview's filter legs (state-variable, driven by a 0..1 fraction). Dry when idle. */
+    val transitionSweep = com.alananasss.kittytune.audio.automix.TransitionSweepAudioProcessor()
+
+    /** The transition editor preview's effect tail (damped feedback delay). Dry when idle. */
+    val transitionEffects = com.alananasss.kittytune.audio.automix.TransitionEffectsAudioProcessor()
+
+    /**
+     * ArtifactNet AI-music tap (issue #41): transparent pass-through that collects the
+     * first seconds of PCM for on-device AI detection. First in the chain so it
+     * analyzes the cleanest signal, before any effect touches it.
+     */
+    val aiDetection = com.alananasss.kittytune.audio.ai.AiDetectionAudioProcessor()
+
+    /**
+     * Real-time tempo and beat grid of this engine's track: the Kitty pet dances on it. Fed by a
+     * pass-through tap right after the AI one, on the clean decoded signal, and anchored in media
+     * time on every start and seek ([LiveBeatTracker.onFlush]).
+     */
+    val liveBeat = com.alananasss.kittytune.audio.beat.LiveBeatTracker()
+    private val liveBeatTap = com.alananasss.kittytune.audio.beat.LiveBeatAudioProcessor(liveBeat)
+
+    /**
+     * Skip silence (see [com.alananasss.kittytune.audio.silence.SkipSilence]). After the taps, which want the
+     * track as it is, and before every effect, so a reverb tail or a fade is never mistaken for silence.
+     */
+    val silenceSkip = com.alananasss.kittytune.audio.silence.SilenceSkipAudioProcessor()
+
+    private val chain: List<AudioProcessor> = listOfNotNull(
+        aiDetection.takeUnless { isolated },
+        liveBeatTap,
+        silenceSkip,
         automixDuck,
-        fx, reverb, eightD, earrape, normalization, mono,
+        mixSweep,
+        transitionSweep,
+        transitionEffects,
+        fx, equalizer, reverb, eightD, earrape, normalization, mono,
         vintageMp3, vocalRemover, vocalBoost, flanger, partyNextDoor,
         superWide, vinylLoFi, phaser, megaphone, robotVocoder, chorus,
         underwater, tranceGate, pingPongDelay, chiptune, shimmerReverb,
@@ -125,14 +179,25 @@ class AudioEngine {
      */
     private var trackGainDb: Float = 0f
 
-    @Volatile
-    private var seekRequestMs: Long = -1L
+    private class SeekRequest(val positionMs: Long, val warmUp: Boolean = false)
+
+    // Keep the latest target visible until the decoder has applied that specific request.
+    private val seekRequest = AtomicReference<SeekRequest?>()
 
     @Volatile
     private var paused = true
 
     @Volatile
     private var stopFlag = false
+
+    /**
+     * Terminal state, set by [release]. A released engine must never produce sound again: the
+     * player may have already moved on to a newer engine, and a late coroutine (a superseded
+     * crossfade, a cancelled load) reaching [setMediaItem]/[prepare]/[play] afterwards used to
+     * revive it as an invisible third stream playing over the selected track (issue #95).
+     */
+    @Volatile
+    private var released = false
 
     @Volatile
     private var activeWorkerId = 0L
@@ -144,35 +209,87 @@ class AudioEngine {
 
     @Volatile
     private var line: SourceDataLine? = null
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private var currentUrl: String? = null
+    var currentUrl: String? = null
+        private set
     private var currentHeaders: Map<String, String> = emptyMap()
     private var hlsAdapter: HlsStreamAdapter? = null
+
+    /**
+     * License token of the track being prepared, for a Widevine-protected (`ctr-encrypted-hls`) stream.
+     *
+     * It is resolved alongside the URL and cached by track id, so it is read here rather than threaded
+     * through every `setMediaItem` call site. Absent for ordinary streams, which is the common case.
+     */
+    private var licenseToken: String? = null
+    private var sourceAnalysisPending = false
 
     init {
         val fmt = AudioFormat(outputSampleRate, outputChannels)
         chain.forEach { it.configure(fmt) }
+        aiDetection.setPreferences(PlayerPreferences())
+        if (!isolated && !com.alananasss.kittytune.audio.ai.AiDetectionManager.isModelLoaded() &&
+            com.alananasss.kittytune.audio.ai.AiDetectionManager.isModelReady() &&
+            com.alananasss.kittytune.audio.ai.AiDetectionManager.isDetectionWanted()
+        ) {
+            com.alananasss.kittytune.audio.ai.AiDetectionManager.initAsync()
+        }
     }
 
 
     @Synchronized
-    fun setMediaItem(url: String, headers: Map<String, String> = emptyMap(), startPositionMs: Long = 0L) {
+    fun setMediaItem(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        startPositionMs: Long = 0L,
+        trackId: Long? = null,
+    ) {
+        if (released) return
         stopInternal()
+        // New track: restart AI collection from zero and drop the previous verdict,
+        // mirroring the Android MusicManager resetForNewTrack + resetResult pair.
+        aiDetection.resetForNewTrack()
+        if (!isolated) com.alananasss.kittytune.audio.ai.AiDetectionManager.resetResult()
+        vocalRemover.setTrack(trackId)
+        vocalBoost.setTrack(trackId)
+        if (trackId != null && !isolated) {
+            com.alananasss.kittytune.audio.ai.karaoke.KaraokeManager.notifyTrackChanged(trackId)
+        }
         currentUrl = url
         currentHeaders = headers
-        positionMs = startPositionMs
+        decodedPositionMs = startPositionMs
         durationMs = 0L
-        seekRequestMs = if (startPositionMs > 0) startPositionMs else -1L
+        liveBeat.onFlush(startPositionMs.toDouble())
+        seekRequest.set(startPositionMs.takeIf { it > 0L }?.let { SeekRequest(it) })
+        if (startPositionMs > 0) {
+            aiDetection.notifySeek(startPositionMs)
+            vocalRemover.seekToPositionMs(startPositionMs)
+            vocalBoost.seekToPositionMs(startPositionMs)
+        }
         Logger.e("AudioEngine", "setMediaItem called with url: $url")
+
         try {
-            hlsAdapter = if (url.contains(".m3u8")) HlsStreamAdapter(url, headers, ::reResolveUrl) else null
+            licenseToken = trackId?.let { id ->
+                runCatching { com.alananasss.kittytune.data.MusicManager.getDrmToken(id) }.getOrNull()
+            }
+            // A protected URL decodes in-process like any other stream: the CDM sidecar decrypts each
+            // fragment into the FFmpeg path, so the whole DSP chain runs.
+            // The previous track's stream no longer needs its DRM session (and the CDM behind it).
+            hlsAdapter?.retire()
+            hlsAdapter = if (url.contains(".m3u8")) {
+                HlsHeadCache.take(url, ::reResolveUrl)?.also {
+                    it.licenseToken = licenseToken
+                }
+            } else null
             Logger.e("AudioEngine", "hlsAdapter initialized: ${hlsAdapter != null}")
         } catch (e: Exception) {
             Logger.e("AudioEngine", "Failed to init HlsStreamAdapter: ${e.message}")
             hlsAdapter = null
         }
-        
+
+        sourceAnalysisPending = true
+
         setState(State.BUFFERING)
     }
 
@@ -221,27 +338,22 @@ class AudioEngine {
 
     @Synchronized
     fun prepare() {
+        if (released) return
         val url = currentUrl ?: return
         stopFlag = false
         val newWorkerId = ++activeWorkerId
+        val headers = currentHeaders
         worker = thread(name = "kittytune-audio-$newWorkerId", isDaemon = true) {
             // One grabber open at a time: the predecessors are holding theirs until they notice
             // they have been replaced.
             awaitPredecessors(newWorkerId)
             if (stopFlag || activeWorkerId != newWorkerId) return@thread
-            runDecodeLoop(newWorkerId, url, currentHeaders)
+            runDecodeLoop(newWorkerId, url, headers)
         }
     }
 
     @Volatile
     private var pausedTimestamp = 0L
-
-    /**
-     * Set while the decode loop is servicing a reconnect nobody is waiting for, which changes two
-     * things: recovery is bounded instead of retrying forever, and success resets the pause clock.
-     */
-    @Volatile
-    private var warmUpRequested = false
 
     private var warmUpJob: kotlinx.coroutines.Job? = null
 
@@ -285,6 +397,7 @@ class AudioEngine {
     }
 
     fun play() {
+        if (released) return
         warmUpJob?.cancel()
         warmUpJob = null
         val pausedFor = if (paused && pausedTimestamp > 0L) System.currentTimeMillis() - pausedTimestamp else 0L
@@ -304,7 +417,7 @@ class AudioEngine {
         } else if (!workerAlive && currentUrl != null) {
             Logger.e("AudioEngine", "play() with no live decoder; re-preparing at $positionMs ms")
             setState(State.BUFFERING)
-            seekRequestMs = positionMs
+            seekRequest.compareAndSet(null, SeekRequest(decodedPositionMs))
             prepare()
         } else if (pausedFor > RECONNECT_AFTER_PAUSE_MS && currentUrl?.startsWith("http") == true) {
             // A CDN keep-alive rarely survives even half a minute, and SoundCloud's signed
@@ -357,33 +470,57 @@ class AudioEngine {
         if (!paused || pausedTimestamp <= 0L) return
         if (currentUrl?.startsWith("http") != true) return
         if (worker?.isAlive != true) return
-        if (seekRequestMs >= 0L) return
-        Logger.e("AudioEngine", "Warming up paused stream at $positionMs ms")
-        warmUpRequested = true
-        seekRequestMs = positionMs
+        val request = SeekRequest(decodedPositionMs, warmUp = true)
+        if (seekRequest.compareAndSet(null, request)) {
+            Logger.e("AudioEngine", "Warming up paused stream at ${request.positionMs} ms")
+        }
     }
 
     fun seekTo(ms: Long) {
+        if (released) return
         val coerced = ms.coerceAtLeast(0)
-        seekRequestMs = coerced
-        positionMs = coerced
+        seekRequest.set(SeekRequest(coerced))
+        aiDetection.notifySeek(coerced)
+        vocalRemover.seekToPositionMs(coerced)
+        vocalBoost.seekToPositionMs(coerced)
     }
 
     fun setVolume(v: Float) {
+        if (released) return
         volume = if (v <= 0.001f) 0f else v.coerceIn(0f, 1f)
         applyLineVolume()
     }
 
     /** @param db the current track's trim, clamped to [TRACK_GAIN_MIN_DB]..[TRACK_GAIN_MAX_DB]. */
     fun setTrackGainDb(db: Float) {
+        if (released) return
         trackGainDb = db.coerceIn(TRACK_GAIN_MIN_DB, TRACK_GAIN_MAX_DB)
         applyLineVolume()
     }
 
     fun getVolume(): Float = volume
 
+    /**
+     * The media position being heard right now: [positionMs] is where decoding is, and the output
+     * line (plus the time-stretcher) still holds what plays next. Used to put the pet's dance steps
+     * on the beats the listener hears rather than on the ones being decoded.
+     */
+    fun audiblePositionMs(): Long {
+        val l = line ?: return positionMs
+        val bytesPerSecond = outputSampleRate * outputChannels * 2
+        val queuedBytes = runCatching { (l.bufferSize - l.available()).coerceAtLeast(0) }.getOrDefault(0)
+        val queuedSamples = queuedBytes / 2 + runCatching { stretcher.available() }.getOrDefault(0)
+        val queuedMs = queuedSamples * 1000L / (bytesPerSecond / 2)
+        return (positionMs - queuedMs).coerceAtLeast(0L)
+    }
+
     fun setTrackLoudness(lufs: Float, truePeakDb: Float = 0f) {
         normalization.setTrackLoudness(lufs, truePeakDb)
+    }
+
+    /** For a loudness learnt while the track already plays: glides rather than resets. */
+    fun updateTrackLoudness(lufs: Float, truePeakDb: Float = 0f) {
+        normalization.updateTrackLoudness(lufs, truePeakDb)
     }
 
     fun clearTrackLoudness() {
@@ -396,12 +533,48 @@ class AudioEngine {
     @Synchronized
     fun stop() {
         stopInternal()
+        aiDetection.resetForNewTrack()
+        if (!isolated) com.alananasss.kittytune.audio.ai.AiDetectionManager.resetResult()
+        currentUrl = null
+        currentHeaders = emptyMap()
+        sourceAnalysisPending = false
+        decodedPositionMs = 0L
+        durationMs = 0L
+        seekRequest.set(null)
         setState(State.IDLE)
     }
 
     fun release() {
-        stopInternal()
+        if (released) return
+        released = true
+        stop()
+        lineCloser.close()
+        // Without this the CDM daemon (in WSL) would stay up until it noticed it was idle.
+        hlsAdapter?.retire()
+        aiDetection.resetForNewTrack()
+        if (!isolated) com.alananasss.kittytune.audio.ai.AiDetectionManager.resetResult()
+        // Terminal: this engine is being discarded. stopInternal() only flush()es the
+        // chain, which keeps native DSP state (normalisation handle, ebur128 histograms)
+        // allocated. Every crossfade releases an engine, so without this reset each
+        // played track leaked ~0.4 MB of native memory (issue #66: 500 MB -> 1 GB+).
+        chain.forEach { runCatching { it.reset() } }
         scope.coroutineContext[Job]?.cancel()
+        com.alananasss.kittytune.utils.NativeMemoryManager.trim()
+    }
+
+    fun onKaraokeStemReady(trackId: Long) {
+        val curId = vocalRemover.getCurrentTrackId() ?: vocalBoost.getCurrentTrackId()
+        if (curId == trackId || curId == null) {
+            vocalRemover.setTrack(trackId)
+            vocalBoost.setTrack(trackId)
+            val prefs = com.alananasss.kittytune.data.local.PlayerPreferences()
+            val isAiMode = prefs.karaokeEngineMode == com.alananasss.kittytune.data.local.KaraokeEngineMode.MEL_BAND_ROFORMER
+            vocalRemover.setKaraokeAiMode(isAiMode)
+            vocalBoost.setKaraokeAiMode(isAiMode)
+            com.alananasss.kittytune.audio.ai.karaoke.KaraokeManager.loadStemSync(trackId)
+            vocalRemover.seekToPositionMs(positionMs)
+            vocalBoost.seekToPositionMs(positionMs)
+        }
     }
 
     fun applyEffects(state: AudioEffectsState) {
@@ -421,9 +594,13 @@ class AudioEngine {
         vintageMp3.setEnabled(state.isVintageMp3Enabled)
         vintageMp3.setCompression(state.vintageMp3Compression)
 
+        val prefs = com.alananasss.kittytune.data.local.PlayerPreferences()
+        val isAiMode = prefs.karaokeEngineMode == com.alananasss.kittytune.data.local.KaraokeEngineMode.MEL_BAND_ROFORMER
+        vocalRemover.setKaraokeAiMode(isAiMode)
         vocalRemover.setEnabled(state.isVocalRemoverEnabled)
         vocalRemover.setSuppressionLevel(state.vocalRemoverLevel)
 
+        vocalBoost.setKaraokeAiMode(isAiMode)
         vocalBoost.setEnabled(state.isVocalBoostEnabled)
         vocalBoost.setIntensity(state.vocalBoostIntensity)
 
@@ -527,12 +704,57 @@ class AudioEngine {
         limiter.setCeiling(peakLimiterCeilingFor(state))
     }
 
+    @Volatile
+    private var equalizerEnabled = false
+
+    /**
+     * The engine's processing stages in signal order, each with whether it is acting on the sound right now:
+     * the audio-path diagnostics show it live.
+     */
+    fun dspStages(): List<Pair<String, Boolean>> {
+        val mixing = com.alananasss.kittytune.audio.automix.AutomixManager.isAutomixing.value
+        val fxOn = effectToggles.any { runCatching { it.invoke(effects) == true }.getOrDefault(false) }
+        return listOf(
+            "AI-detection tap" to (!isolated && com.alananasss.kittytune.audio.ai.AiDetectionManager.isDetectionWanted()),
+            "Live-beat tap" to true,
+            "Silence skip" to (com.alananasss.kittytune.audio.silence.SkipSilence.trimEnabled ||
+                com.alananasss.kittytune.audio.silence.SkipSilence.instantEnabled),
+            "Automix · bass duck" to mixing,
+            "Automix · sweep filter" to mixing,
+            "Player FX" to fxOn,
+            "Equalizer" to equalizerEnabled,
+            "LUFS normalization" to effects.isNormalizationEnabled,
+            "Time stretch" to (effects.speed != 1f),
+            "Peak limiter" to true,
+        )
+    }
+
+    fun applyEqualizer(state: EqualizerState) {
+        equalizerEnabled = state.isEnabled
+        equalizer.setParameters(
+            enabled = state.isEnabled,
+            preampDb = state.preampDb,
+            gainsDb = state.bandGainsDb.toFloatArray(),
+        )
+    }
+
     fun setDuckMix(fraction: Float) {
         automixDuck.setMix(fraction)
     }
 
     fun resetDuckMix() {
         automixDuck.resetGain()
+    }
+
+    /** Runs the transition sweep filter in [mode] at [cutoffHz] (null keeps the last cutoff). */
+    fun setMixSweep(mode: com.alananasss.kittytune.audio.automix.MixSweepAudioProcessor.FilterMode, cutoffHz: Float?, q: Float) {
+        mixSweep.setMode(mode)
+        if (cutoffHz != null) mixSweep.setSweep(cutoffHz, q)
+    }
+
+    /** Glides the sweep filter home and out of the path once the transition is over. */
+    fun resetMixSweep() {
+        mixSweep.resetSweep()
     }
 
     fun setStretcherRatio(tempoRatio: Float, pitchRatio: Float) {
@@ -550,16 +772,58 @@ class AudioEngine {
      */
     var onReResolveUrl: (suspend (failedUrl: String) -> String?)? = null
 
-    private fun createGrabber(targetUrl: String, headers: Map<String, String>, startPositionMs: Long = 0L): FFmpegFrameGrabber {
+    private fun requireCurrentWorker(workerId: Long) {
+        if (released || stopFlag || activeWorkerId != workerId) {
+            throw java.io.InterruptedIOException("Playback source was superseded")
+        }
+    }
+
+    private fun startSourceAnalysis(workerId: Long, url: String, headers: Map<String, String>, adapter: HlsStreamAdapter?) {
+        synchronized(this) {
+            requireCurrentWorker(workerId)
+            if (!sourceAnalysisPending) return
+            sourceAnalysisPending = false
+            val prefs = PlayerPreferences()
+            // An isolated deck (the transition preview) never touches the playing track's AI verdict.
+            if (!isolated && com.alananasss.kittytune.audio.ai.AiDetectionManager.isModelReady() && (prefs.aiShowBadge || prefs.aiAutoSkip)) {
+                com.alananasss.kittytune.audio.ai.AiDetectionManager.analyzeTrackUpfront(url, headers, adapter)
+            }
+        }
+    }
+
+    private fun createGrabber(workerId: Long, targetUrl: String, headers: Map<String, String>, startPositionMs: Long = 0L): FFmpegFrameGrabber {
         val isHls = targetUrl.contains(".m3u8")
         if (isHls) {
-            var adapter = hlsAdapter
-            if (adapter == null || adapter.playlistUrl != targetUrl) {
-                adapter = HlsStreamAdapter(targetUrl, headers, ::reResolveUrl)
-                hlsAdapter = adapter
+            val (cached, token) = synchronized(this) {
+                requireCurrentWorker(workerId)
+                hlsAdapter to licenseToken
             }
-            return FFmpegFrameGrabber(adapter.getInputStream(startPositionMs)).apply {
-                format = "mp4" // Fragments are ISOBMFF (mp4)
+            var adapter = cached
+            if (adapter == null || adapter.playlistUrl != targetUrl) {
+                adapter?.retire()
+                adapter = HlsStreamAdapter(targetUrl, headers, refreshPlaylistUrl = ::reResolveUrl).also {
+                    it.licenseToken = token
+                }
+                val opened = adapter
+                try {
+                    synchronized(this) {
+                        requireCurrentWorker(workerId)
+                        hlsAdapter = opened
+                    }
+                } catch (e: Throwable) {
+                    opened.releaseDrm()
+                    throw e
+                }
+            }
+            startSourceAnalysis(workerId, targetUrl, headers, adapter)
+            // A maximum size of 0 reads the fragments in order and nothing else. javacv's default treats the stream as
+            // seekable: it keeps every byte read in memory, and FFmpeg asking for the stream's size made it read to
+            // the end first, so a track only started once all of it had been downloaded, the longer the slower
+            // (issue #66).
+            return FFmpegFrameGrabber(adapter.getInputStream(startPositionMs), 0).apply {
+                if (adapter.hasInitSegment) {
+                    format = "mp4" // Fragments with #EXT-X-MAP are ISOBMFF (fMP4)
+                }
                 setOption("probesize", "32768") // 32KB is enough for MOOV atom + some audio
                 setOption("analyzeduration", "0")
                 sampleRate = outputSampleRate
@@ -569,6 +833,7 @@ class AudioEngine {
                 sampleMode = FrameGrabber.SampleMode.FLOAT
             }
         } else {
+            startSourceAnalysis(workerId, targetUrl, headers, null)
             return FFmpegFrameGrabber(targetUrl).apply {
                 if (headers.isNotEmpty()) {
                     val headerBlob = headers.entries.joinToString("\r\n") { "${it.key}: ${it.value}" }
@@ -606,6 +871,13 @@ class AudioEngine {
         kotlinx.coroutines.runBlocking {
             try {
                 freshUrl = reResolver.invoke(failedUrl)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Re-throw: the previous `catch (e: Exception)` swallows CancellationException,
+                // which means a cancelled runBlocking job (e.g. release() cancelling the scope)
+                // is caught here, freshUrl stays null, and the decode loop continues spinning
+                // instead of honouring the cancellation. Re-throwing lets the cancellation
+                // propagate out of runBlocking so the decode thread can exit (audit issue).
+                throw e
             } catch (e: Exception) {
                 Logger.e("AudioEngine", "Re-resolve failed: ${e.message}")
             }
@@ -614,18 +886,20 @@ class AudioEngine {
     }
 
     private fun recoverStream(
+        workerId: Long,
         oldGrabber: FFmpegFrameGrabber?,
         url: String,
         headers: Map<String, String>,
         resumePosMs: Long,
-        maxAttempts: Int = Int.MAX_VALUE
+        maxAttempts: Int = Int.MAX_VALUE,
+        shouldRecover: () -> Boolean = { true },
     ): Pair<FFmpegFrameGrabber?, String?> {
-        oldGrabber?.releaseQuietly()
+        oldGrabber?.releaseUnlockedQuietly()
 
         var currentUrlToTry = url
         var attempt = 0
 
-        while (!stopFlag && attempt < maxAttempts) {
+        while (!stopFlag && activeWorkerId == workerId && shouldRecover() && attempt < maxAttempts) {
             attempt++
             Logger.e("AudioEngine", "Network recovery attempt $attempt at $resumePosMs ms...")
 
@@ -639,16 +913,31 @@ class AudioEngine {
             // the network stays down.
             var newG: FFmpegFrameGrabber? = null
             try {
-                newG = createGrabber(currentUrlToTry, headers, resumePosMs)
-                newG.start()
+                newG = createGrabber(workerId, currentUrlToTry, headers, resumePosMs)
+                newG.startUnlocked()
                 val isHls = currentUrlToTry.contains(".m3u8")
-                if (!isHls && resumePosMs > 0) {
+                val resumeTargetTs = if (resumePosMs > 0) resumePosMs * 1000L else 0L
+                if (!isHls && resumeTargetTs > 0) {
                     try {
-                        newG.timestamp = resumePosMs * 1000L
+                        newG.timestamp = resumeTargetTs
                     } catch (_: Exception) {}
                 }
-                val f = try { newG.grabSamples() } catch (_: Exception) { null }
-                if (f != null) {
+                var f = try { newG.grabSamples() } catch (_: Exception) { null }
+                if (resumeTargetTs > 0 && f != null) {
+                    var droppedCount = 0
+                    var lastTs = Long.MIN_VALUE
+                    while (f != null && !stopFlag && shouldRecover()) {
+                        val ts = newG.timestamp
+                        if (ts >= resumeTargetTs - 25_000L || (lastTs != Long.MIN_VALUE && ts <= lastTs)) {
+                            break
+                        }
+                        lastTs = ts
+                        f = try { newG.grabSamples() } catch (_: Exception) { null }
+                        droppedCount++
+                        if (droppedCount > 1500) break
+                    }
+                }
+                if (f != null && !stopFlag && shouldRecover()) {
                     val samples = f.samples
                     if (samples != null) {
                         pushFrame(samples, f.audioChannels)
@@ -659,7 +948,8 @@ class AudioEngine {
             } catch (e: Exception) {
                 Logger.e("AudioEngine", "Reopen attempt $attempt failed (${e.message}).")
             }
-            newG?.releaseQuietly()
+            newG?.releaseUnlockedQuietly()
+            if (!shouldRecover()) break
 
             val backoffMs = (attempt * 400L).coerceAtMost(2000L)
             try {
@@ -689,20 +979,23 @@ class AudioEngine {
             try {
                 // Both halves can fail on a dead URL: an HLS playlist 403s while the grabber is
                 // still being built, a progressive one only on start().
-                opening = createGrabber(activeUrl, headers, positionMs)
-                opening.start()
+                opening = createGrabber(workerId, activeUrl, headers, positionMs)
+                opening.startUnlocked()
                 grabber = opening
             } catch (e: Exception) {
                 // A dead URL that slipped past the check above (unsigned, or the CDN disagrees
                 // about the deadline). Re-resolve and retry a couple of times before handing the
                 // failure up: the owner's own error path is a full teardown and reload.
                 Logger.e("AudioEngine", "Initial open failed (${e.message}); recovering")
-                val recovered = recoverStream(opening, activeUrl, headers, positionMs, INITIAL_OPEN_ATTEMPTS)
+                val recovered = recoverStream(workerId, opening, activeUrl, headers, positionMs, INITIAL_OPEN_ATTEMPTS)
                 grabber = recovered.first ?: throw e
                 recovered.second?.let { activeUrl = it }
             }
 
             if (stopFlag || activeWorkerId != workerId) return
+
+            sourceFormat = SourceAudioFormat.of(grabber)
+            onSourceFormat?.invoke(sourceFormat)
 
             // Only trust the adapter's duration while it actually describes what we opened: a
             // re-resolve can hand back a progressive URL where the playlist used to be.
@@ -729,10 +1022,11 @@ class AudioEngine {
                     line = localLine
                 }
 
-                val seek = seekRequestMs
-                if (seek >= 0) {
+                val request = seekRequest.get()
+                if (request != null) {
+                    val seek = request.positionMs
                     val targetTimestamp = seek * 1000L
-                    seekRequestMs = -1L
+                    fun isCurrentSeek() = !stopFlag && activeWorkerId == workerId && seekRequest.get() === request
 
                     Logger.e("AudioEngine", "Seeking to targetTimestamp=$targetTimestamp (ms=$seek)")
 
@@ -754,11 +1048,11 @@ class AudioEngine {
                     var seekFrame: Frame? = null
                     if (!urlExpired) try {
                         if (isHls) {
-                            grabber?.releaseQuietly()
+                            grabber?.releaseUnlockedQuietly()
                             grabber = null
 
-                            grabber = createGrabber(activeUrl, headers, seek)
-                            grabber.start()
+                            grabber = createGrabber(workerId, activeUrl, headers, seek)
+                            grabber.startUnlocked()
                             seekFrame = try { grabber.grabSamples() } catch (_: Exception) { null }
                             seekOk = seekFrame != null
                         } else {
@@ -770,74 +1064,87 @@ class AudioEngine {
                         Logger.e("AudioEngine", "Seek error - ${e.message}")
                     }
 
-                    if (!seekOk) {
-                        if (durationMs > 0 && seek >= durationMs - 1500L) {
-                            Logger.e("AudioEngine", "Seek reached end of stream at $seek ms (duration=$durationMs ms). Ending track.")
-                            positionMs = durationMs
-                            drainStretcher(outBuf, localLine)
-                            setStateAsync(State.ENDED)
-                            break
-                        }
+                    if (!isCurrentSeek()) continue
+                    var reachedEnd = !seekOk && durationMs > 0L && seek >= durationMs - 1500L
 
+                    if (!seekOk && !reachedEnd) {
                         val recovered = recoverStream(
+                            workerId,
                             grabber,
                             activeUrl,
                             headers,
                             seek,
-                            maxAttempts = if (warmUpRequested) WARM_UP_RECOVERY_ATTEMPTS else Int.MAX_VALUE,
+                            maxAttempts = if (request.warmUp) WARM_UP_RECOVERY_ATTEMPTS else Int.MAX_VALUE,
+                            shouldRecover = ::isCurrentSeek,
                         )
-                        if (recovered.first != null) {
-                            grabber = recovered.first
-                            if (recovered.second != null) activeUrl = recovered.second!!
-                            seekFrame = try { grabber?.grabSamples() } catch (_: Exception) { null }
+                        grabber = recovered.first
+                        recovered.second?.let { activeUrl = it }
+                        if (!isCurrentSeek()) continue
+                        if (grabber != null) {
+                            seekFrame = try { grabber.grabSamples() } catch (_: Exception) { null }
                             seekOk = seekFrame != null
-                        } else if (durationMs > 0 && seek >= durationMs - 3000L) {
-                            Logger.e("AudioEngine", "Seek recovery at end of track failed at $seek ms. Ending track.")
-                            positionMs = durationMs
-                            drainStretcher(outBuf, localLine)
-                            setStateAsync(State.ENDED)
-                            break
+                        } else {
+                            reachedEnd = durationMs > 0L && seek >= durationMs - 3000L
                         }
+                    }
+
+                    if (reachedEnd) {
+                        decodedPositionMs = durationMs
+                        if (!seekRequest.compareAndSet(request, null)) continue
+                        Logger.e("AudioEngine", "Seek reached end of stream at $seek ms (duration=$durationMs ms). Ending track.")
+                        drainStretcher(outBuf, localLine)
+                        if (seekRequest.get() != null || stopFlag || activeWorkerId != workerId) continue
+                        setStateAsync(State.ENDED)
+                        break
                     }
 
                     if (seekOk && grabber != null) {
-                        if (isHls) {
-                            // On HLS, createGrabber(seek) already positioned at the requested segment.
-                            val samples = seekFrame?.samples
-                            if (samples != null) {
-                                pushFrame(samples, seekFrame!!.audioChannels)
+                        var f = seekFrame
+                        var droppedCount = 0
+                        var lastTs = Long.MIN_VALUE
+                        while (f != null && isCurrentSeek()) {
+                            val ts = grabber.timestamp
+                            // Accept frame if timestamp is within ~1 audio frame (25ms) of target or past it,
+                            // or if timestamps stop advancing (e.g. malformed stream without PTS)
+                            if (ts >= targetTimestamp - 25_000L || (lastTs != Long.MIN_VALUE && ts <= lastTs)) {
+                                val samples = f.samples
+                                if (samples != null) {
+                                    pushFrame(samples, f.audioChannels)
+                                }
+                                break
                             }
-                        } else {
-                            var f = seekFrame
-                            var droppedCount = 0
-                            while (f != null && !stopFlag && activeWorkerId == workerId) {
-                                val ts = grabber.timestamp
-                                if (ts >= targetTimestamp - 50_000L) {
-                                    val samples = f.samples
-                                    if (samples != null) {
-                                        pushFrame(samples, f.audioChannels)
-                                    }
-                                    break
+                            lastTs = ts
+                            f = try {
+                                grabber.grabSamples()
+                            } catch (_: Exception) {
+                                null
+                            }
+                            droppedCount++
+                            // 1500 frames corresponds to ~35-40s of audio, ensuring we safely prune
+                            // even large HLS segments while preventing infinite loop on broken streams
+                            if (droppedCount > 1500) {
+                                val samples = f?.samples
+                                if (samples != null) {
+                                    pushFrame(samples, f.audioChannels)
                                 }
-                                f = try {
-                                    grabber.grabSamples()
-                                } catch (_: Exception) {
-                                    null
-                                }
-                                droppedCount++
-                                if (droppedCount > 150) break
+                                break
                             }
                         }
                     }
 
-                    positionMs = seek
+                    if (!isCurrentSeek()) continue
+                    decodedPositionMs = seek
+                    aiDetection.notifySeek(seek)
+                    vocalRemover.seekToPositionMs(seek)
+                    vocalBoost.seekToPositionMs(seek)
                     stretcher.flush()
                     limiter.flush()
                     chain.forEach { it.flush() }
+                    liveBeat.onFlush(seek.toDouble())
                     localLine?.flush()
+                    if (!seekRequest.compareAndSet(request, null)) continue
 
-                    if (warmUpRequested) {
-                        warmUpRequested = false
+                    if (request.warmUp && paused) {
                         // The pause clock measures how long it has been since the stream was known
                         // good, which is what play() reads to decide whether to reconnect. A
                         // successful warm-up makes that "just now"; a failed one leaves it alone so
@@ -847,9 +1154,15 @@ class AudioEngine {
                 }
 
                 if (paused) {
+                    // A line left running with nothing written to it underruns, and on some Windows drivers
+                    // an underrun replays the last bit of the buffer: a short fragment of the song every few
+                    // seconds for as long as it stayed paused (issue #66). Stopped, it holds still, and the
+                    // buffer is picked up where it stopped when playback resumes.
+                    localLine?.let { if (it.isRunning) it.stop() }
                     Thread.sleep(20)
                     continue
                 }
+                localLine?.let { if (!it.isRunning) it.start() }
 
                 var frame: Frame? = null
                 try {
@@ -858,6 +1171,7 @@ class AudioEngine {
                     Logger.e("AudioEngine", "Read error from grabber: ${e.message}")
                     frame = null
                 }
+                if (seekRequest.get() != null) continue
 
                 if (frame == null) {
                     if (!stopFlag && activeWorkerId == workerId) {
@@ -871,10 +1185,15 @@ class AudioEngine {
                                 "AudioEngine",
                                 "Premature EOF/error at $positionMs ms (duration=$durationMs ms). Recovering stream..."
                             )
-                            val recovered = recoverStream(grabber, activeUrl, headers, positionMs)
+                            val recovered = recoverStream(
+                                workerId,
+                                grabber, activeUrl, headers, decodedPositionMs,
+                                shouldRecover = { seekRequest.get() == null && activeWorkerId == workerId },
+                            )
+                            grabber = recovered.first
+                            recovered.second?.let { activeUrl = it }
+                            if (seekRequest.get() != null || stopFlag || activeWorkerId != workerId) continue
                             if (recovered.first != null) {
-                                grabber = recovered.first
-                                if (recovered.second != null) activeUrl = recovered.second!!
                                 Logger.e("AudioEngine", "Stream recovery succeeded at $positionMs ms!")
                                 continue
                             } else {
@@ -892,16 +1211,18 @@ class AudioEngine {
                 pushFrame(samples, frame.audioChannels)
                 drainStretcher(outBuf, localLine)
 
-                if (seekRequestMs == -1L) {
-                    positionMs = (grabber?.timestamp ?: 0L) / 1000L
+                if (seekRequest.get() == null) {
+                    val rawPos = (grabber?.timestamp ?: 0L) / 1000L
+                    decodedPositionMs = if (durationMs > 0L) rawPos.coerceIn(0L, durationMs) else rawPos.coerceAtLeast(0L)
                 }
             }
         } catch (t: Throwable) {
             if (!stopFlag && activeWorkerId == workerId) {
+                setStateAsync(State.IDLE)
                 onError?.invoke(t)
             }
         } finally {
-            grabber?.releaseQuietly()
+            grabber?.releaseUnlockedQuietly()
             closeLineInstance(localLine)
         }
     }
@@ -1044,38 +1365,7 @@ class AudioEngine {
         val fmt = JavaAudioFormat(
             outputSampleRate.toFloat(), 16, outputChannels, true, false,
         )
-        val info = DataLine.Info(SourceDataLine::class.java, fmt)
-
-        val prefs = com.alananasss.kittytune.data.local.PlayerPreferences()
-        val deviceName = prefs.getAudioDevice()
-        var mixer: Mixer? = null
-
-        if (deviceName.isNotEmpty()) {
-            val isLinux = System.getProperty("os.name").lowercase().contains("linux")
-            if (isLinux && deviceName.startsWith("alsa_output.")) {
-                System.setProperty("javax.sound.sampled.SourceDataLine", "")
-                try {
-                    val pb = ProcessBuilder("sh", "-c", "pactl set-default-sink '$deviceName'")
-                    pb.start().waitFor()
-                } catch (_: Exception) {
-                }
-            } else {
-                val mixerInfos = AudioSystem.getMixerInfo()
-                val targetInfo = mixerInfos.firstOrNull { it.name.trim() == deviceName }
-                if (targetInfo != null) {
-                    try {
-                        val m = AudioSystem.getMixer(targetInfo)
-                        if (m.isLineSupported(info)) mixer = m
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-        }
-
-        val l =
-            if (mixer != null) mixer.getLine(info) as SourceDataLine else AudioSystem.getLine(info) as SourceDataLine
-        l.open(fmt, outputSampleRate * outputChannels * 2 * 200 / 1000)
-        l.start()
+        val l = openPlaybackLine(fmt, outputSampleRate * outputChannels * 2 * 200 / 1000)
         applyLineVolume(l)
         return l
     }
@@ -1108,11 +1398,30 @@ class AudioEngine {
         }
     }
 
+    /**
+     * Stops a line at once and closes it off the calling thread. [stop] runs on the UI thread when a track is
+     * tapped, and closing a Windows DirectSound line (`DirectAudioDevice.nClose`) can take a second or more: the
+     * whole app froze for that long on every tap. Flushing and stopping is what silences it, and is quick; the
+     * worker opens a fresh line for the next track, so nothing waits for the old one to close.
+     */
+    private fun silenceAndCloseLater(localLine: SourceDataLine?) {
+        if (localLine == null) return
+        if (line == localLine) line = null
+        try {
+            localLine.flush()
+            localLine.stop()
+        } catch (_: Exception) {
+        }
+        lineCloser.closeLater(localLine)
+    }
+
+    /** One thread, so lines close one after another rather than piling up threads on a burst of taps. */
+    private val lineCloser = AudioLineCloser()
+
     @Synchronized
     private fun stopInternal() {
         warmUpJob?.cancel()
         warmUpJob = null
-        warmUpRequested = false
         stopFlag = true
         activeWorkerId++
         paused = true
@@ -1130,7 +1439,7 @@ class AudioEngine {
         }
         worker = null
         reapFinishedWorkers()
-        closeLineInstance(line, drain = false)
+        silenceAndCloseLater(line)
         stretcher.flush()
         limiter.flush()
         chain.forEach { it.flush() }

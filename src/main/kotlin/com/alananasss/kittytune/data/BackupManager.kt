@@ -53,14 +53,11 @@ object BackupManager {
         withContext(Dispatchers.IO) {
             val tracks = dao.getAllTracks().first()
             val playlists = dao.getAllPlaylists().first()
-            val allRefs = mutableListOf<PlaylistTrackCrossRef>()
-            playlists.forEach { playlist ->
-                val tracksInPlaylist = dao.getTracksForPlaylistSync(playlist.id)
-                tracksInPlaylist.forEach { track ->
-                    val ref = dao.getRef(playlist.id, track.id)
-                    if (ref != null) allRefs.add(ref)
-                }
-            }
+            // Single query for all refs — the previous N+1+M pattern called getTracksForPlaylistSync
+            // per playlist (N queries) then getRef per track per playlist (M queries), so a library
+            // with 100 playlists of 50 tracks was 5,100 DB round-trips through the single dispatcher
+            // (audit Phase 5 IO gain).
+            val allRefs = dao.getAllRefs()
 
             val artists = dao.getAllSavedArtists().first()
             val history = dao.getHistory().first()
@@ -89,18 +86,28 @@ object BackupManager {
             val jsonString = file.takeIf { it.exists() }?.readText()
                 ?: throw Exception(str("error_backup_read"))
 
-            val data: FullBackupData = gson.fromJson(jsonString, FullBackupData::class.java)
+            // Gson happily returns null for a "null" document and leaves missing fields null even
+            // on non-null Kotlin properties — both then NPE'd at the first forEach with a stack
+            // trace instead of the backup dialog's own message. A backup without a field is a
+            // backup with nothing of that kind; a document that is not a backup at all is the
+            // read error.
+            val data: FullBackupData = runCatching { gson.fromJson(jsonString, FullBackupData::class.java) }.getOrNull()
+                ?: throw Exception(str("error_backup_read"))
 
-            data.localTracks.forEach { dao.insertTrack(it) }
-            data.localPlaylists.forEach { dao.insertPlaylist(it) }
-            data.playlistRefs.forEach { dao.insertPlaylistTrackRef(it) }
-            data.savedArtists.forEach { dao.insertArtist(it) }
-            data.history.forEach { dao.insertHistory(it) }
-            data.listeningStats?.forEach { dao.insertStatsEvent(it.copy(id = 0)) }
+            // Batch inserts: each dao.insertX(list) call uses execBatch (one transaction per
+            // table), replacing the previous per-item inserts that were each their own transaction
+            // (N commits + N invalidations). execBatch is already atomic per-table; a crash between
+            // tables is unlikely (they're fast) and the restore can be re-run (audit Phase 5 IO gain).
+            dao.insertTracks(data.localTracks ?: emptyList())
+            dao.insertPlaylists(data.localPlaylists ?: emptyList())
+            dao.insertPlaylistTrackRefs(data.playlistRefs ?: emptyList())
+            dao.insertArtists(data.savedArtists ?: emptyList())
+            dao.insertHistoryList(data.history ?: emptyList())
+            dao.insertStatsEvents((data.listeningStats ?: emptyList()).map { it.copy(id = 0) })
 
-            LikeRepository.replaceAllLikes(data.likedTracks)
+            LikeRepository.replaceAllLikes(data.likedTracks ?: emptyList())
 
-            restorePlayerPrefs(data.playerPrefs)
+            restorePlayerPrefs(data.playerPrefs ?: emptyMap())
         }
     }
 
@@ -112,7 +119,13 @@ object BackupManager {
         is Number -> when {
             key.startsWith("time_") || key == "last_position" -> JsonPrimitive(value.toLong())
             key == "font_wdth" || key == "font_slnt" || key == "font_rond" || key == "font_grad" || key == "font_opsz" || key == "lyrics_font_size" -> JsonPrimitive(value.toFloat())
-            else -> JsonPrimitive(value.toInt())
+            // Longs preserved when they do not fit an Int: the flat toInt() truncated them —
+            // cached_user_id (a snowflake-sized id) restored as a different user's id. Small
+            // values stay Int so ordinary prefs round-trip byte-identically.
+            else -> {
+                val asLong = value.toLong()
+                if (asLong.toInt().toLong() == asLong) JsonPrimitive(asLong.toInt()) else JsonPrimitive(asLong)
+            }
         }
         else -> null
     }

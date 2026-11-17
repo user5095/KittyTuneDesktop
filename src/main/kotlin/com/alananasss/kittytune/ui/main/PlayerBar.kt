@@ -1,8 +1,13 @@
 package com.alananasss.kittytune.ui.main
 
+import androidx.compose.ui.unit.Dp
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.AnimatedVisibility
 import com.alananasss.kittytune.core.str
 import com.alananasss.kittytune.ui.player.cover.AnimatedArtwork
-import com.alananasss.kittytune.ui.player.slider.PlayerSlider
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -16,23 +21,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.material.icons.outlined.ThumbDown
+import androidx.compose.material.icons.rounded.ThumbDown
 import androidx.compose.material3.IconButtonShapes
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Repeat
-import androidx.compose.material.icons.filled.RepeatOne
-import androidx.compose.material.icons.filled.Shuffle
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.rounded.PictureInPictureAlt
+import androidx.compose.material.icons.rounded.Pets
 import androidx.compose.material.icons.rounded.Verified
-import androidx.compose.material.icons.outlined.HeartBroken
-import androidx.compose.material.icons.outlined.QueueMusic
-import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+import androidx.compose.material.icons.rounded.Tune
 
 import com.alananasss.kittytune.ui.icons.Icon
 import androidx.compose.material3.IconButton
@@ -41,7 +37,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -51,6 +46,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -63,25 +59,23 @@ import androidx.compose.material3.ripple
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import java.awt.Cursor
-import com.alananasss.kittytune.data.MusicManager
 import com.alananasss.kittytune.ui.common.ArtistLinkText
 import com.alananasss.kittytune.ui.common.Tip
+import com.alananasss.kittytune.ui.player.CodecBadge
 import com.alananasss.kittytune.ui.player.PlayerViewModel
 import com.alananasss.kittytune.ui.player.RepeatMode
 import com.alananasss.kittytune.utils.makeTimeString
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
-import androidx.compose.animation.togetherWith
 import androidx.compose.material.icons.rounded.GraphicEq
-import com.alananasss.kittytune.R
-import com.alananasss.kittytune.audio.automix.AutomixManager
-import com.alananasss.kittytune.core.stringResource
+import androidx.compose.material.icons.rounded.Devices
+import com.alananasss.kittytune.ui.player.slider.mixGlow
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.unit.sp
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.PointerMatcher
@@ -94,6 +88,16 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.alananasss.kittytune.data.local.PlayerPreferences
+import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.FavoriteBorder
+import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material.icons.rounded.SkipPrevious
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SkipNext
+import androidx.compose.material.icons.rounded.RepeatOne
+import androidx.compose.material.icons.rounded.Repeat
+import androidx.compose.material.icons.rounded.ViewSidebar
 
 /**
  * Bottom full-width playback bar: track info left, transport + progress center,
@@ -107,6 +111,7 @@ fun PlayerBar(
     onToggleNowPlaying: () -> Unit,
     onOpenQueue: () -> Unit,
     onOpenLyrics: () -> Unit,
+    onOpenDevices: () -> Unit = {},
     /**
      * The cover and the credit at the bottom left. It opened the side panel on its Info tab; it opens the
      * whole player now — "I think you can do this when you click on it, the player opens in full"
@@ -115,14 +120,17 @@ fun PlayerBar(
     onOpenFullPlayer: () -> Unit = {},
     isNowPlayingOpen: Boolean = false,
     isQueueOpen: Boolean = false,
+    isDevicesOpen: Boolean = false,
     modifier: Modifier = Modifier,
     /** Floating only: told where the pill itself is, which the content uses to keep clear of it. */
     onBarPlaced: ((androidx.compose.ui.layout.LayoutCoordinates) -> Unit)? = null,
 ) {
+    com.alananasss.kittytune.ui.debug.TraceRecompositions("PlayerBar")
     val vm = playerViewModel
-    val track = vm.currentTrack
+    val track = vm.uiCurrentTrack
     val visibleButtons = rememberPlayerBarButtons()
     val showLyricsButton = rememberShowLyricsButton()
+    val oneLineLyrics = rememberOneLineLyrics() && track != null
     val barStyle = rememberPlayerBarStyle()
     val isFloating = barStyle == com.alananasss.kittytune.data.local.PlayerBarStyle.FLOATING
     val floatLook = rememberFloatingBarLook()
@@ -162,17 +170,14 @@ fun PlayerBar(
             val barWidth = maxWidth
             val isCompact = barWidth < 900.dp
             val isVeryCompact = barWidth < 740.dp
-            val centerMax = when {
-                barWidth >= 1100.dp -> 560.dp
-                barWidth >= 850.dp -> 440.dp
-                barWidth >= 700.dp -> 360.dp
-                else -> 280.dp
-            }
-            val centerMin = when {
-                barWidth >= 850.dp -> 300.dp
-                barWidth >= 700.dp -> 240.dp
-                else -> 180.dp
-            }
+            // Proportional to the bar's width rather than stepped at a few widths. The steps were where the
+            // transport visibly jumped narrower while a window was being resized (issue #66).
+            // Narrow bars give the title and the artist the room: at the smallest window the transport used to take
+            // over 400 dp and left them about 50.
+            val centerMax = lerpByWidth(barWidth, from = 700.dp to 264.dp, to = 1500.dp to 560.dp)
+            // Never narrower than the buttons need: below that the play button was squeezed to a sliver while the
+            // title and the volume took the room, and the shuffle went with it.
+            val centerMin = maxOf(lerpByWidth(barWidth, from = 700.dp to 180.dp, to = 850.dp to 300.dp), if (isVeryCompact) 264.dp else 248.dp)
 
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = if (isFloating) 18.dp else 12.dp),
@@ -201,14 +206,18 @@ fun PlayerBar(
                                 .clickable { onOpenFullPlayer() }
                                 .padding(4.dp),
                         ) {
-                            val artworkSize = if (isVeryCompact) 48.dp else if (isFloating) 52.dp else 56.dp
+                            val artworkSize by animateDpAsState(
+                                if (isVeryCompact) 48.dp else if (isFloating) 52.dp else 56.dp,
+                                tween(BAR_MORPH_MS, easing = FastOutSlowInEasing),
+                                label = "barArtwork",
+                            )
                             val artworkShape = RoundedCornerShape(if (isFloating) 26.dp else 8.dp)
 
                             Box(modifier = Modifier.size(artworkSize)) {
                                 AnimatedArtwork(
                                     artworkUrl = track.fullResArtwork,
-                                    animatedCoverUrl = vm.currentAnimatedCoverUrl,
-                                    isPlaying = vm.isPlaying,
+                                    animatedCoverUrl = vm.uiCurrentAnimatedCoverUrl,
+                                    isPlaying = vm.uiIsPlaying,
                                     contentDescription = null,
                                     modifier = Modifier
                                         .fillMaxSize()
@@ -216,110 +225,119 @@ fun PlayerBar(
                                 )
                                 com.alananasss.kittytune.ui.common.TrackSourceCoverBadge(
                                     track = track,
-                                    resolvedSource = vm.currentStreamSource,
+                                    resolvedSource = vm.uiCurrentStreamSource,
                                     modifier = Modifier
                                         .align(Alignment.BottomEnd)
                                         .offset(x = 2.dp, y = 2.dp)
                                 )
                             }
-                            Spacer(Modifier.width(if (isVeryCompact) 8.dp else 12.dp))
-                            Column(Modifier.weight(1f, fill = false).widthIn(max = if (isCompact) 180.dp else 260.dp)) {
-                                Text(
-                                    text = track.title.orEmpty(),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-
-                                val isAutomixing by AutomixManager.isAutomixing.collectAsState()
-                                val mixBeatsLeft by AutomixManager.mixBeatsLeft.collectAsState()
-                                val isCrossfading = MusicManager.isCrossfadingOut
-                                // Derived, so the bar recomposes when this flips (once a track), not
-                                // on every position tick.
-                                val isNearingEnd by remember(vm) {
-                                    androidx.compose.runtime.derivedStateOf {
-                                        val remainingMs = if (vm.duration > 0) vm.duration - vm.currentPosition else Long.MAX_VALUE
-                                        remainingMs in 0L..20_000L
-                                    }
+                            val artworkGap by animateDpAsState(
+                                if (isVeryCompact) 8.dp else 12.dp, tween(BAR_MORPH_MS), label = "barArtworkGap",
+                            )
+                            val titleMaxWidth by animateDpAsState(
+                                if (isCompact) 180.dp else 260.dp,
+                                tween(BAR_MORPH_MS, easing = FastOutSlowInEasing),
+                                label = "barTitleWidth",
+                            )
+                            Spacer(Modifier.width(artworkGap))
+                            Column(
+                                modifier = Modifier.weight(1f, fill = false).widthIn(max = titleMaxWidth),
+                                verticalArrangement = Arrangement.Center,
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = track.title.orEmpty(),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
+                                    )
                                 }
-                                val isTransitionActive = (isAutomixing || isCrossfading || (mixBeatsLeft != null && mixBeatsLeft!! > 0)) && isNearingEnd
 
-                                val nextTrack = if (vm.repeatMode == RepeatMode.ONE) track else vm.queue.getOrNull(vm.currentQueueIndex + 1)
-                                val isDifferentTrack = vm.repeatMode == RepeatMode.ONE || (nextTrack != null && nextTrack.id != track.id)
-                                val nextTitle = nextTrack?.title?.trim()?.takeIf { it.isNotEmpty() && isDifferentTrack }
-
-                                AnimatedContent(
-                                    targetState = isTransitionActive && nextTitle != null,
-                                    transitionSpec = {
-                                        (fadeIn(tween(300)) + slideInVertically(tween(300)) { it / 2 })
-                                            .togetherWith(fadeOut(tween(200)) + slideOutVertically(tween(200)) { -it / 2 })
-                                    },
-                                    label = "TrackSubtitleTransition"
-                                ) { showTransition ->
-                                    if (showTransition && nextTitle != null) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    val deviceLabel = vm.playbackDeviceLabel
+                                    if (deviceLabel != null) {
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { onOpenDevices() }
+                                                .padding(end = 6.dp)
                                         ) {
                                             Icon(
-                                                imageVector = Icons.Rounded.GraphicEq,
-                                                contentDescription = null,
+                                                Icons.Rounded.Devices,
+                                                null,
                                                 tint = MaterialTheme.colorScheme.primary,
                                                 modifier = Modifier.size(13.dp)
                                             )
+                                            Spacer(Modifier.width(3.dp))
                                             Text(
-                                                text = stringResource(R.string.automix_mix_into, nextTitle),
-                                                style = MaterialTheme.typography.bodySmall.copy(
-                                                    fontWeight = FontWeight.Medium,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                ),
+                                                text = deviceLabel,
+                                                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                                                color = MaterialTheme.colorScheme.primary,
                                                 maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
+                                                overflow = TextOverflow.Ellipsis,
                                             )
-                                        }
-                                    } else {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            ArtistLinkText(
-                                                track = track,
-                                                onArtistClick = { vm.navigateToTrackArtist(it) },
-                                                text = track.displayArtist.ifBlank { track.user?.username.orEmpty() },
+                                            Spacer(Modifier.width(6.dp))
+                                            Text(
+                                                text = "·",
                                                 style = MaterialTheme.typography.bodySmall,
-                                                modifier = Modifier.weight(1f, fill = false)
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
-                                            if (track.user?.verified == true) {
-                                                Spacer(Modifier.width(3.dp))
-                                                Icon(
-                                                    Icons.Rounded.Verified,
-                                                    null,
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(12.dp)
-                                                )
-                                            }
                                         }
                                     }
+                                    ArtistLinkText(
+                                        track = track,
+                                        onArtistClick = { vm.navigateToTrackArtist(it) },
+                                        text = track.displayArtist.ifBlank { track.user?.username.orEmpty() },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                    if (track.user?.verified == true) {
+                                        Spacer(Modifier.width(3.dp))
+                                        Icon(
+                                            Icons.Rounded.Verified,
+                                            null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                    }
+                                    // ArtifactNet AI-detection badge (issue #41)
+                                    val aiResult by com.alananasss.kittytune.audio.ai.AiDetectionManager.result.collectAsState()
+                                    com.alananasss.kittytune.ui.player.ai.AiDetectionBadge(
+                                        result = aiResult.takeUnless { vm.isRemotePlayback },
+                                        textColor = MaterialTheme.colorScheme.onSurface,
+                                        onClick = { vm.showAiDetectionSheet = true },
+                                        modifier = Modifier.padding(start = 6.dp),
+                                    )
                                 }
+                                CodecBadge(
+                                    viewModel = vm,
+                                    textColor = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                )
                             }
                         }
                         if (PlayerPreferences.PLAYER_BAR_BUTTON_LIKE in visibleButtons) {
                             Spacer(Modifier.width(8.dp))
                             IconButton(shapes = iconShapes, onClick = { vm.toggleLike() }) {
                                 Icon(
-                                    if (vm.isLiked) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                    if (vm.uiIsLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
                                     contentDescription = str("player_like"),
-                                    tint = if (vm.isLiked) MaterialTheme.colorScheme.primary
+                                    tint = if (vm.uiIsLiked) MaterialTheme.colorScheme.primary
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(20.dp),
                                 )
                             }
-                            if (vm.isYourMixActive) {
+                            if (vm.uiIsYourMixActive) {
                                 Spacer(Modifier.width(4.dp))
                                 IconButton(
                                     shapes = iconShapes,
                                     onClick = { vm.dislikeCurrentTrackInMix() }
                                 ) {
                                     Icon(
-                                        androidx.compose.material.icons.Icons.Outlined.ThumbDown,
+                                        androidx.compose.material.icons.Icons.Rounded.ThumbDown,
                                         contentDescription = str("mix_dislike"),
                                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.size(20.dp),
@@ -332,7 +350,7 @@ fun PlayerBar(
 
                 // --- center: transport + progress ------------------------------------------
                 Column(
-                    modifier = Modifier.widthIn(min = centerMin, max = centerMax),
+                    modifier = Modifier.widthIn(min = centerMin, max = maxOf(centerMin, if (isVeryCompact) centerMin else centerMax)),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Row(
@@ -344,8 +362,8 @@ fun PlayerBar(
                     val transportGap = if (isFloating) 12.dp else 6.dp
                     if (PlayerPreferences.PLAYER_BAR_BUTTON_SHUFFLE in visibleButtons) {
                         ExpressiveToggleButton(
-                            selected = vm.shuffleEnabled,
-                            icon = Icons.Filled.Shuffle,
+                            selected = vm.uiShuffleEnabled,
+                            icon = Icons.Rounded.Shuffle,
                             contentDescription = "Shuffle",
                             onClick = { vm.toggleShuffle() },
                         )
@@ -412,7 +430,7 @@ fun PlayerBar(
                             ) { vm.smartPrevious() },
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Filled.SkipPrevious, null, modifier = Modifier.size(22.dp))
+                        Icon(Icons.Rounded.SkipPrevious, null, modifier = Modifier.size(22.dp))
                     }
 
                     Spacer(Modifier.width(transportGap))
@@ -431,11 +449,27 @@ fun PlayerBar(
                             ) { vm.togglePlayPause() },
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            if (vm.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onPrimary,
-                        )
+                        if (vm.uiIsLoading && vm.uiIsPlaying) {
+                            Box(contentAlignment = Alignment.Center) {
+                                androidx.compose.material3.CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                    strokeWidth = 2.dp
+                                )
+                                Icon(
+                                    Icons.Rounded.Pause,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        } else {
+                            Icon(
+                                if (vm.uiIsPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                            )
+                        }
                     }
 
                     Spacer(Modifier.width(transportGap))
@@ -454,15 +488,15 @@ fun PlayerBar(
                             ) { vm.playNext() },
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Filled.SkipNext, null, modifier = Modifier.size(22.dp))
+                        Icon(Icons.Rounded.SkipNext, null, modifier = Modifier.size(22.dp))
                     }
 
                     if (PlayerPreferences.PLAYER_BAR_BUTTON_REPEAT in visibleButtons) {
                         Spacer(Modifier.width(transportGap))
                         ExpressiveToggleButton(
-                            selected = vm.repeatMode != RepeatMode.NONE,
-                            icon = if (vm.repeatMode == RepeatMode.ONE) Icons.Filled.RepeatOne
-                            else Icons.Filled.Repeat,
+                            selected = vm.uiRepeatMode != RepeatMode.NONE,
+                            icon = if (vm.uiRepeatMode == RepeatMode.ONE) Icons.Rounded.RepeatOne
+                            else Icons.Rounded.Repeat,
                             contentDescription = "Repeat",
                             onClick = { vm.toggleRepeatMode() },
                         )
@@ -475,8 +509,10 @@ fun PlayerBar(
             val verticalVolumeSlider = rememberVerticalVolumeSlider()
 
             // --- right: lyrics / effects / queue / volume ------------------------------
+            // Narrow, the right side takes only what its buttons need and the title gets the rest, instead of both
+            // sides getting an equal share that left the title nothing.
             Row(
-                modifier = Modifier.weight(1f),
+                modifier = if (isVeryCompact) Modifier else Modifier.weight(1f),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.End,
             ) {
@@ -495,7 +531,13 @@ fun PlayerBar(
                         )
                     }
                 }
-                if (!isVeryCompact && PlayerPreferences.PLAYER_BAR_BUTTON_MINIPLAYER in visibleButtons) {
+                // Buttons that make way for a narrow window fold away rather than vanishing in one frame, which
+                // shoved everything beside them sideways mid-resize (issue #66).
+                AnimatedVisibility(
+                    visible = !isVeryCompact && PlayerPreferences.PLAYER_BAR_BUTTON_MINIPLAYER in visibleButtons,
+                    enter = barButtonEnter,
+                    exit = barButtonExit,
+                ) {
                     Tip(str("mini_player_title")) {
                         IconButton(
                             shapes = iconShapes,
@@ -511,13 +553,36 @@ fun PlayerBar(
                         }
                     }
                 }
+                // The Kitty pet on and off in one click (lit while it is shown), in whichever home
+                // it was given: the floating window or the app's own window.
+                AnimatedVisibility(
+                    visible = !isVeryCompact && PlayerPreferences.PLAYER_BAR_BUTTON_PET in visibleButtons,
+                    enter = barButtonEnter,
+                    exit = barButtonExit,
+                ) {
+                    val petShown = com.alananasss.kittytune.ui.pet.PetWindowState.visible
+                    Tip(str(if (petShown) "pet_desk_hide" else "pet_desk_tray_show")) {
+                        IconButton(
+                            shapes = iconShapes,
+                            onClick = { com.alananasss.kittytune.ui.pet.PetWindowState.toggle() },
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Pets,
+                                contentDescription = str("pet_settings_title"),
+                                tint = if (petShown) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
                 if (PlayerPreferences.PLAYER_BAR_BUTTON_PANEL in visibleButtons) {
                     IconButton(
                         shapes = iconShapes,
                         onClick = onToggleNowPlaying,
                     ) {
                         Icon(
-                            Icons.Outlined.Tune,
+                            Icons.Rounded.ViewSidebar,
                             contentDescription = null,
                             tint = if (isNowPlayingOpen) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -527,13 +592,17 @@ fun PlayerBar(
                 }
                 // The panel this opens also has a queue tab, so hiding this button costs the queue
                 // a click rather than access to it (issue #33).
-                if (!isCompact && PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE in visibleButtons) {
+                AnimatedVisibility(
+                    visible = !isCompact && PlayerPreferences.PLAYER_BAR_BUTTON_QUEUE in visibleButtons,
+                    enter = barButtonEnter,
+                    exit = barButtonExit,
+                ) {
                     IconButton(
                         shapes = iconShapes,
                         onClick = onOpenQueue,
                     ) {
                         Icon(
-                            Icons.Outlined.QueueMusic,
+                            Icons.AutoMirrored.Rounded.QueueMusic,
                             contentDescription = null,
                             tint = if (isQueueOpen) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -542,22 +611,55 @@ fun PlayerBar(
                     }
                 }
 
+                AnimatedVisibility(
+                    visible = !isCompact && PlayerPreferences.PLAYER_BAR_BUTTON_DEVICES in visibleButtons,
+                    enter = barButtonEnter,
+                    exit = barButtonExit,
+                ) {
+                    Tip(str("connect_devices")) {
+                        IconButton(shapes = iconShapes, onClick = onOpenDevices) {
+                            Icon(
+                                Icons.Rounded.Devices,
+                                contentDescription = str("connect_devices"),
+                                tint = if (isDevicesOpen || vm.isRemotePlayback) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
                 VolumeControl(
-                    volume = vm.volume,
+                    volume = vm.uiVolume,
                     preferVertical = verticalVolumeSlider,
-                    isPlaying = vm.isPlaying,
+                    isPlaying = vm.uiIsPlaying,
                     onVolumeChange = { vm.updateVolume(it) },
                     onVolumeChangeFinished = { vm.persistVolume() },
                     onVolumeScrolled = { vm.updateVolume(it); vm.persistVolumeSoon() },
                     onToggleMute = { vm.toggleMute() },
+                    shapes = iconShapes,
+                    onSelectDevice = { vm.changeOutputDevice(it) },
                 )
             }
         }
     }
     }
+    // Above the play button: the transport is centred in the bar, its two sides having equal weight.
+    if (oneLineLyrics) FloatingLyricChip(vm, Modifier.align(Alignment.TopCenter))
 }
 }
 
+
+/** How long the player bar takes to settle into a new width's layout. */
+private const val BAR_MORPH_MS = 280
+
+private val barButtonEnter = fadeIn(tween(BAR_MORPH_MS)) + expandHorizontally(tween(BAR_MORPH_MS, easing = FastOutSlowInEasing))
+private val barButtonExit = fadeOut(tween(BAR_MORPH_MS / 2)) + shrinkHorizontally(tween(BAR_MORPH_MS, easing = FastOutSlowInEasing))
+
+/** A size that follows the bar's width linearly between two points and holds at either end. */
+private fun lerpByWidth(width: Dp, from: Pair<Dp, Dp>, to: Pair<Dp, Dp>): Dp {
+    val t = ((width - from.first) / (to.first - from.first)).coerceIn(0f, 1f)
+    return from.second + (to.second - from.second) * t
+}
 
 /**
  * Elapsed time, seek bar and duration.
@@ -567,62 +669,29 @@ fun PlayerBar(
  */
 @Composable
 private fun PlaybackProgressRow(vm: PlayerViewModel) {
-    val seekWheelSeconds = rememberSeekWheelSeconds()
-    val sliderStyle = rememberPlayerSliderStyle()
-    var scrubbing by remember { mutableStateOf(false) }
-    var scrubPosition by remember { mutableFloatStateOf(0f) }
-    val position = if (scrubbing || vm.isScrubbing) scrubPosition.toLong() else vm.currentPosition
-    val duration = vm.duration.coerceAtLeast(1L)
+    PlaybackSeekBar(vm) { position, duration, slider ->
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = makeTimeString(position),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            slider(Modifier.weight(1f).padding(horizontal = 8.dp))
 
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            text = makeTimeString(position),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        PlayerSlider(
-            value = position.toFloat().coerceIn(0f, duration.toFloat()),
-            onValueChange = {
-                scrubbing = true
-                scrubPosition = it
-                vm.updateScrubPosition(it.toLong())
-            },
-            onValueChangeFinished = {
-                vm.seekTo(scrubPosition.toLong())
-                scrubbing = false
-            },
-            sliderStyle = sliderStyle,
-            isPlaying = vm.isPlaying,
-            valueRange = 0f..duration.toFloat(),
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 8.dp)
-                .seekWheel(
-                    positionMs = { if (scrubbing || vm.isScrubbing) scrubPosition.toLong() else vm.currentPosition },
-                    durationMs = { vm.duration },
-                    stepSeconds = { seekWheelSeconds },
-                    onSeek = { target ->
-                        // Straight to the player rather than through the scrub state: a
-                        // wheel notch is a decision, not a drag in progress.
-                        scrubbing = false
-                        vm.seekTo(target)
-                    },
-                ),
-        )
-        // Click to switch between the track's length and the time left, which counts down with a minus, as in
-        // the full player. Remembered and synced with settings.
-        val showRemaining = rememberShowRemainingTime()
-        Text(
-            text = if (showRemaining) "-" + makeTimeString((duration - position).coerceAtLeast(0L)) else makeTimeString(duration),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier
-                .clip(RoundedCornerShape(6.dp))
-                .clickable {
-                    com.alananasss.kittytune.data.local.PlayerPreferences().setShowRemainingTime(!showRemaining)
-                }
-                .padding(horizontal = 4.dp, vertical = 2.dp),
-        )
+            val showRemaining = rememberShowRemainingTime()
+            Text(
+                text = if (showRemaining) "-" + makeTimeString(duration - position) else makeTimeString(duration),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.End,
+                // Reserve room for either time label so toggling it keeps the slider in place.
+                modifier = Modifier
+                    .widthIn(min = 52.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable { PlayerPreferences().setShowRemainingTime(!showRemaining) }
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+            )
+        }
     }
 }
 
@@ -691,45 +760,6 @@ private fun ExpressiveToggleButton(
 }
 
 /**
- * The wheel over the progress bar, moving the playhead (issue #33).
- *
- * "If you hover over the slider showing how long the track is, you can use the mouse wheel to rewind
- * and fast-forward the track."
- *
- * Consumed, so the wheel does not also scroll whatever the player bar happens to be sitting on. Up
- * goes forward, matching the volume control right next to it, where up is louder. The step is a
- * setting because five seconds is right for checking a lyric and useless for finding your way around
- * a two-hour set.
- */
-@Composable
-private fun Modifier.seekWheel(
-    positionMs: () -> Long,
-    durationMs: () -> Long,
-    stepSeconds: () -> Float,
-    onSeek: (Long) -> Unit,
-): Modifier {
-    val position by androidx.compose.runtime.rememberUpdatedState(positionMs)
-    val duration by androidx.compose.runtime.rememberUpdatedState(durationMs)
-    val step by androidx.compose.runtime.rememberUpdatedState(stepSeconds)
-    val seek by androidx.compose.runtime.rememberUpdatedState(onSeek)
-    return this.pointerInput(Unit) {
-        awaitPointerEventScope {
-            while (true) {
-                val event = awaitPointerEvent()
-                if (event.type != PointerEventType.Scroll) continue
-                val notches = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
-                if (notches == 0f) continue
-                val total = duration()
-                if (total <= 0L) continue
-                val moved = position() - (notches * step() * 1000f).toLong()
-                seek(moved.coerceIn(0L, total))
-                event.changes.forEach { it.consume() }
-            }
-        }
-    }
-}
-
-/**
  * Reactive read of which optional player-bar buttons the user keeps; recomposes on pref changes.
  */
 @Composable
@@ -750,18 +780,17 @@ private fun rememberPlayerBarButtons(): Set<String> {
     return remember(prefsSnapshot) { PlayerPreferences().getPlayerBarButtons() }
 }
 
-/** Reactive read of how far a wheel notch over the progress bar moves the playhead. */
-@Composable
-private fun rememberSeekWheelSeconds(): Float {
-    val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
-    return remember(prefsSnapshot) { PlayerPreferences().getSeekWheelSeconds() }
-}
-
 /** Reactive read of the lyrics button's own switch, which lives in the lyrics settings. */
 @Composable
 private fun rememberShowLyricsButton(): Boolean {
     val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
     return remember(prefsSnapshot) { PlayerPreferences().getShowLyricsButtonEnabled() }
+}
+
+@Composable
+private fun rememberOneLineLyrics(): Boolean {
+    val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
+    return remember(prefsSnapshot) { PlayerPreferences().getOneLineLyricsEnabled() }
 }
 
 /**
@@ -774,27 +803,4 @@ private fun rememberVerticalVolumeSlider(): Boolean {
         com.alananasss.kittytune.data.local.PlayerPreferences().getVerticalVolumeSlider()
     }
 }
-
-/**
- * Reactive read of the "slider style" setting; recomposes when the pref changes.
- */
-@Composable
-private fun rememberPlayerSliderStyle(): com.alananasss.kittytune.data.local.PlayerSliderStyle {
-    val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
-    return remember(prefsSnapshot) {
-        com.alananasss.kittytune.data.local.PlayerPreferences().getPlayerSliderStyle()
-    }
-}
-
-/**
- * Reactive read of the "show remaining time" setting; recomposes when the pref changes.
- */
-@Composable
-private fun rememberShowRemainingTime(): Boolean {
-    val prefsSnapshot by com.alananasss.kittytune.core.Prefs.flow.collectAsState()
-    return remember(prefsSnapshot) {
-        com.alananasss.kittytune.data.local.PlayerPreferences().getShowRemainingTime()
-    }
-}
-
 

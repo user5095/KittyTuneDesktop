@@ -54,6 +54,7 @@ import com.alananasss.kittytune.data.ChartsData
 import com.alananasss.kittytune.domain.User
 import com.alananasss.kittytune.ui.common.SquareCardShimmer
 import com.alananasss.kittytune.ui.common.ShimmerBox
+import com.alananasss.kittytune.ui.common.rememberFilteredTracks
 import com.alananasss.kittytune.ui.player.ArtworkPalette
 import com.alananasss.kittytune.ui.player.PlaybackContext
 import com.alananasss.kittytune.ui.player.PlayerViewModel
@@ -74,7 +75,7 @@ fun rememberDominantColor(url: String?, defaultColor: Color = MaterialTheme.colo
     LaunchedEffect(url) {
         if (url != null) {
             val extracted = withContext(Dispatchers.IO) {
-                ArtworkPalette.load(url)?.let { ArtworkPalette.dominantColor(it, preferLight = false) }
+                ArtworkPalette.dominantColorCached(url, preferLight = false)
             }
             if (extracted != null) color.value = extracted
         }
@@ -90,149 +91,14 @@ fun ChartsScreen(
     playerViewModel: PlayerViewModel,
     viewModel: ChartsViewModel = viewModel { ChartsViewModel(AppInstance.application) }
 ) {
-    var showCountrySelector by remember { mutableStateOf(false) }
-    var showArtistMenu by remember { mutableStateOf<User?>(null) }
-
-    val currentCountry = ChartsData.charts[viewModel.selectedCountryIndex]
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
-    // Country selector — desktop dialog instead of the Android bottom sheet.
-    if (showCountrySelector) {
-        BackHandler(onBack = { showCountrySelector = false })
-        Dialog(onDismissRequest = { showCountrySelector = false }) {
-            Surface(
-                shape = RoundedCornerShape(28.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                modifier = Modifier.widthIn(max = 440.dp).heightIn(max = 620.dp)
-            ) {
-                Column(modifier = Modifier.padding(24.dp)) {
-                    Text(
-                        text = str("charts_select_country"),
-                        style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
-                        modifier = Modifier
-                            .padding(bottom = 16.dp)
-                            .align(Alignment.CenterHorizontally)
-                    )
-
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        itemsIndexed(ChartsData.charts) { index, chartData ->
-                            val isSelected = index == viewModel.selectedCountryIndex
-                            ChartsCountryCard(
-                                countryName = chartData.countryName,
-                                flagEmoji = chartData.flagEmoji,
-                                isSelected = isSelected,
-                                onClick = {
-                                    viewModel.loadCountryCharts(index)
-                                    showCountrySelector = false
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Artist options — desktop dialog instead of the Android bottom sheet.
-    if (showArtistMenu != null) {
-        val user = showArtistMenu!!
-        BackHandler(onBack = { showArtistMenu = null })
-        Dialog(onDismissRequest = { showArtistMenu = null }) {
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.surfaceContainer,
-                modifier = Modifier.widthIn(max = 420.dp)
-            ) {
-                Column(modifier = Modifier.padding(bottom = 16.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .padding(horizontal = 24.dp, vertical = 20.dp)
-                            .fillMaxWidth()
-                    ) {
-                        ArtistAvatar(
-                            avatarUrl = user.avatarUrl,
-                            modifier = Modifier
-                                .size(64.dp)
-                                .clip(CircleShape)
-                        )
-                        Spacer(Modifier.width(16.dp))
-                        Column {
-                            Text(
-                                text = user.username ?: str("unknown_artist"),
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = str("lib_artists"),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                if (user.verified) {
-                                    Spacer(Modifier.width(4.dp))
-                                    Icon(
-                                        imageVector = Icons.Rounded.Verified,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                    Spacer(Modifier.height(8.dp))
-
-                    ArtistMenuOption(
-                        icon = Icons.Default.Shuffle,
-                        text = str("btn_shuffle"),
-                        onClick = {
-                            viewModel.fetchArtistTopTracks(user.id) { tracks ->
-                                if (tracks.isNotEmpty()) {
-                                    playerViewModel.playPlaylist(tracks.shuffled(), 0)
-                                }
-                            }
-                            showArtistMenu = null
-                        }
-                    )
-
-                    ArtistMenuOption(
-                        icon = Icons.Default.Radio,
-                        text = str("radio"),
-                        onClick = {
-                            onNavigate("station_artist:${user.id}")
-                            showArtistMenu = null
-                        }
-                    )
-
-                    ArtistMenuOption(
-                        icon = Icons.Default.Person,
-                        text = str("menu_go_artist"),
-                        onClick = {
-                            onNavigate("profile:${user.id}")
-                            showArtistMenu = null
-                        }
-                    )
-
-                    ArtistMenuOption(
-                        icon = Icons.Outlined.Share,
-                        text = str("btn_share"),
-                        onClick = {
-                            // Desktop share = copy the profile link to the clipboard.
-                            val url = user.permalinkUrl ?: "https://soundcloud.com/${user.username}"
-                            val selection = StringSelection(url)
-                            java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(selection, selection)
-                            Toaster.show(str("copied_to_clipboard"))
-                            showArtistMenu = null
-                        }
-                    )
-                }
-            }
-        }
+    // Hide blocked tracks/artists (issue #41); playback uses this same visible
+    // list so the start index stays aligned with what is rendered.
+    val visibleTracks = rememberFilteredTracks(viewModel.chartEntries.map { it.track })
+    val chartEntries = remember(viewModel.chartEntries, visibleTracks) {
+        val visibleIds = visibleTracks.map { it.id }.toSet()
+        viewModel.chartEntries.filter { it.track.id in visibleIds }
     }
 
     Scaffold(
@@ -269,31 +135,32 @@ fun ChartsScreen(
                     genres = ChartsViewModel.chartGenres,
                     onKindChange = { viewModel.loadChart(it, viewModel.chartGenre) },
                     onGenreChange = { viewModel.loadChart(viewModel.chartKind, it) },
+                    country = viewModel.chartCountry,
+                    onCountryChange = { viewModel.selectChartCountry(it) },
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
                 )
             }
 
-            if (viewModel.isChartLoading && viewModel.chartEntries.isEmpty()) {
+            if (viewModel.isChartLoading && chartEntries.isEmpty()) {
                 items(6) {
                     Box(Modifier.fillMaxWidth().height(72.dp)) { ShimmerBox(Modifier.fillMaxWidth().height(64.dp)) }
                 }
-            } else if (viewModel.chartEntries.isNotEmpty()) {
-                items(viewModel.chartEntries.size) { index ->
-                    val entry = viewModel.chartEntries[index]
+            } else if (chartEntries.isNotEmpty()) {
+                items(chartEntries.size) { index ->
+                    val entry = chartEntries[index]
                     ChartTrackRow(
                         track = entry.track,
                         rank = entry.rank,
-                        currentlyPlayingTrack = playerViewModel.currentTrack,
+                        currentlyPlayingTrack = playerViewModel.uiCurrentTrack,
                         onClick = {
                             // A chart is a queue: pressing a song plays the chart from there, so the
                             // songs either side of it are what comes next.
                             playerViewModel.playPlaylist(
-                                tracks = viewModel.chartEntries.map { it.track },
+                                tracks = chartEntries.map { it.track },
                                 startIndex = index,
                                 context = PlaybackContext(
                                     displayText = str(
-                                        if (viewModel.chartKind == ChartKind.TOP) "chart_kind_top"
-                                        else "chart_kind_trending"
+                                        viewModel.chartKind.labelKey()
                                     ),
                                     navigationId = "charts",
                                 ),
@@ -301,120 +168,6 @@ fun ChartsScreen(
                         },
                         onArtistClick = { playerViewModel.navigateToTrackArtist(it) },
                     )
-                }
-            }
-
-            // country selector button
-            item {
-                Box(
-                    modifier = Modifier
-                        .padding(horizontal = 24.dp, vertical = 12.dp)
-                        .fillMaxWidth(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Surface(
-                        onClick = { showCountrySelector = true },
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.surfaceContainer,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)),
-                        modifier = Modifier.height(56.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .padding(horizontal = 20.dp)
-                                .fillMaxHeight(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(text = currentCountry.flagEmoji, style = MaterialTheme.typography.titleLarge)
-                                Spacer(Modifier.width(12.dp))
-                                Text(
-                                    text = currentCountry.countryName,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Icon(Icons.Rounded.KeyboardArrowDown, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-
-            if (viewModel.isLoading) {
-                // loading skeleton
-                item {
-                    LazyRow(
-                        contentPadding = PaddingValues(16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        items(4) { SquareCardShimmer() }
-                    }
-                }
-            } else {
-                if (viewModel.chartPlaylists.isNotEmpty()) {
-                    item {
-                        Text(
-                            text = str("explorer_charts"),
-                            style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp)
-                        )
-                    }
-                    item {
-                        val chartPlaylistsRowState = rememberLazyListState()
-                        LazyRow(
-                            state = chartPlaylistsRowState,
-                            modifier = Modifier.horizontalMouseSwipe(chartPlaylistsRowState),
-                            contentPadding = PaddingValues(horizontal = 16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            items(viewModel.chartPlaylists) { playlist ->
-                                ChartPlaylistCard(playlist = playlist, onClick = { onPlaylistClick(playlist.id) })
-                            }
-                        }
-                    }
-                }
-
-                // --- TOP ARTISTS (horizontal swipe, columns of 4) ---
-                if (viewModel.topArtists.isNotEmpty()) {
-                    item {
-                        Text(
-                            text = str("charts_top_artists"),
-                            style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 24.dp)
-                        )
-                    }
-
-                    item {
-                        val chunkedArtists = remember(viewModel.topArtists) {
-                            viewModel.topArtists.chunked(4)
-                        }
-
-                        val topArtistsRowState = rememberLazyListState()
-                        LazyRow(
-                            state = topArtistsRowState,
-                            modifier = Modifier.horizontalMouseSwipe(topArtistsRowState),
-                            contentPadding = PaddingValues(horizontal = 16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(16.dp)
-                        ) {
-                            items(chunkedArtists) { columnGroup ->
-                                Column(
-                                    modifier = Modifier.width(340.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    columnGroup.forEach { artistRanking ->
-                                        ArtistRankRow(
-                                            ranking = artistRanking,
-                                            onClick = { onNavigate("profile:${artistRanking.user.id}") },
-                                            onMenuClick = { showArtistMenu = artistRanking.user }
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -477,7 +230,7 @@ fun ArtistRankRow(
             )
         }
 
-        IconButton(onClick = onMenuClick) {
+        IconButton(shapes = IconButtonDefaults.shapes(), onClick = onMenuClick) {
             Icon(
                 imageVector = Icons.Default.MoreVert,
                 contentDescription = str("btn_options"),
@@ -539,8 +292,6 @@ private fun ChartsCountryCard(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(text = flagEmoji, style = MaterialTheme.typography.headlineSmall)
-                Spacer(Modifier.width(16.dp))
                 Text(
                     text = countryName,
                     style = MaterialTheme.typography.bodyLarge,
