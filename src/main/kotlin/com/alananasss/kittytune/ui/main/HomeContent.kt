@@ -842,6 +842,13 @@ private fun SearchResults(
             )
         }
 
+        com.alananasss.kittytune.ui.home.SearchHistorySuggestions(
+            query = vm.searchQuery,
+            searches = vm.recentSearches,
+            onRun = vm::runRecentSearch,
+            onForget = vm::forgetSearch,
+        )
+
         // ── Content ──
         if (!hasQuery) {
             // With an empty field: recent searches, a chart, and what the liked artists have

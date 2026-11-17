@@ -542,3 +542,26 @@ private val CONTENT_PADDING = 20.dp
 /** Gap between sections, and the height a recent-search row is pinned to. */
 private val SECTION_GAP = 14.dp
 private val ROW_HEIGHT = 40.dp
+
+/**
+ * While typing: the saved searches that contain what is in the field, the way a browser's address
+ * bar offers them. Hidden when nothing matches or the only match is what is already typed.
+ */
+@Composable
+fun SearchHistorySuggestions(
+    query: String,
+    searches: List<String>,
+    onRun: (String) -> Unit,
+    onForget: (String) -> Unit,
+) {
+    val needle = query.trim()
+    val matches = searches
+        .filter { it.contains(needle, ignoreCase = true) && !it.equals(needle, ignoreCase = true) }
+        .take(MAX_SUGGESTIONS)
+    if (needle.isEmpty() || matches.isEmpty()) return
+    Column {
+        matches.forEach { term -> RecentSearchRow(term = term, onRun = { onRun(term) }, onForget = { onForget(term) }) }
+    }
+}
+
+private const val MAX_SUGGESTIONS = 4
