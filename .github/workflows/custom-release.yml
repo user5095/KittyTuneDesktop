@@ -58,4 +58,4 @@ jobs:
           git push origin "v$VERSION"
           # --repo is mandatory: the `upstream` remote makes gh target the original repo otherwise
           # tags pushed with GITHUB_TOKEN don't trigger workflows, so dispatch the build explicitly
-          gh workflow run build-installers.yml --repo "$GITHUB_REPOSITORY" --ref "v$VERSION"
+          gh workflow run build-installers.yml --repo "$GITHUB_REPOSITORY" --ref "v$VERSION" -f macos_only=false
